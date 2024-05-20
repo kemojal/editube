@@ -5,6 +5,8 @@ class VideoBase(BaseModel):
     description: str | None = None
 
 class VideoCreate(VideoBase):
+    name: str
+    description: str | None = None
     pass
 
 class VideoUpdate(VideoBase):

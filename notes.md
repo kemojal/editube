@@ -9,10 +9,10 @@
 
 ##### Project Management
 
-- [ ] **POST** `javascript /api/projects` - Create a new project
-- [ ] **GET** `javascript /api/projects/:projectId ` - /api/projects/:projectId
-- [ ] **PUT** `javascript api/projects/:projectId` :Update project details
-- [ ] **DELETE** `javascript api/projects/:projectId` :Delete a project
+- [x] **POST** `javascript /api/projects` - Create a new project
+- [x] **GET** `javascript /api/projects/:projectId ` - /api/projects/:projectId
+- [x] **PUT** `javascript api/projects/:projectId` :Update project details
+- [x] **DELETE** `javascript api/projects/:projectId` :Delete a project
 - [ ] **POST** `javascript  /api/projects/:projectId/collaborators` register - Invite collaborators to a project
 - [ ] **DELETE** `javascript /api/projects/:projectId/collaborators/:userId` - Remove a collaborator from a project
 

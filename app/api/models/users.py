@@ -20,6 +20,7 @@
 from pydantic import BaseModel, EmailStr, ConfigDict
 from sqlalchemy import Column, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
+from datetime import datetime
 class UserBase(BaseModel):
     email: EmailStr
     name: str
@@ -63,3 +64,25 @@ class UserRegisterSchema(BaseModel):
 class UserLoginSchema(BaseModel):
     email: str
     password: str
+
+
+
+class GoogleAccountBase(BaseModel):
+    userId: int
+    googleId: str
+    accessToken: str
+    refreshToken: str
+
+class GoogleAccountCreate(GoogleAccountBase):
+    pass
+
+class GoogleAccountUpdate(GoogleAccountBase):
+    pass
+
+class GoogleAccount(GoogleAccountBase):
+    id: int
+    createdAt: datetime
+    updatedAt: datetime
+
+    class Config:
+        orm_mode = True

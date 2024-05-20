@@ -16,3 +16,6 @@ class ProjectCollaboratorCreate(BaseModel):
 
 class ProjectCollaboratorUpdate(BaseModel):
     role: str
+
+class CollaboratorEmailList(BaseModel):
+    collaborator_emails: list[str]
