@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 sqlalchemy
-psycopg2
+psycopg2-binary>=2.9.9
 python-jose
 python-multipart
 alembic
