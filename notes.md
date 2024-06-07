@@ -31,3 +31,15 @@
 - [ ] Uranus
 - [ ] Neptune
 - [ ] Comet Haley
+
+
+
+
+### Security & best practices
+- rate limits
+- Authentication limits( maximum times a user can retry login if not authenticated)
+- Server monitory
+- JWT blacklisting and refresh token
+- Security linter
+- Limiting payload size( not ensure that the post size)
+- 

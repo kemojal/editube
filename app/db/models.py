@@ -101,30 +101,30 @@ class ActivityFeed(Base):
 
 
 
-class ProjectAnalytics(Base):
-    __tablename__ = "ProjectAnalytics"
+# class ProjectAnalytics(Base):
+#     __tablename__ = "ProjectAnalytics"
 
-    id = Column(Integer, primary_key=True, index=True)
-    projectId = Column(Integer, ForeignKey("projects.id"), nullable=False)
-    videoCount = Column(Integer, nullable=False, default=0)
-    commentCount = Column(Integer, nullable=False, default=0)
-    collaboratorCount = Column(Integer, nullable=False, default=0)
-    lastActivity = Column(TIMESTAMP)
-    createdAt = Column(TIMESTAMP, nullable=False, server_default=func.now())
-    updatedAt = Column(TIMESTAMP, nullable=False, server_default=func.now())
+#     id = Column(Integer, primary_key=True, index=True)
+#     projectId = Column(Integer, ForeignKey("projects.id"), nullable=False)
+#     videoCount = Column(Integer, nullable=False, default=0)
+#     commentCount = Column(Integer, nullable=False, default=0)
+#     collaboratorCount = Column(Integer, nullable=False, default=0)
+#     lastActivity = Column(TIMESTAMP)
+#     createdAt = Column(TIMESTAMP, nullable=False, server_default=func.now())
+#     updatedAt = Column(TIMESTAMP, nullable=False, server_default=func.now())
 
-    project = relationship("Project", back_populates="analytics")
+#     project = relationship("Project", back_populates="analytics")
 
-class UserAnalytics(Base):
-    __tablename__ = "UserAnalytics"
+# class UserAnalytics(Base):
+#     __tablename__ = "UserAnalytics"
 
-    id = Column(Integer, primary_key=True, index=True)
-    userId = Column(Integer, ForeignKey("users.id"), nullable=False)
-    projectsCollaborated = Column(ARRAY(Integer))
-    videosUploaded = Column(Integer, nullable=False, default=0)
-    commentsPosted = Column(Integer, nullable=False, default=0)
-    lastActivity = Column(TIMESTAMP)
-    createdAt = Column(TIMESTAMP, nullable=False, server_default=func.now())
-    updatedAt = Column(TIMESTAMP, nullable=False, server_default=func.now())
+#     id = Column(Integer, primary_key=True, index=True)
+#     userId = Column(Integer, ForeignKey("users.id"), nullable=False)
+#     projectsCollaborated = Column(ARRAY(Integer))
+#     videosUploaded = Column(Integer, nullable=False, default=0)
+#     commentsPosted = Column(Integer, nullable=False, default=0)
+#     lastActivity = Column(TIMESTAMP)
+#     createdAt = Column(TIMESTAMP, nullable=False, server_default=func.now())
+#     updatedAt = Column(TIMESTAMP, nullable=False, server_default=func.now())
 
-    user = relationship("User", back_populates="analytics")
+#     user = relationship("User", back_populates="analytics")

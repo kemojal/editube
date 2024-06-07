@@ -1,10 +1,31 @@
 import cloudinary
 from fastapi import FastAPI
 from app.websocket_manager import app as websocket_app
+from fastapi.middleware.cors import CORSMiddleware
 
 from .api import api_router
 
 app = FastAPI()
+
+
+origins = [
+   
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:3002",
+    "http://localhost:3003",
+
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 
           
 cloudinary.config( 
