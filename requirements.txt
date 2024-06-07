@@ -7,3 +7,4 @@ python-multipart
 alembic
 passlib
 cloudinary
+bcrypt
