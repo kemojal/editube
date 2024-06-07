@@ -1,6 +1,6 @@
 import cloudinary
 from fastapi import FastAPI
-from app.websocket_manager import app as websocket_app
+# from app.websocket_manager import app as websocket_app
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api import api_router
@@ -37,7 +37,7 @@ cloudinary.config(
 app.include_router(api_router)
 
 # Include the WebSocket app
-app.mount("/", websocket_app)
+# app.mount("/", websocket_app)
 
 @app.get("/")
 async def read_item():
@@ -45,4 +45,4 @@ async def read_item():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
