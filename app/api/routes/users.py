@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from ..models.users import User as UserSchema, UserCreate, UserUpdate, UserRegisterSchema, UserLoginSchema
 from ...db.database import get_db
 from app.db.models import User
-from ...utils.security import get_password_hash, verify_password, get_current_user, create_access_token
+from ...utils.security import get_password_hash, verify_password, get_current_user, create_access_token, create_refresh_token, verify_refresh_token
 
 router = APIRouter(
     prefix="/users",
@@ -49,7 +49,25 @@ def login_user(user_credentials: UserLoginSchema, db: Session = Depends(get_db))
     
     # Generate and return an access token
     access_token = create_access_token(data={"user_id": user.id})
+    # Generate refresh token
+    refresh_token = create_refresh_token(data={"user_id": user.id})
+
+    return {"access_token": access_token, "token_type": "bearer", "refresh_token": refresh_token}
+
+
+# Implement a token refresh endpoint
+@router.post("/refresh-token")
+def refresh_access_token(refresh_token: str, db: Session = Depends(get_db)):
+    # Verify the refresh token
+    user_id = verify_refresh_token(refresh_token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    # Generate a new access token
+    access_token = create_access_token(data={"user_id": user_id})
+
     return {"access_token": access_token, "token_type": "bearer"}
+
 
 # @router.get("/{user_id}", response_model=UserSchema)
 @router.get("/{user_id}")

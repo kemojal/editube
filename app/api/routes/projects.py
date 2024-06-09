@@ -139,7 +139,5 @@ def remove_collaborator(project_id: int, user_id: int, db: Session = Depends(get
 def get_user_projects(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     created_projects = db.query(Project).filter(Project.creator_id == current_user.id).all()
     collaborated_projects = db.query(Project).join(ProjectCollaborator).filter(ProjectCollaborator.user_id == current_user.id).all()
-    return {
-        "created_projects": created_projects,
-        "collaborated_projects": collaborated_projects
-    }
+    all_projects = created_projects + collaborated_projects
+    return all_projects

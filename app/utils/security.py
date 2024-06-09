@@ -23,6 +23,7 @@ def verify_password(plain_password, hashed_password):
 SECRET_KEY = "5f647556f4a1a426f08fad0bbb8bbab058aee16e6478e034c3a86855461b7e26"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 30
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -65,3 +66,30 @@ def authenticate_user(db: Session, email: str, password: str):
     if not verify_password(password, user.hashed_password):
         return None
     return user
+
+
+#refresh token
+
+def create_refresh_token(data: dict):
+    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    data.update({"exp": expire})
+    return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
+
+def verify_token(token: str, secret_key: str):
+    try:
+        payload = jwt.decode(token, secret_key, algorithms=[ALGORITHM])
+        return payload
+    except jwt.JWTError:
+        return None
+
+def verify_access_token(token: str):
+    return verify_token(token, SECRET_KEY)
+
+def verify_refresh_token(token: str):
+    return verify_token(token, SECRET_KEY)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
