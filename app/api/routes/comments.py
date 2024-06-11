@@ -4,7 +4,7 @@ from typing import List
 
 from app.db.database import get_db
 from app.db.models import Project, Video, Comment, User
-from app.api.models.comments import CommentCreate, CommentUpdate
+from app.api.models.comments import CommentCreate, CommentUpdate, CommentResponse
 from app.utils.security import get_current_user
 
 router = APIRouter(
@@ -12,7 +12,7 @@ router = APIRouter(
     tags=["Comments"],
 )
 
-@router.post("/")
+@router.post("/", response_model=CommentResponse)
 def add_comment(project_id: int, video_id: int, comment: CommentCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     db_video = db.query(Video).filter(Video.id == video_id, Video.project_id == project_id).first()
     if not db_video:
@@ -32,7 +32,7 @@ def add_comment(project_id: int, video_id: int, comment: CommentCreate, db: Sess
     db.refresh(db_comment)
     return db_comment
 
-@router.get("/")
+@router.get("/", response_model=List[CommentResponse])
 def get_comments(project_id: int, video_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     db_video = db.query(Video).filter(Video.id == video_id, Video.project_id == project_id).first()
     if not db_video:
@@ -42,7 +42,7 @@ def get_comments(project_id: int, video_id: int, db: Session = Depends(get_db), 
         raise HTTPException(status_code=403, detail="Not authorized to access comments for this video")
     return db_video.comments
 
-@router.put("/{comment_id}")
+@router.put("/{comment_id}", response_model=CommentResponse)
 def update_comment(project_id: int, video_id: int, comment_id: int, comment: CommentUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     db_comment = db.query(Comment).filter(Comment.id == comment_id, Comment.video_id == video_id, Comment.video.project_id == project_id).first()
     if not db_comment:
@@ -60,7 +60,7 @@ def update_comment(project_id: int, video_id: int, comment_id: int, comment: Com
     db.refresh(db_comment)
     return db_comment
 
-@router.delete("/{comment_id}")
+@router.delete("/{comment_id}", response_model=CommentResponse)
 def delete_comment(project_id: int, video_id: int, comment_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     db_comment = db.query(Comment).filter(Comment.id == comment_id, Comment.video_id == video_id, Comment.video.project_id == project_id).first()
     if not db_comment:
