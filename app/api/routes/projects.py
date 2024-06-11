@@ -21,12 +21,16 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List
+import logging
 
 from app.db.database import get_db
 from app.db.models import Project, ProjectCollaborator, User
 from app.api.models.projects import ProjectCreate, ProjectUpdate, CollaboratorEmailList, ProjectResponse, UserResponse
 from app.utils.security import get_current_user
 from app.utils.email import send_invitation_email
+
+
+logger = logging.getLogger(__name__)  # Define or import logger
 
 router = APIRouter(
     prefix="/projects",
@@ -69,12 +73,22 @@ def create_project(project: ProjectCreate, db: Session = Depends(get_db), curren
 
 @router.get("/{project_id}", response_model=ProjectResponse)
 def get_project(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    db_project = db.query(Project).filter(Project.id == project_id).first()
-    if not db_project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    if current_user not in [db_project.creator] + [c.user for c in db_project.collaborators]:
-        raise HTTPException(status_code=403, detail="Not authorized to access this project")
-    return db_project
+    # db_project = db.query(Project).filter(Project.id == project_id).first()
+    # if not db_project:
+    #     raise HTTPException(status_code=404, detail="Project not found")
+    # if current_user not in [db_project.creator] + [c.user for c in db_project.collaborators]:
+    #     raise HTTPException(status_code=403, detail="Not authorized to access this project")
+    # return db_project
+    try:
+        db_project = db.query(Project).filter(Project.id == project_id).first()
+        if not db_project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if current_user not in [db_project.creator] + [c.user for c in db_project.collaborators]:
+            raise HTTPException(status_code=403, detail="Not authorized to access this project")
+        return convert_project_to_response(db_project)
+    except Exception as e:
+        logger.error(f"Error retrieving project {project_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.put("/{project_id}", response_model=ProjectResponse)
 def update_project(project_id: int, project: ProjectUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
