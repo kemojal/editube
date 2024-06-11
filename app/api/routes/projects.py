@@ -24,7 +24,7 @@ from typing import List
 
 from app.db.database import get_db
 from app.db.models import Project, ProjectCollaborator, User
-from app.api.models.projects import ProjectCreate, ProjectUpdate, CollaboratorEmailList
+from app.api.models.projects import ProjectCreate, ProjectUpdate, CollaboratorEmailList, ProjectResponse, UserResponse
 from app.utils.security import get_current_user
 from app.utils.email import send_invitation_email
 
@@ -32,6 +32,32 @@ router = APIRouter(
     prefix="/projects",
     tags=["Projects"],
 )
+
+
+def convert_project_to_response(db_project: Project) -> ProjectResponse:
+    return ProjectResponse(
+        id=db_project.id,
+        name=db_project.name,
+        description=db_project.description,
+        created_at=db_project.created_at.isoformat(),
+        updated_at=db_project.updated_at.isoformat(),
+        creator=UserResponse(
+            id=db_project.creator.id,
+            name=db_project.creator.name,
+            email=db_project.creator.email,
+            created_at=db_project.creator.created_at.isoformat(),
+            updated_at=db_project.creator.updated_at.isoformat()
+        ),
+        collaborators=[
+            UserResponse(
+                id=collaborator.user.id,
+                name=collaborator.user.name,
+                email=collaborator.user.email,
+                created_at=collaborator.user.created_at.isoformat(),
+                updated_at=collaborator.user.updated_at.isoformat()
+            ) for collaborator in db_project.collaborators
+        ]
+    )
 
 @router.post("/")
 def create_project(project: ProjectCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -41,7 +67,7 @@ def create_project(project: ProjectCreate, db: Session = Depends(get_db), curren
     db.refresh(db_project)
     return db_project
 
-@router.get("/{project_id}")
+@router.get("/{project_id}", response_model=ProjectResponse)
 def get_project(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     db_project = db.query(Project).filter(Project.id == project_id).first()
     if not db_project:
@@ -50,7 +76,7 @@ def get_project(project_id: int, db: Session = Depends(get_db), current_user: Us
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
     return db_project
 
-@router.put("/{project_id}")
+@router.put("/{project_id}", response_model=ProjectResponse)
 def update_project(project_id: int, project: ProjectUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     db_project = db.query(Project).filter(Project.id == project_id).first()
     if not db_project:
@@ -62,7 +88,8 @@ def update_project(project_id: int, project: ProjectUpdate, db: Session = Depend
         setattr(db_project, key, value)
     db.commit()
     db.refresh(db_project)
-    return db_project
+    return convert_project_to_response(db_project)
+    # return db_project
 
 @router.delete("/{project_id}")
 def delete_project(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -132,7 +159,8 @@ def remove_collaborator(project_id: int, user_id: int, db: Session = Depends(get
     db.delete(collaborator)
     db.commit()
     db.refresh(db_project)
-    return db_project
+    return convert_project_to_response(db_project)
+    # return db_project
 
 
 @router.get("/")
@@ -140,4 +168,5 @@ def get_user_projects(db: Session = Depends(get_db), current_user: User = Depend
     created_projects = db.query(Project).filter(Project.creator_id == current_user.id).all()
     collaborated_projects = db.query(Project).join(ProjectCollaborator).filter(ProjectCollaborator.user_id == current_user.id).all()
     all_projects = created_projects + collaborated_projects
-    return all_projects
+    return [convert_project_to_response(project) for project in all_projects]
+    # return all_projects

@@ -1,4 +1,6 @@
 from pydantic import BaseModel
+from typing import List
+from datetime import datetime
 
 class ProjectBase(BaseModel):
     name: str
@@ -19,3 +21,26 @@ class ProjectCollaboratorUpdate(BaseModel):
 
 class CollaboratorEmailList(BaseModel):
     collaborator_emails: list[str]
+
+
+class UserResponse(BaseModel):
+    id: int
+    name: str
+    email: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        orm_mode = True
+
+class ProjectResponse(BaseModel):
+    id: int
+    name: str
+    description: str
+    created_at: datetime
+    updated_at: datetime
+    creator: UserResponse
+    collaborators: List[UserResponse]
+
+    class Config:
+        orm_mode = True

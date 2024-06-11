@@ -1,9 +1,12 @@
 import cloudinary
+import os 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 # from app.websocket_manager import app as websocket_app
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api import api_router
+
 
 app = FastAPI()
 
@@ -27,11 +30,17 @@ app.add_middleware(
 
 
 
+load_dotenv()
           
+# cloudinary.config( 
+#   cloud_name = "dtpnbesbx", 
+#   api_key = "811133693665998", 
+#   api_secret = "1YJOBmJ9LN1Aqhyc8AlUoAOHF9A" 
+# )
 cloudinary.config( 
-  cloud_name = "dtpnbesbx", 
-  api_key = "811133693665998", 
-  api_secret = "1YJOBmJ9LN1Aqhyc8AlUoAOHF9A" 
+  cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"), 
+  api_key = os.getenv("CLOUDINARY_API_KEY"), 
+  api_secret = os.getenv("CLOUDINARY_API_SECRET") 
 )
 
 app.include_router(api_router)

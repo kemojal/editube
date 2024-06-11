@@ -8,3 +8,5 @@ alembic
 passlib
 cloudinary
 bcrypt
+python-dotenv
+python-multipart

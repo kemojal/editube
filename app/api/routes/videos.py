@@ -7,7 +7,8 @@ from app.db.models import Project, Video, User
 from app.api.models.videos import VideoCreate, VideoUpdate
 from app.utils.security import get_current_user
 from app.utils.storage import upload_file, delete_file
-import app.utils.cloudinary as upload_file_to_cloudinary
+# import app.utils.cloudinary as upload_file_to_cloudinary
+from app.utils.cloudinary import upload_file_to_cloudinary
 
 router = APIRouter(
     prefix="/projects/{project_id}/videos",
@@ -41,7 +42,7 @@ router = APIRouter(
 
 @router.post("/")
 def upload_video(project_id: int, video: VideoCreate, video_file: UploadFile = File(...), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    print("hello video upload")
+   
     db_project = db.query(Project).filter(Project.id == project_id).first()
     if not db_project:
         raise HTTPException(status_code=404, detail="Project not found")
