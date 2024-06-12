@@ -26,6 +26,16 @@ class UserBase(BaseModel):
     name: str
     role: str
 
+
+class UserResponse(BaseModel):
+    id: int
+    name: str
+    email: str
+    role: str
+
+    class Config:
+        orm_mode = True
+
 class UserCreate(UserBase):
     password: str
 

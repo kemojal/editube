@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from ..models.users import User as UserSchema, UserCreate, UserUpdate, UserRegisterSchema, UserLoginSchema
 from ...db.database import get_db
 from app.db.models import User
+from app.api.models.users import UserResponse
 from ...utils.security import get_password_hash, verify_password, get_current_user, create_access_token, create_refresh_token, verify_refresh_token
 
 router = APIRouter(
@@ -70,13 +71,16 @@ def refresh_access_token(refresh_token: str, db: Session = Depends(get_db)):
 
 
 # @router.get("/{user_id}", response_model=UserSchema)
-@router.get("/{user_id}")
+@router.get("/{user_id}", response_model=UserResponse)
 def get_user(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    userQuery = user = db.query(User)
-    print("user query  = ", userQuery)
+    # Check if the user_id matches the current logged-in user's id
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this user")
+    
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    
     return user
 
 @router.put("/{user_id}")
