@@ -1,4 +1,5 @@
 from sqlalchemy import Column, Integer, String, ForeignKey, Text, Boolean, ARRAY
+from sqlalchemy.dialects.postgresql import JSONB, NUMRANGE
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql.sqltypes import TIMESTAMP
 from sqlalchemy.sql import func
@@ -56,6 +57,7 @@ class Video(Base):
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
     comments = relationship("Comment", back_populates="video")
+    annotations = relationship("Annotation", back_populates="video")
 
 class Comment(Base):
     __tablename__ = "comments"
@@ -68,6 +70,21 @@ class Comment(Base):
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
     video = relationship("Video", back_populates="comments")
+    user = relationship("User")
+
+
+class Annotation(Base):
+    __tablename__ = "annotations"
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    annotation_type = Column(String(50), nullable=False)
+    annotation_data = Column(JSONB, nullable=False)
+    timecode = Column(NUMRANGE, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    video = relationship("Video", back_populates="annotations")
     user = relationship("User")
 
 class Notification(Base):
