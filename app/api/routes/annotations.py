@@ -84,24 +84,42 @@ def get_video_annotations(
     #     )
     #     for annotation in annotations
     # ]
+#     annotation_responses = [
+#     AnnotationResponse(
+#         id=annotation.id,
+#         video_id=annotation.video_id,
+#         user=UserResponse(
+#             id=annotation.user.id,
+#             name=annotation.user.name,
+#             email=annotation.user.email,
+#             role=annotation.user.role
+#         ),
+#         annotation_type=annotation.annotation_type,
+#         annotation_data=annotation.annotation_data,
+#         timecode=str(annotation.timecode),
+#         created_at=annotation.created_at,
+#         updated_at=annotation.updated_at
+#     )
+#     for annotation in annotations
+# ]
     annotation_responses = [
-    AnnotationResponse(
-        id=annotation.id,
-        video_id=annotation.video_id,
-        user=UserResponse(
-            id=annotation.user.id,
-            name=annotation.user.name,
-            email=annotation.user.email,
-            role=annotation.user.role
-        ),
-        annotation_type=annotation.annotation_type,
-        annotation_data=annotation.annotation_data,
-        timecode=str(annotation.timecode),
-        created_at=annotation.created_at,
-        updated_at=annotation.updated_at
-    )
-    for annotation in annotations
-]
+        AnnotationResponse(
+            id=annotation.id,
+            video_id=annotation.video_id,
+            user=UserResponse(
+                id=annotation.user.id,
+                name=annotation.user.name,
+                email=annotation.user.email,
+                role=annotation.user.role
+            ),
+            annotation_data=annotation.annotation_data,
+            annotation_type=annotation.annotation_type,
+            timecode=str(annotation.timecode),
+            created_at=annotation.created_at,
+            updated_at=annotation.updated_at
+        )
+        for annotation in annotations
+    ]
     
     return annotation_responses
 
