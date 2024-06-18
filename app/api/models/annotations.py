@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
 # from app.api.models.users import UserResponse
 
 class AnnotationBase(BaseModel):
@@ -32,7 +32,7 @@ class AnnotationResponse(BaseModel):
     video_id: int
     # user_id: int
     user: UserResponse
-    annotation_data: Optional[dict] = None
+    annotation_data: Optional[Dict[str, str]] = None
     annotation_type: Optional[str] = None
     # timecode: str  # Adjust to str if SQLAlchemy provides a string
     created_at: datetime
