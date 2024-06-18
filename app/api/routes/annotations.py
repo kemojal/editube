@@ -112,15 +112,19 @@ def get_video_annotations(
                 email=annotation.user.email,
                 role=annotation.user.role
             ),
-            annotation_data=annotation.annotation_data,
             annotation_type=annotation.annotation_type,
+            annotation_data={
+                'x': str(annotation.annotation_data.get('x')),
+                'y': str(annotation.annotation_data.get('y')),
+                'width': str(annotation.annotation_data.get('width')),
+                'height': str(annotation.annotation_data.get('height'))
+            },
             timecode=str(annotation.timecode),
             created_at=annotation.created_at,
             updated_at=annotation.updated_at
         )
         for annotation in annotations
     ]
-    
     return annotation_responses
 
 
