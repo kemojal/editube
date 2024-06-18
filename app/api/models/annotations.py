@@ -25,18 +25,17 @@ class UserResponse(BaseModel):
     role: str
 
     class Config:
-        orm_mode = True
-        
+        orm_mode = True    
 class AnnotationResponse(BaseModel):
     id: int
     video_id: int
-    # user_id: int
-    user: UserResponse
-    annotation_data: Optional[Dict[str, str]] = None
+    user: UserResponse  # Ensure `user` is correctly populated as `UserResponse`
+    annotation_data: Optional[Dict[str, str]] = None  # Adjust types as necessary
     annotation_type: Optional[str] = None
-    # timecode: str  # Adjust to str if SQLAlchemy provides a string
+    timecode: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
     class Config:
         orm_mode = True
+        
