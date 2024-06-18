@@ -31,10 +31,11 @@ class UserResponse(BaseModel):
 class AnnotationResponse( AnnotationBase):
     id: int
     video_id: int
-    user: UserResponse  # Ensure `user` is correctly populated as `UserResponse`
+    # user: UserResponse  # Ensure `user` is correctly populated as `UserResponse`
     # annotation_data: Optional[Dict[str, str]] = None  # Adjust types as necessary
     # annotation_type: Optional[str] = None
     # timecode: Optional[str] = None
+    user_id: int
     created_at: datetime
     updated_at: datetime
 
