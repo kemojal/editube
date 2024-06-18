@@ -80,7 +80,7 @@ class Annotation(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     annotation_type = Column(String(50), nullable=False)
     annotation_data = Column(JSONB, nullable=False)
-    timecode = Column(NUMRANGE, nullable=False)
+    timecode = Column(String, nullable=False)  # Assuming this should be a string
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 
