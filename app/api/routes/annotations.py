@@ -89,13 +89,13 @@ def get_video_annotations(
         AnnotationResponse(
             id=annotation.id,
             video_id=annotation.video_id,
-            # user=UserResponse(
-            #     id=annotation.user.id,
-            #     name=annotation.user.name,
-            #     email=annotation.user.email,
-            #     role=annotation.user.role
-            # ),
-            user_id=annotation.user_id,
+            user=UserResponse(
+                id=annotation.user.id,
+                name=annotation.user.name,
+                email=annotation.user.email,
+                role=annotation.user.role
+            ),
+            # user_id=annotation.user_id,
             annotation_type=annotation.annotation_type,
             annotation_data=annotation.annotation_data,
             timecode=str(annotation.timecode),
