@@ -45,6 +45,12 @@ def login_user(user_credentials: UserLoginSchema, db: Session = Depends(get_db))
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
+    if not user.hashed_password:
+        raise HTTPException(
+            status_code=401,
+            detail="This account uses Google sign-in. Continue with Google.",
+        )
+
     if not verify_password(user_credentials.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     

@@ -18,6 +18,7 @@
 # app/api/models/users.py
 
 from pydantic import BaseModel, EmailStr, ConfigDict
+from typing import Optional
 from sqlalchemy import Column, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
@@ -32,9 +33,10 @@ class UserResponse(BaseModel):
     name: str
     email: str
     role: str
+    auth_provider: Optional[str] = None
+    google_sub: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 class UserCreate(UserBase):
     password: str
@@ -94,5 +96,4 @@ class GoogleAccount(GoogleAccountBase):
     createdAt: datetime
     updatedAt: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
