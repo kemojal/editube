@@ -14,7 +14,17 @@ from .api import api_router
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+app = FastAPI(
+    title="Editube API",
+    description=(
+        "Backend API for Editube, powering authentication, projects, uploads, "
+        "video collaboration, comments, notifications, and analytics."
+    ),
+    version="1.0.0",
+    contact={
+        "name": "Editube Team",
+    },
+)
 
 
 origins = [
