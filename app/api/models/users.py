@@ -19,6 +19,7 @@
 
 from pydantic import BaseModel, EmailStr, ConfigDict
 from typing import Optional
+from typing import Literal
 from sqlalchemy import Column, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
@@ -45,6 +46,34 @@ class UserResponse(BaseModel):
     google_sub: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class UserSettingsResponse(BaseModel):
+    workspace_name: str = "My Workspace"
+    timezone: str = "America/Los_Angeles"
+    theme: str = "system"
+    date_format: str = "MMM d, yyyy"
+    email_comments: bool = True
+    email_mentions: bool = True
+    product_updates: bool = False
+    two_factor: bool = False
+    session_timeout: str = "30"
+    allow_project_invites: bool = True
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserSettingsUpdate(BaseModel):
+    workspace_name: Optional[str] = None
+    timezone: Optional[str] = None
+    theme: Optional[Literal["light", "dark", "system"]] = None
+    date_format: Optional[Literal["MMM d, yyyy", "yyyy-MM-dd", "MM/dd/yyyy"]] = None
+    email_comments: Optional[bool] = None
+    email_mentions: Optional[bool] = None
+    product_updates: Optional[bool] = None
+    two_factor: Optional[bool] = None
+    session_timeout: Optional[Literal["15", "30", "60", "120"]] = None
+    allow_project_invites: Optional[bool] = None
 
 
 class OnboardingProfileUpdate(BaseModel):

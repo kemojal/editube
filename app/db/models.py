@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, Text, Boolean, ARRAY
+from sqlalchemy import Column, Integer, String, ForeignKey, Text, Boolean, ARRAY, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, NUMRANGE
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql.sqltypes import TIMESTAMP
@@ -33,6 +33,48 @@ class User(Base):
     subscriptions = relationship(
         "Subscription", back_populates="user", cascade="all, delete-orphan"
     )
+    settings = relationship(
+        "UserSettings",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
+    workspace_name = Column(String, server_default="My Workspace", nullable=False)
+    timezone = Column(String, server_default="America/Los_Angeles", nullable=False)
+    theme = Column(String, server_default="system", nullable=False)
+    date_format = Column(String, server_default="MMM d, yyyy", nullable=False)
+    email_comments = Column(Boolean, server_default="true", nullable=False)
+    email_mentions = Column(Boolean, server_default="true", nullable=False)
+    product_updates = Column(Boolean, server_default="false", nullable=False)
+    two_factor = Column(Boolean, server_default="false", nullable=False)
+    session_timeout = Column(String, server_default="30", nullable=False)
+    allow_project_invites = Column(Boolean, server_default="true", nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", back_populates="settings")
+
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_id = Column(String, unique=True, nullable=False, index=True)
+    last_activity_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    revoked = Column(Boolean, server_default="false", nullable=False)
+    revoked_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User")
 
 
 class Subscription(Base):
@@ -423,6 +465,57 @@ class CommentLike(Base):
     created_at = Column(TIMESTAMP, server_default=func.now())
 
     comment = relationship("Comment", back_populates="likes")
+    user = relationship("User")
+
+
+class Suggestion(Base):
+    __tablename__ = "suggestions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String, nullable=False)
+    body = Column(Text, nullable=False)
+    category = Column(String, nullable=True)
+    status = Column(String, server_default="open", nullable=False)  # open|planned|in_progress|completed
+    upvotes_count = Column(Integer, server_default="0", nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User")
+    comments = relationship("SuggestionComment", back_populates="suggestion", cascade="all, delete-orphan")
+    votes = relationship("SuggestionVote", back_populates="suggestion", cascade="all, delete-orphan")
+
+
+class SuggestionComment(Base):
+    __tablename__ = "suggestion_comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    suggestion_id = Column(
+        Integer, ForeignKey("suggestions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    body = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    suggestion = relationship("Suggestion", back_populates="comments")
+    user = relationship("User")
+
+
+class SuggestionVote(Base):
+    __tablename__ = "suggestion_votes"
+    __table_args__ = (
+        UniqueConstraint("suggestion_id", "user_id", name="uq_suggestion_votes_suggestion_user"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    suggestion_id = Column(
+        Integer, ForeignKey("suggestions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    suggestion = relationship("Suggestion", back_populates="votes")
     user = relationship("User")
 
 

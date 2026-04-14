@@ -1,18 +1,25 @@
+import logging
+import os
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List
 
 from app.db.database import get_db
-from app.db.models import Project, Video, Comment, CommentLike, User
+from app.db.models import Project, Video, Comment, CommentLike, Notification, User, UserSettings
 from app.api.models.comments import (
     CommentCreate, CommentUpdate, CommentResponse, CommentWithRepliesResponse,
 )
+from app.jobs.queue import enqueue_mention_email_job
+from app.services.mentions import extract_mention_handles, resolve_mentioned_users
 from app.utils.security import get_current_user
+from app.websocket_manager import notifications_ws_manager
 
 router = APIRouter(
     prefix="/projects/{project_id}/videos/{video_id}/comments",
     tags=["Comments"],
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _check_video_access(project_id: int, video_id: int, db: Session, current_user: User):
@@ -90,14 +97,14 @@ def _comment_response(comment: Comment, current_user_id: int) -> dict:
 
 
 @router.post("/", response_model=CommentResponse)
-def add_comment(
+async def add_comment(
     project_id: int,
     video_id: int,
     comment: CommentCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _check_video_access(project_id, video_id, db, current_user)
+    db_video, db_project = _check_video_access(project_id, video_id, db, current_user)
 
     if comment.parent_id is not None:
         parent = db.query(Comment).filter(
@@ -119,6 +126,64 @@ def add_comment(
     db.add(db_comment)
     db.commit()
     db.refresh(db_comment)
+
+    handles = extract_mention_handles(comment.text or "")
+    if handles:
+        project_users = [db_project.creator] + [c.user for c in db_project.collaborators if c.user]
+        recipients = resolve_mentioned_users(
+            mention_handles=handles,
+            candidate_users=project_users,
+            actor_user_id=current_user.id,
+        )
+        frontend_base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+        comment_url = f"{frontend_base}/projects/{project_id}/videos/{video_id}?commentId={db_comment.id}"
+
+        created_notifications: list[Notification] = []
+        for recipient in recipients:
+            notification = Notification(
+                user_id=recipient.id,
+                type="mention",
+                project_id=project_id,
+                video_id=video_id,
+                comment_id=db_comment.id,
+                read=False,
+            )
+            db.add(
+                notification
+            )
+            created_notifications.append(notification)
+            settings = db.query(UserSettings).filter(UserSettings.user_id == recipient.id).first()
+            if settings is not None and not settings.email_mentions:
+                continue
+            queued = enqueue_mention_email_job(
+                recipient_user_id=recipient.id,
+                actor_name=current_user.name or current_user.email or "A teammate",
+                project_name=db_project.name,
+                video_name=db_video.name,
+                comment_text=db_comment.text or "",
+                comment_url=comment_url,
+            )
+            if not queued:
+                logger.warning("Mention email enqueue skipped/failed for user %s", recipient.id)
+
+        db.commit()
+        for notification in created_notifications:
+            await notifications_ws_manager.send_to_user(
+                notification.user_id,
+                {
+                    "event": "notification.new",
+                    "payload": {
+                        "id": notification.id,
+                        "type": notification.type,
+                        "read": notification.read,
+                        "project_id": notification.project_id,
+                        "video_id": notification.video_id,
+                        "comment_id": notification.comment_id,
+                        "created_at": notification.created_at.isoformat() if notification.created_at else None,
+                    },
+                },
+            )
+
     return _comment_response(db_comment, current_user.id)
 
 

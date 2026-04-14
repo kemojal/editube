@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.db.models import User
-from app.utils.security import create_access_token, create_refresh_token
+from app.utils.security import create_access_token, create_refresh_token, create_user_session
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -135,8 +135,11 @@ def google_oauth_callback(req: Request, code: str | None = None, error: str | No
         db.commit()
         db.refresh(user)
 
-    app_access_token = create_access_token(data={"user_id": user.id, "onboarding_completed": user.onboarding_completed})
-    app_refresh_token = create_refresh_token(data={"user_id": user.id})
+    session_id = create_user_session(db, user.id)
+    app_access_token = create_access_token(
+        data={"user_id": user.id, "onboarding_completed": user.onboarding_completed, "sid": session_id}
+    )
+    app_refresh_token = create_refresh_token(data={"user_id": user.id, "sid": session_id})
     redirect_url = (
         f"{frontend_callback}?access_token={parse.quote(app_access_token)}"
         f"&refresh_token={parse.quote(app_refresh_token)}"

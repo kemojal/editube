@@ -20,19 +20,29 @@ _VIDEO_CHUNK_BYTES = 6 * 1024 * 1024
 _CLOUDINARY_UPLOAD_TIMEOUT = 900  # seconds; large videos + processing need headroom
 
 
-def upload_file_to_cloudinary(file: UploadFile) -> str:
+def upload_file_to_cloudinary(file: UploadFile, resource_type: str = "video") -> str:
     try:
         stream = file.file
         if hasattr(stream, "seek"):
             stream.seek(0)
-        # Chunked upload avoids nginx/Cloudinary 413 on large single-request bodies
-        result = cloudinary.uploader.upload_large(
-            stream,
-            resource_type="video",
-            filename=file.filename or "video",
-            chunk_size=_VIDEO_CHUNK_BYTES,
-            timeout=_CLOUDINARY_UPLOAD_TIMEOUT,
-        )
+        if resource_type == "image":
+            # Regular upload for avatars/images so jpeg/jpg/png/webp are handled correctly.
+            result = cloudinary.uploader.upload(
+                stream,
+                resource_type="image",
+                filename=file.filename or "avatar",
+                timeout=_CLOUDINARY_UPLOAD_TIMEOUT,
+                allowed_formats=["jpg", "jpeg", "png", "webp"],
+            )
+        else:
+            # Chunked upload avoids nginx/Cloudinary 413 on large single-request bodies
+            result = cloudinary.uploader.upload_large(
+                stream,
+                resource_type="video",
+                filename=file.filename or "video",
+                chunk_size=_VIDEO_CHUNK_BYTES,
+                timeout=_CLOUDINARY_UPLOAD_TIMEOUT,
+            )
         url = result.get("secure_url")
         if not url:
             raise HTTPException(
@@ -60,7 +70,11 @@ def upload_file_to_cloudinary(file: UploadFile) -> str:
 
 async def upload_image(image: UploadFile):
     try:
-        upload_result = cloudinary.uploader.upload(image.file, resource_type="video")
+        upload_result = cloudinary.uploader.upload(
+            image.file,
+            resource_type="image",
+            allowed_formats=["jpg", "jpeg", "png", "webp"],
+        )
         return upload_result["secure_url"]
     except CloudinaryError as e:
         err = str(e)

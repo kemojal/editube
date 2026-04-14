@@ -4,11 +4,14 @@ import os
 import re
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .api import api_router
+from .db.database import SessionLocal
+from .utils.security import authenticate_access_token
+from .websocket_manager import notifications_ws_manager
 
 load_dotenv()
 
@@ -86,6 +89,40 @@ app.include_router(api_router)
 
 # Include the WebSocket app
 # app.mount("/", websocket_app)
+
+
+@app.websocket("/ws/notifications")
+async def notifications_websocket(websocket: WebSocket):
+    token = websocket.query_params.get("token")
+    if not token:
+        auth_header = websocket.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+
+    if not token:
+        await websocket.close(code=1008)
+        return
+
+    db = SessionLocal()
+    try:
+        user = authenticate_access_token(db, token, touch_session=True)
+    except Exception:
+        db.close()
+        await websocket.close(code=1008)
+        return
+
+    user_id = user.id
+    db.close()
+    await notifications_ws_manager.connect(user_id, websocket)
+
+    try:
+        while True:
+            # Heartbeat; no-op payload keeps connection alive.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        notifications_ws_manager.disconnect(user_id, websocket)
+    except Exception:
+        notifications_ws_manager.disconnect(user_id, websocket)
 
 
 @app.get("/health")

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import secrets
 import hashlib
+import logging
+import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -48,17 +50,22 @@ from app.api.models.review_links import (
 from app.db.database import get_db
 from app.db.models import (
     Comment,
+    Notification,
     Project,
     ReviewEvent,
     ReviewLink,
     ReviewMagicToken,
     ReviewSignoff,
     ReviewSession,
+    UserSettings,
     User,
     Video,
     ReviewCommentDraft,
 )
+from app.jobs.queue import enqueue_mention_email_job
+from app.services.mentions import extract_mention_handles, resolve_mentioned_users
 from app.utils.email import send_review_magic_link_email
+from app.websocket_manager import notifications_ws_manager
 from app.utils.security import (
     get_current_user,
     get_password_hash,
@@ -74,6 +81,8 @@ auth_router = APIRouter(
     prefix="/projects/{project_id}/videos/{video_id}/review-links",
     tags=["Review Links"],
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _check_video_owner(
@@ -672,7 +681,7 @@ def list_public_comments(token: str, db: Session = Depends(get_db)):
 @public_router.post(
     "/{token}/comments", response_model=PublicReviewCommentResponse
 )
-def create_public_comment(
+async def create_public_comment(
     token: str,
     body: PublicReviewCommentCreate,
     db: Session = Depends(get_db),
@@ -719,6 +728,62 @@ def create_public_comment(
     )
     db.commit()
     db.refresh(comment)
+
+    handles = extract_mention_handles(body.text or "")
+    if handles:
+        video = db.query(Video).filter(Video.id == link.video_id).first()
+        project = db.query(Project).filter(Project.id == video.project_id).first() if video else None
+        if project:
+            project_users = [project.creator] + [c.user for c in project.collaborators if c.user]
+            recipients = resolve_mentioned_users(handles, project_users)
+            frontend_base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+            comment_url = f"{frontend_base}/projects/{project.id}/videos/{link.video_id}?commentId={comment.id}"
+            actor_name = session.guest_name or session.guest_email or "Guest reviewer"
+
+            created_notifications: list[Notification] = []
+            for recipient in recipients:
+                notification = Notification(
+                    user_id=recipient.id,
+                    type="mention",
+                    project_id=project.id,
+                    video_id=link.video_id,
+                    comment_id=comment.id,
+                    read=False,
+                )
+                db.add(notification)
+                created_notifications.append(notification)
+                settings = db.query(UserSettings).filter(UserSettings.user_id == recipient.id).first()
+                if settings is not None and not settings.email_mentions:
+                    continue
+                queued = enqueue_mention_email_job(
+                    recipient_user_id=recipient.id,
+                    actor_name=actor_name,
+                    project_name=project.name,
+                    video_name=video.name if video else None,
+                    comment_text=comment.text or "",
+                    comment_url=comment_url,
+                )
+                if not queued:
+                    logger.warning("Mention email enqueue skipped/failed for user %s", recipient.id)
+
+            db.commit()
+            for notification in created_notifications:
+                await notifications_ws_manager.send_to_user(
+                    notification.user_id,
+                    {
+                        "event": "notification.new",
+                        "payload": {
+                            "id": notification.id,
+                            "type": notification.type,
+                            "read": notification.read,
+                            "project_id": notification.project_id,
+                            "video_id": notification.video_id,
+                            "comment_id": notification.comment_id,
+                            "created_at": notification.created_at.isoformat() if notification.created_at else None,
+                        },
+                    },
+                )
+
     return _serialize_public_comment(comment)
 
 

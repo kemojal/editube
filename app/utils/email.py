@@ -200,3 +200,40 @@ def send_review_magic_link_email(
     <p>If you did not request this, you can ignore this email.</p>
     """
     return send_transactional_email(to_email, subject, text, html)
+
+
+def send_comment_mention_email(
+    to_email: str,
+    recipient_name: str | None,
+    actor_name: str,
+    project_name: str | None,
+    video_name: str | None,
+    comment_text: str,
+    comment_url: str,
+) -> bool:
+    subject_scope = video_name or project_name or "a video"
+    subject = f"You were mentioned in {subject_scope}"
+    greet = f"Hi {recipient_name}," if recipient_name else "Hi,"
+    preview = (comment_text or "").strip()
+    if len(preview) > 220:
+        preview = preview[:217].rstrip() + "..."
+
+    text = (
+        f"{greet}\n\n"
+        f"{actor_name} mentioned you in a comment on Editube.\n\n"
+        f"Project: {project_name or 'Unknown project'}\n"
+        f"Video: {video_name or 'Unknown video'}\n\n"
+        f"Comment:\n\"{preview}\"\n\n"
+        f"Open comment: {comment_url}\n\n"
+        "You can update mention email preferences in Account settings."
+    )
+    html = f"""
+    <p>{greet}</p>
+    <p><strong>{actor_name}</strong> mentioned you in a comment on Editube.</p>
+    <p>Project: <strong>{project_name or "Unknown project"}</strong><br/>Video: <strong>{video_name or "Unknown video"}</strong></p>
+    <p>Comment:</p>
+    <blockquote>{preview}</blockquote>
+    <p><a href="{comment_url}">Open comment</a></p>
+    <p>You can update mention email preferences in Account settings.</p>
+    """
+    return send_transactional_email(to_email, subject, text, html)

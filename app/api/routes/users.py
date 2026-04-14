@@ -1,18 +1,64 @@
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile
+from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
-from ..models.users import User as UserSchema, UserCreate, UserUpdate, UserRegisterSchema, UserLoginSchema, OnboardingProfileUpdate, OnboardingWorkflowUpdate, OnboardingPlanUpdate
+from ..models.users import User as UserSchema, UserCreate, UserUpdate, UserRegisterSchema, UserLoginSchema, OnboardingProfileUpdate, OnboardingWorkflowUpdate, OnboardingPlanUpdate, UserSettingsResponse, UserSettingsUpdate
 from ...db.database import get_db
-from app.db.models import User
+from app.db.models import User, UserSettings
 from app.api.models.users import UserResponse
-from ...utils.security import get_password_hash, verify_password, get_current_user, create_access_token, create_refresh_token, verify_refresh_token
+from ...utils.security import (
+    get_password_hash,
+    verify_password,
+    get_current_user,
+    create_access_token,
+    create_refresh_token,
+    verify_refresh_token,
+    create_user_session,
+    validate_refresh_session,
+    decode_access_token_payload,
+    revoke_user_session,
+)
 from app.utils.cloudinary import upload_file_to_cloudinary
 
 router = APIRouter(
     prefix="/users",
     tags=["Users"],
 )
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+
+DEFAULT_USER_SETTINGS = {
+    "workspace_name": "My Workspace",
+    "timezone": "America/Los_Angeles",
+    "theme": "system",
+    "date_format": "MMM d, yyyy",
+    "email_comments": True,
+    "email_mentions": True,
+    "product_updates": False,
+    "two_factor": False,
+    "session_timeout": "30",
+    "allow_project_invites": True,
+}
+ALLOWED_TIMEZONES = {
+    "America/Los_Angeles",
+    "America/New_York",
+    "Europe/London",
+    "Asia/Singapore",
+}
+ALLOWED_DATE_FORMATS = {"MMM d, yyyy", "yyyy-MM-dd", "MM/dd/yyyy"}
+
+
+def get_or_create_user_settings(db: Session, user_id: int) -> UserSettings:
+    settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+    if settings:
+        return settings
+
+    settings = UserSettings(user_id=user_id, **DEFAULT_USER_SETTINGS)
+    db.add(settings)
+    db.commit()
+    db.refresh(settings)
+    return settings
 
 # @router.post("/register")
 # def register_user(user_data: UserRegisterSchema, db: Session = Depends(get_db)):
@@ -41,8 +87,11 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_user)
 
-    access_token = create_access_token(data={"user_id": db_user.id, "onboarding_completed": False})
-    refresh_token = create_refresh_token(data={"user_id": db_user.id})
+    session_id = create_user_session(db, db_user.id)
+    access_token = create_access_token(
+        data={"user_id": db_user.id, "onboarding_completed": False, "sid": session_id}
+    )
+    refresh_token = create_refresh_token(data={"user_id": db_user.id, "sid": session_id})
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -65,8 +114,15 @@ def login_user(user_credentials: UserLoginSchema, db: Session = Depends(get_db))
     if not verify_password(user_credentials.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
-    access_token = create_access_token(data={"user_id": user.id, "onboarding_completed": user.onboarding_completed})
-    refresh_token = create_refresh_token(data={"user_id": user.id})
+    session_id = create_user_session(db, user.id)
+    access_token = create_access_token(
+        data={
+            "user_id": user.id,
+            "onboarding_completed": user.onboarding_completed,
+            "sid": session_id,
+        }
+    )
+    refresh_token = create_refresh_token(data={"user_id": user.id, "sid": session_id})
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -85,29 +141,50 @@ def refresh_access_token(body: RefreshTokenBody, db: Session = Depends(get_db)):
     payload = verify_refresh_token(body.refresh_token)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
-    user_id = payload.get("user_id")
-    if user_id is None:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    user_id = validate_refresh_session(db, payload)
     user = db.query(User).filter(User.id == int(user_id)).first()
-    if not user:
+    if not user:  # defensive; validate_refresh_session already checks this
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+    session_id = payload.get("sid")
 
     access_token = create_access_token(
-        data={"user_id": user.id, "onboarding_completed": user.onboarding_completed}
+        data={"user_id": user.id, "onboarding_completed": user.onboarding_completed, "sid": session_id}
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
 
 @router.post("/sync-access-token")
-def sync_access_token(current_user: User = Depends(get_current_user)):
+def sync_access_token(
+    token: str = Depends(oauth2_scheme),
+    current_user: User = Depends(get_current_user),
+):
     """Mint a new access token with current onboarding flags (e.g. after Stripe checkout)."""
+    payload = decode_access_token_payload(token)
+    session_id = payload.get("sid")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Session missing. Please sign in again.")
     access_token = create_access_token(
         data={
             "user_id": current_user.id,
             "onboarding_completed": current_user.onboarding_completed,
+            "sid": session_id,
         }
     )
     return {"access_token": access_token, "token_type": "bearer"}
+
+
+@router.post("/logout")
+def logout_user(
+    token: str = Depends(oauth2_scheme),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    payload = decode_access_token_payload(token)
+    session_id = payload.get("sid")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Session missing. Please sign in again.")
+    revoke_user_session(db, current_user.id, session_id)
+    return {"ok": True}
 
 
 # ── Onboarding Endpoints (must be before /{user_id} to avoid route conflict) ──
@@ -118,6 +195,46 @@ def get_current_user_profile(
     current_user: User = Depends(get_current_user),
 ):
     return current_user
+
+
+@router.get("/me/settings", response_model=UserSettingsResponse)
+def get_current_user_settings(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return get_or_create_user_settings(db, current_user.id)
+
+
+@router.put("/me/settings", response_model=UserSettingsResponse)
+def update_current_user_settings(
+    data: UserSettingsUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    settings = get_or_create_user_settings(db, current_user.id)
+    update_data = data.model_dump(exclude_unset=True)
+
+    if "theme" in update_data and update_data["theme"] not in {"light", "dark", "system"}:
+        raise HTTPException(status_code=400, detail="Invalid theme")
+
+    if "session_timeout" in update_data and update_data["session_timeout"] not in {"15", "30", "60", "120"}:
+        raise HTTPException(status_code=400, detail="Invalid session timeout")
+    if "timezone" in update_data and update_data["timezone"] not in ALLOWED_TIMEZONES:
+        raise HTTPException(status_code=400, detail="Invalid timezone")
+    if "date_format" in update_data and update_data["date_format"] not in ALLOWED_DATE_FORMATS:
+        raise HTTPException(status_code=400, detail="Invalid date format")
+    if "workspace_name" in update_data:
+        value = (update_data["workspace_name"] or "").strip()
+        if not value:
+            raise HTTPException(status_code=400, detail="Workspace name cannot be empty")
+        update_data["workspace_name"] = value[:120]
+
+    for key, value in update_data.items():
+        setattr(settings, key, value)
+
+    db.commit()
+    db.refresh(settings)
+    return settings
 
 
 @router.put("/onboarding/profile", response_model=UserResponse)
@@ -142,7 +259,7 @@ def onboarding_upload_avatar(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    file_url = upload_file_to_cloudinary(file)
+    file_url = upload_file_to_cloudinary(file, resource_type="image")
     current_user.avatar_url = file_url
     db.commit()
     db.refresh(current_user)

@@ -8,7 +8,7 @@ from fastapi.security import OAuth2PasswordBearer
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 from app.db.database import get_db
-from app.db.models import User
+from app.db.models import User, UserSettings, UserSession
 
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -37,30 +37,56 @@ def create_access_token(data: dict):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+
+def create_user_session(db: Session, user_id: int) -> str:
+    session_id = os.urandom(16).hex()
+    session = UserSession(user_id=user_id, session_id=session_id)
+    db.add(session)
+    db.commit()
+    return session_id
+
+
+def _session_timeout_minutes_for_user(db: Session, user_id: int) -> int:
+    settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+    if not settings:
+        return 30
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("user_id")
-        if user_id is None:
-            raise credentials_exception
-    except ExpiredSignatureError:
+        return int(settings.session_timeout)
+    except (TypeError, ValueError):
+        return 30
+
+
+def _validate_and_touch_session(db: Session, user_id: int, session_id: str) -> None:
+    session = (
+        db.query(UserSession)
+        .filter(UserSession.user_id == user_id, UserSession.session_id == session_id)
+        .first()
+    )
+    if not session or session.revoked:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired",
+            detail="Session is no longer active",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    except JWTError:
-        raise credentials_exception
-    
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None:
-        raise credentials_exception
-    return user
+
+    now = datetime.utcnow()
+    timeout_minutes = _session_timeout_minutes_for_user(db, user_id)
+    inactivity_deadline = session.last_activity_at + timedelta(minutes=timeout_minutes)
+    if now > inactivity_deadline:
+        session.revoked = True
+        session.revoked_at = now
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired due to inactivity",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    session.last_activity_at = now
+    db.commit()
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    return authenticate_access_token(db, token, touch_session=True)
 
 
 
@@ -92,6 +118,75 @@ def verify_access_token(token: str):
 
 def verify_refresh_token(token: str):
     return verify_token(token, SECRET_KEY)
+
+
+def decode_access_token_payload(token: str) -> dict:
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid access token")
+
+
+def authenticate_access_token(db: Session, token: str, touch_session: bool = True) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("user_id")
+        session_id = payload.get("sid")
+        if user_id is None:
+            raise credentials_exception
+        if not session_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session missing. Please sign in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise credentials_exception
+    if touch_session:
+        _validate_and_touch_session(db, user.id, session_id)
+    return user
+
+
+def validate_refresh_session(db: Session, payload: dict) -> int:
+    user_id = payload.get("user_id")
+    session_id = payload.get("sid")
+    if user_id is None or not session_id:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    _validate_and_touch_session(db, user.id, session_id)
+    return user.id
+
+
+def revoke_user_session(db: Session, user_id: int, session_id: str) -> None:
+    session = (
+        db.query(UserSession)
+        .filter(UserSession.user_id == user_id, UserSession.session_id == session_id)
+        .first()
+    )
+    if not session or session.revoked:
+        return
+    session.revoked = True
+    session.revoked_at = datetime.utcnow()
+    db.commit()
 
 def get_password_hash(password):
     return pwd_context.hash(password)
