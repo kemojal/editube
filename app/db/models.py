@@ -126,6 +126,11 @@ class Video(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+    ai_results = relationship(
+        "AiResult",
+        back_populates="video",
+        cascade="all, delete-orphan",
+    )
 
 
 class VideoTranscription(Base):
@@ -145,12 +150,38 @@ class VideoTranscription(Base):
         server_default="pending",
     )  # pending, queued, processing, completed, failed
     segments = Column(JSONB, nullable=True)
+    speakers = Column(JSONB, nullable=True)
+    speaker_count = Column(Integer, nullable=True)
     error_message = Column(Text, nullable=True)
     model_name = Column(String, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
     video = relationship("Video", back_populates="transcription")
+
+
+class AiResult(Base):
+    __tablename__ = "ai_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(
+        Integer,
+        ForeignKey("videos.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    result_type = Column(String, nullable=False, index=True)
+    status = Column(
+        String,
+        nullable=False,
+        server_default="completed",
+    )  # pending, processing, completed, failed
+    result_data = Column(JSONB, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    video = relationship("Video", back_populates="ai_results")
 
 
 class Comment(Base):

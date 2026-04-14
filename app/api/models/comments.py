@@ -38,7 +38,10 @@ class CommentResponse(BaseModel):
     drawing_data: Any | None = None
     is_resolved: bool = False
     is_private: bool = False
-    user: CommentUserResponse
+    user: Optional[CommentUserResponse] = None
+    guest_name: Optional[str] = None
+    guest_email: Optional[str] = None
+    review_link_id: Optional[int] = None
     likes_count: int = 0
     liked_by_me: bool = False
     replies_count: int = 0

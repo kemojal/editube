@@ -35,6 +35,8 @@ def transcription_to_dict(tr: VideoTranscription | None) -> dict[str, Any] | Non
     return {
         "status": tr.status,
         "segments": tr.segments,
+        "speakers": tr.speakers,
+        "speaker_count": tr.speaker_count,
         "error_message": tr.error_message,
     }
 

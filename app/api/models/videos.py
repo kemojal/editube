@@ -23,6 +23,8 @@ class VideoTranscriptionNested(BaseModel):
 
     status: str
     segments: Optional[List[Any]] = None
+    speakers: Optional[List[str]] = None
+    speaker_count: Optional[int] = None
     error_message: Optional[str] = None
 
     class Config:

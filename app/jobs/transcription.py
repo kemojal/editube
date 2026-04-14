@@ -92,6 +92,8 @@ def transcribe_video(video_id: int) -> None:
                     wav_size,
                 )
                 vt.segments = []
+                vt.speakers = []
+                vt.speaker_count = 0
                 vt.status = "completed"
                 vt.model_name = model_size
                 vt.error_message = None
@@ -104,16 +106,24 @@ def transcribe_video(video_id: int) -> None:
             segments_iter, _info = model.transcribe(str(wav_path), beam_size=5)
 
             segments: list[dict] = []
+            speaker_labels: set[str] = set()
             for seg in segments_iter:
+                # Minimal diarization-compatible shape.
+                # We preserve a deterministic speaker tag even before whisperx integration.
+                speaker = "SPEAKER_1"
+                speaker_labels.add(speaker)
                 segments.append(
                     {
                         "start": float(seg.start),
                         "end": float(seg.end),
                         "text": (seg.text or "").strip(),
+                        "speaker": speaker,
                     }
                 )
 
             vt.segments = segments
+            vt.speakers = sorted(speaker_labels)
+            vt.speaker_count = len(speaker_labels)
             vt.status = "completed"
             vt.model_name = model_size
             vt.error_message = None
@@ -136,6 +146,8 @@ def transcribe_video(video_id: int) -> None:
                 )
                 if row:
                     row.segments = []
+                    row.speakers = []
+                    row.speaker_count = 0
                     row.status = "completed"
                     row.model_name = os.environ.get("WHISPER_MODEL_SIZE", "base").strip() or "base"
                     row.error_message = None
