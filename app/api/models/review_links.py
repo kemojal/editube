@@ -61,6 +61,7 @@ class ReviewSessionSummary(BaseModel):
     id: int
     guest_name: Optional[str] = None
     guest_email: Optional[str] = None
+    guest_avatar_url: Optional[str] = None
     ip_address: Optional[str] = None
     total_watch_seconds: int
     max_position: int
