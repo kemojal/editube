@@ -7,8 +7,8 @@ FastAPI backend for the Editube project.
 - Python 3.10+ (tested here with Python 3.14)
 - pip
 - **PostgreSQL** (via `DATABASE_URL`)
-- **ffmpeg** on `PATH` (required for video **transcription** worker only; API process does not shell out to ffmpeg)
-- **Redis** (optional but recommended if you want uploads to enqueue transcription jobs)
+- **ffmpeg** on `PATH` (required for **transcription** and **aspect export** workers; the API process does not shell out to ffmpeg)
+- **Redis** (optional but recommended: transcription, YouTube publish, aspect exports, chapter synthesis, and mention emails all enqueue **RQ** jobs when `REDIS_URL` is set)
 
 ## Run locally
 
@@ -44,7 +44,7 @@ Configure `.env` (see your local template). Commonly used:
 | `CLOUDINARY_CLOUD_NAME` | Video/image storage |
 | `CLOUDINARY_API_KEY` | |
 | `CLOUDINARY_API_SECRET` | |
-| `REDIS_URL` | e.g. `redis://127.0.0.1:6379/0`. Used to enqueue **transcription** jobs after video upload. If unset, uploads still work but transcription stays **`pending`** (no job runs until Redis + worker are available). |
+| `REDIS_URL` | e.g. `redis://127.0.0.1:6379/0`. Used for **RQ** workers: transcription, **YouTube publish**, **aspect exports**, **LLM auto-chapters**, mention emails. If unset, those features stay queued/pending until Redis and a worker are available. |
 
 ### Email (SMTP)
 
@@ -113,6 +113,40 @@ Existing videos created before this feature will have **`transcription: null`** 
 | Stuck **`queued`** | No RQ worker running, or worker cannot import `app` (run worker from `editube/` with venv activated). |
 | **`failed`** with ffmpeg message | `ffmpeg` missing on the **worker** host, or bad/corrupt download. |
 | **`failed`** with CUDA / model errors | Wrong `TRANSCRIPTION_DEVICE` / `TRANSCRIPTION_COMPUTE_TYPE` for your machine. |
+
+## Creator studio (YouTube, aspect exports, chapters)
+
+### YouTube OAuth and publish
+
+1. **Google Cloud Console:** enable **YouTube Data API v3** for the same project as your OAuth client. Add authorized redirect URI for the backend callback, e.g. `http://127.0.0.1:8000/users/google/youtube/callback`, or set `GOOGLE_YOUTUBE_REDIRECT_URI` to that exact URL.
+2. **Env:** `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` (same as Google login), `TOKEN_ENCRYPTION_KEY` (Fernet key: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`), optional `FRONTEND_YOUTUBE_OAUTH_RETURN_URL` (where Google redirects the browser after connect; default uses `FRONTEND_BASE_URL`).
+3. **Connect:** authenticated `POST /users/google/youtube/authorize-url` returns `authorization_url`; the frontend opens it. Callback exchanges the code and stores an encrypted refresh token in **`user_youtube_connections`** (Alembic revision `z2b3c4d5e6f7`).
+4. **Publish:** `POST /creator/publications/{id}/publish` for `platform=youtube` enqueues **`app.jobs.youtube_publish.youtube_publish_job`**. The draft author (`created_by`) must have connected YouTube. Requires **ffmpeg** on the worker host to download the master file (same pattern as transcription).
+
+Optional **`YOUTUBE_PUBLISH_DRY_RUN=1`**: marks the publication published without calling YouTube (for smoke tests).
+
+**Scheduled uploads** use `status.publishAt` (YouTube requires a **verified** channel and privacy `private` until publish time). **Chapters** in the description are appended from `video_chapters` when uploading.
+
+### Aspect exports (ffmpeg + Cloudinary)
+
+`POST /creator/videos/{id}/aspect-exports` enqueues **`app.jobs.aspect_export.aspect_export_job`**: download source, center-crop to target aspect, upload to Cloudinary, set `output_path` to the secure URL. **`subject_tracking`** is reserved for a future ML path; v1 uses smart center crop only.
+
+### LLM auto-chapters
+
+`POST /creator/videos/{id}/chapters/auto` enqueues **`app.jobs.chapter_synthesis.chapter_synthesis_job`** (needs `GEMINI_API_KEY` / AI client config like other AI jobs). Writes `VideoChapter` rows with `source=llm`.
+
+### Single RQ worker
+
+The same worker process picks up all jobs:
+
+```bash
+cd editube
+source .venv/bin/activate
+export REDIS_URL=redis://127.0.0.1:6379/0
+rq worker -u "$REDIS_URL" default
+```
+
+Registered job callables include string paths such as **`app.jobs.youtube_publish.youtube_publish_job`**, **`app.jobs.aspect_export.aspect_export_job`**, and **`app.jobs.chapter_synthesis.chapter_synthesis_job`** (see `app/jobs/queue.py`).
 
 ## Docker and Dokploy (Hetzner)
 

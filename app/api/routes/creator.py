@@ -1,47 +1,58 @@
 """Creator-native routes: YouTube publish, aspect exports, chapters,
 end-screens, brand deals, thumbnail A/B variants.
 
-External integrations (YouTube Data API, AI reframe/subject tracking)
-are stubbed — routes persist state and emit TODO markers where a real
-worker or API call should run.
+Operational: YouTube upload, aspect exports, and chapter synthesis jobs need
+``REDIS_URL`` and ``rq worker``. YouTube publish uses the real Data API when
+OAuth is connected (see ``app.jobs.youtube_publish``). Other platforms use
+``StubPublisher`` until dedicated publishers exist.
+
+Aspect exports v1 use center / smart crop only — AI subject-tracking reframe
+is not implemented yet (see ``docs/future_plan.md`` §4). Auto-chapters need a
+video transcript plus AI config (``GEMINI_API_KEY`` / worker).
 """
+
+from datetime import datetime
+from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from typing import List
-from datetime import datetime
 
+from app.api.models.creator import (
+    AspectExportCreate,
+    AspectExportResponse,
+    BrandDealCreate,
+    BrandDealResponse,
+    BrandDealUpdate,
+    ChapterCreate,
+    ChapterResponse,
+    ChapterUpdate,
+    EndScreenBody,
+    EndScreenResponse,
+    PublicationCreate,
+    PublicationResponse,
+    PublicationUpdate,
+    ThumbnailVariantCreate,
+    ThumbnailVariantResponse,
+    ThumbnailVariantUpdate,
+    YoutubeChapterBlockResponse,
+)
 from app.db.database import get_db
 from app.db.models import (
-    Video,
+    BrandDeal,
     Project,
+    ThumbnailVariant,
     User,
-    VideoPublication,
+    UserYoutubeConnection,
+    Video,
     VideoAspectExport,
     VideoChapter,
     VideoEndScreen,
-    BrandDeal,
-    ThumbnailVariant,
+    VideoPublication,
 )
+from app.jobs.queue import enqueue_aspect_export_job, enqueue_chapter_synthesis_job
+from app.publishers import get_publisher
+from app.services.youtube_chapters import youtube_description_block
 from app.utils.security import get_current_user
-from app.api.models.creator import (
-    PublicationCreate,
-    PublicationUpdate,
-    PublicationResponse,
-    AspectExportCreate,
-    AspectExportResponse,
-    ChapterCreate,
-    ChapterUpdate,
-    ChapterResponse,
-    EndScreenBody,
-    EndScreenResponse,
-    BrandDealCreate,
-    BrandDealUpdate,
-    BrandDealResponse,
-    ThumbnailVariantCreate,
-    ThumbnailVariantUpdate,
-    ThumbnailVariantResponse,
-)
 
 
 router = APIRouter(prefix="/creator", tags=["Creator"])
@@ -139,10 +150,21 @@ def publish_publication(
     if not pub:
         raise HTTPException(status_code=404, detail="Publication not found")
     _get_owned_video(db, pub.video_id, current_user)
-    # TODO: call YouTube Data API / TikTok upload here. For now, stub success.
-    pub.status = "published"
-    pub.published_at = datetime.utcnow()
-    pub.external_url = pub.external_url or f"https://example.invalid/{pub.platform}/{pub.id}"
+    if (pub.platform or "").lower() == "youtube":
+        author_id = pub.created_by
+        if not author_id:
+            raise HTTPException(status_code=400, detail="Publication has no author")
+        conn = (
+            db.query(UserYoutubeConnection)
+            .filter(UserYoutubeConnection.user_id == author_id)
+            .first()
+        )
+        if not conn:
+            raise HTTPException(
+                status_code=400,
+                detail="The user who created this draft must connect YouTube (Studio → Connect YouTube).",
+            )
+    get_publisher(pub.platform).start_publish(db, pub)
     db.commit()
     db.refresh(pub)
     return pub
@@ -192,7 +214,12 @@ def create_aspect_export(
     db.add(exp)
     db.commit()
     db.refresh(exp)
-    # TODO: enqueue ffmpeg + AI subject-tracking reframe job here.
+    if not enqueue_aspect_export_job(exp.id):
+        exp.status = "failed"
+        exp.error_message = "Could not queue export (set REDIS_URL and run an RQ worker)."
+        db.add(exp)
+        db.commit()
+        db.refresh(exp)
     return exp
 
 
@@ -276,8 +303,25 @@ def delete_chapter(chapter_id: int, db: Session = Depends(get_db), current_user:
 @router.post("/videos/{video_id}/chapters/auto")
 def auto_chapters(video_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     _get_owned_video(db, video_id, current_user)
-    # TODO: pull transcript segments and run LLM chapter synthesis.
-    return {"ok": True, "enqueued": True}
+    enqueued = enqueue_chapter_synthesis_job(video_id)
+    return {"ok": True, "enqueued": enqueued}
+
+
+@router.get(
+    "/videos/{video_id}/chapters/youtube-description-block",
+    response_model=YoutubeChapterBlockResponse,
+)
+def youtube_chapter_description_block(
+    video_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    _get_owned_video(db, video_id, current_user)
+    chapters = (
+        db.query(VideoChapter)
+        .filter(VideoChapter.video_id == video_id)
+        .order_by(VideoChapter.start_time.asc(), VideoChapter.order_index.asc())
+        .all()
+    )
+    return YoutubeChapterBlockResponse(block=youtube_description_block(chapters))
 
 
 # =====================================================================

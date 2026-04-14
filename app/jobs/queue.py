@@ -76,3 +76,70 @@ def enqueue_mention_email_job(
             e,
         )
         return False
+
+
+def enqueue_youtube_publish_job(publication_id: int) -> bool:
+    """Enqueue YouTube resumable upload for a VideoPublication."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; YouTube publish not enqueued for publication %s", publication_id)
+        return False
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=7200)
+        q.enqueue(
+            "app.jobs.youtube_publish.youtube_publish_job",
+            publication_id,
+            job_timeout=7200,
+        )
+        return True
+    except Exception as e:
+        logger.exception("Failed to enqueue YouTube publish for publication %s: %s", publication_id, e)
+        return False
+
+
+def enqueue_aspect_export_job(export_id: int) -> bool:
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; aspect export not enqueued for %s", export_id)
+        return False
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=3600)
+        q.enqueue(
+            "app.jobs.aspect_export.aspect_export_job",
+            export_id,
+            job_timeout=3600,
+        )
+        return True
+    except Exception as e:
+        logger.exception("Failed to enqueue aspect export %s: %s", export_id, e)
+        return False
+
+
+def enqueue_chapter_synthesis_job(video_id: int) -> bool:
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; chapter synthesis not enqueued for video %s", video_id)
+        return False
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=900)
+        q.enqueue(
+            "app.jobs.chapter_synthesis.chapter_synthesis_job",
+            video_id,
+            job_timeout=900,
+        )
+        return True
+    except Exception as e:
+        logger.exception("Failed to enqueue chapter synthesis for video %s: %s", video_id, e)
+        return False

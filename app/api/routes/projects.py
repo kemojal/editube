@@ -71,6 +71,17 @@ def create_project(project: ProjectCreate, db: Session = Depends(get_db), curren
     db.refresh(db_project)
     return db_project
 
+
+@router.get("/")
+def get_user_projects(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    created_projects = db.query(Project).filter(Project.creator_id == current_user.id).all()
+    collaborated_projects = (
+        db.query(Project).join(ProjectCollaborator).filter(ProjectCollaborator.user_id == current_user.id).all()
+    )
+    all_projects = created_projects + collaborated_projects
+    return [convert_project_to_response(project) for project in all_projects]
+
+
 @router.get("/{project_id}", response_model=ProjectResponse)
 def get_project(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     # db_project = db.query(Project).filter(Project.id == project_id).first()
@@ -177,12 +188,3 @@ def remove_collaborator(project_id: int, user_id: int, db: Session = Depends(get
     db.refresh(db_project)
     return convert_project_to_response(db_project)
     # return db_project
-
-
-@router.get("/")
-def get_user_projects(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    created_projects = db.query(Project).filter(Project.creator_id == current_user.id).all()
-    collaborated_projects = db.query(Project).join(ProjectCollaborator).filter(ProjectCollaborator.user_id == current_user.id).all()
-    all_projects = created_projects + collaborated_projects
-    return [convert_project_to_response(project) for project in all_projects]
-    # return all_projects

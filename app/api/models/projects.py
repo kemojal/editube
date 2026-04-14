@@ -36,7 +36,7 @@ class UserResponse(BaseModel):
 class ProjectResponse(BaseModel):
     id: int
     name: str
-    description: str
+    description: str | None = None
     created_at: datetime
     updated_at: datetime
     creator: UserResponse

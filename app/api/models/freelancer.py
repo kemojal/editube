@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional, Any, List
+from typing import Optional, Any, List, Dict
 
 
 # --- Project scope settings ---
@@ -15,6 +15,8 @@ class ProjectScopeUpdate(BaseModel):
     portfolio_slug: Optional[str] = None
     client_name: Optional[str] = None
     client_email: Optional[str] = None
+    # Per-complexity hourly rates in cents, e.g. {"simple": 8000, "standard": 12000, "complex": 20000}
+    rate_card_cents: Optional[Dict[str, int]] = None
 
 
 class ProjectScopeResponse(BaseModel):
@@ -29,6 +31,7 @@ class ProjectScopeResponse(BaseModel):
     portfolio_slug: Optional[str] = None
     client_name: Optional[str] = None
     client_email: Optional[str] = None
+    rate_card_cents: Optional[Dict[str, int]] = None
 
     class Config:
         orm_mode = True
@@ -113,6 +116,7 @@ class InvoiceResponse(BaseModel):
     status: str
     stripe_invoice_id: Optional[str] = None
     stripe_payment_link: Optional[str] = None
+    stripe_connect_account_id: Optional[str] = None
     due_at: Optional[datetime] = None
     sent_at: Optional[datetime] = None
     paid_at: Optional[datetime] = None
@@ -200,6 +204,10 @@ class ContractResponse(BaseModel):
         orm_mode = True
 
 
+class ContractSendResponse(ContractResponse):
+    email_sent: bool = False
+
+
 class ContractSignBody(BaseModel):
     signer_name: str
     signer_email: str
@@ -214,6 +222,27 @@ class ContractPublicResponse(BaseModel):
     signer_name: Optional[str] = None
     signer_email: Optional[str] = None
     signed_at: Optional[datetime] = None
+    pdf_url: Optional[str] = None
+
+
+# --- Stripe Connect ---
+
+
+class StripeConnectStatusResponse(BaseModel):
+    stripe_connect_account_id: Optional[str] = None
+    charges_enabled: bool = False
+    details_submitted: bool = False
+    payouts_enabled: bool = False
+    platform_invoices_allowed: bool = False
+
+
+class StripeConnectAccountResponse(BaseModel):
+    stripe_connect_account_id: str
+    created: bool
+
+
+class StripeConnectAccountLinkResponse(BaseModel):
+    url: str
 
 
 # --- Time entries ---

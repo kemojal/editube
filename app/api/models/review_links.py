@@ -102,6 +102,15 @@ class PublicReviewVideo(BaseModel):
     thumbnail_url: Optional[str] = None
 
 
+class PublicReviewScope(BaseModel):
+    revisions_included: int
+    revisions_used: int
+    change_request_fee_cents: int
+    currency: str
+    deliverables_locked: bool
+    deliverables_unlocked: bool
+
+
 class PublicReviewLinkInfo(BaseModel):
     token: str
     label: Optional[str] = None
@@ -116,6 +125,7 @@ class PublicReviewLinkInfo(BaseModel):
     expired: bool
     revoked: bool
     video: Optional[PublicReviewVideo] = None  # null if password required
+    scope: Optional[PublicReviewScope] = None
 
 
 class PublicReviewAuthRequest(BaseModel):

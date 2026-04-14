@@ -38,6 +38,7 @@ from app.api.models.review_links import (
     PublicReviewSignoffResponse,
     PublicReviewEventCreate,
     PublicReviewLinkInfo,
+    PublicReviewScope,
     PublicReviewVideo,
     ReviewAnalyticsResponse,
     ReviewHeatmapBucket,
@@ -50,8 +51,10 @@ from app.api.models.review_links import (
 from app.db.database import get_db
 from app.db.models import (
     Comment,
+    Invoice,
     Notification,
     Project,
+    ProjectRevision,
     ReviewEvent,
     ReviewLink,
     ReviewMagicToken,
@@ -151,9 +154,32 @@ def _hash_magic_token(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _is_session_download_unlocked(link: ReviewLink, session: Optional[ReviewSession]) -> bool:
+def _project_deliverables_paid(db: Session, project_id: int) -> bool:
+    """Freelancer deliverables lock: if project.deliverables_locked is true,
+    at least one invoice must be paid before downloads/final files unlock.
+    """
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project or not getattr(project, "deliverables_locked", False):
+        return True
+    paid = (
+        db.query(Invoice.id)
+        .filter(Invoice.project_id == project_id, Invoice.status == "paid")
+        .first()
+    )
+    return paid is not None
+
+
+def _is_session_download_unlocked(
+    link: ReviewLink,
+    session: Optional[ReviewSession],
+    db: Optional[Session] = None,
+    video: Optional[Video] = None,
+) -> bool:
     if not link.allow_download:
         return False
+    if db is not None and video is not None:
+        if not _project_deliverables_paid(db, video.project_id):
+            return False
     if not link.approval_required_for_download:
         return True
     return bool(session and session.approved_at)
@@ -469,10 +495,21 @@ def get_public_link_info(token: str, db: Session = Depends(get_db)):
     expired = _link_expired(link)
     revoked = link.revoked_at is not None
     video_payload: Optional[PublicReviewVideo] = None
-    if not link.password_hash and not expired and not revoked:
-        video = db.query(Video).filter(Video.id == link.video_id).first()
-        if video:
-            video_payload = _public_video(video)
+    scope_payload: Optional[PublicReviewScope] = None
+    video = db.query(Video).filter(Video.id == link.video_id).first()
+    if not link.password_hash and not expired and not revoked and video:
+        video_payload = _public_video(video)
+    if video:
+        project = db.query(Project).filter(Project.id == video.project_id).first()
+        if project:
+            scope_payload = PublicReviewScope(
+                revisions_included=project.scope_revisions_included or 0,
+                revisions_used=project.revision_count or 0,
+                change_request_fee_cents=project.change_request_fee_cents or 0,
+                currency=project.currency or "USD",
+                deliverables_locked=bool(project.deliverables_locked),
+                deliverables_unlocked=_project_deliverables_paid(db, project.id),
+            )
     return PublicReviewLinkInfo(
         token=link.token,
         label=link.label,
@@ -487,6 +524,7 @@ def get_public_link_info(token: str, db: Session = Depends(get_db)):
         expired=expired,
         revoked=revoked,
         video=video_payload,
+        scope=scope_payload,
     )
 
 
@@ -1063,7 +1101,11 @@ def public_download_allowed(
     session = None
     if session_id is not None:
         session = _get_session_or_404(link, session_id, db)
-    return {"ok": True, "allowed": _is_session_download_unlocked(link, session)}
+    video = db.query(Video).filter(Video.id == link.video_id).first()
+    return {
+        "ok": True,
+        "allowed": _is_session_download_unlocked(link, session, db=db, video=video),
+    }
 
 
 @public_router.get("/{token}/versions")

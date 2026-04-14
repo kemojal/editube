@@ -25,6 +25,7 @@ class User(Base):
     subscription_status = Column(String, nullable=True)
     auth_provider = Column(String, nullable=True, server_default="local")
     google_sub = Column(String, unique=True, index=True, nullable=True)
+    stripe_connect_account_id = Column(String, unique=True, index=True, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -35,6 +36,12 @@ class User(Base):
     )
     settings = relationship(
         "UserSettings",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+    youtube_connection = relationship(
+        "UserYoutubeConnection",
         back_populates="user",
         uselist=False,
         cascade="all, delete-orphan",
@@ -119,6 +126,7 @@ class Project(Base):
     portfolio_slug = Column(String, unique=True, index=True, nullable=True)
     client_name = Column(String, nullable=True)
     client_email = Column(String, nullable=True)
+    rate_card_cents = Column(JSONB, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -664,6 +672,25 @@ class ThumbnailVariant(Base):
     video = relationship("Video")
 
 
+class UserYoutubeConnection(Base):
+    """YouTube Data API OAuth tokens (separate from Google login). One row per user."""
+
+    __tablename__ = "user_youtube_connections"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False, index=True)
+    channel_id = Column(String, nullable=True)
+    channel_title = Column(String, nullable=True)
+    refresh_token_encrypted = Column(Text, nullable=False)
+    access_token = Column(Text, nullable=True)
+    access_expires_at = Column(TIMESTAMP, nullable=True)
+    scopes = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", back_populates="youtube_connection")
+
+
 # =====================================================================
 # Freelancer Business Layer models
 # =====================================================================
@@ -701,6 +728,7 @@ class Invoice(Base):
     status = Column(String, server_default="draft", nullable=False)
     stripe_invoice_id = Column(String, nullable=True)
     stripe_payment_link = Column(String, nullable=True)
+    stripe_connect_account_id = Column(String, nullable=True, index=True)
     due_at = Column(TIMESTAMP, nullable=True)
     sent_at = Column(TIMESTAMP, nullable=True)
     paid_at = Column(TIMESTAMP, nullable=True)

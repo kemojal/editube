@@ -110,6 +110,12 @@ class ChapterResponse(BaseModel):
         orm_mode = True
 
 
+class YoutubeChapterBlockResponse(BaseModel):
+    """Timestamp lines for YouTube description (chapters)."""
+
+    block: str
+
+
 # --- End screens ---
 
 class EndScreenBody(BaseModel):
