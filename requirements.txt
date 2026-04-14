@@ -10,3 +10,8 @@ cloudinary
 bcrypt
 python-dotenv
 python-multipart
+stripe>=10.0.0
+httpx>=0.27.0
+redis>=5.0.0
+rq>=1.16.0
+faster-whisper>=1.0.0

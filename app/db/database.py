@@ -1,16 +1,34 @@
+import os
+
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-# Load database URL from environment variable
-# SQLALCHEMY_DATABASE_URL = "postgresql://postgres:12345@localhost/editube"
-SQLALCHEMY_DATABASE_URL = "postgresql://ditally-db_owner:uJfZYwcIz6d5@ep-royal-wood-a1on9e6p.ap-southeast-1.aws.neon.tech/editube_db?sslmode=require"
+load_dotenv()
 
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+def _database_url() -> str:
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL environment variable is not set")
+    if "sslmode=" not in url and "neon.tech" in url:
+        url += "&sslmode=require" if "?" in url else "?sslmode=require"
+    return url
+
+
+SQLALCHEMY_DATABASE_URL = _database_url()
+
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=300,
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
 
 def get_db():
     db = SessionLocal()

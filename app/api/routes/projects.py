@@ -86,9 +86,11 @@ def get_project(project_id: int, db: Session = Depends(get_db), current_user: Us
         if current_user not in [db_project.creator] + [c.user for c in db_project.collaborators]:
             raise HTTPException(status_code=403, detail="Not authorized to access this project")
         return convert_project_to_response(db_project)
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error retrieving project {project_id}: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.exception("Error retrieving project %s", project_id)
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 @router.put("/{project_id}", response_model=ProjectResponse)
 def update_project(project_id: int, project: ProjectUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -140,7 +142,7 @@ def invite_collaborators(
             user_id = collaborator.id
         else:
             # Send an invitation email if the user doesn't exist
-            send_invitation_email(email, project_id)  # Implement this function in utils/email.py if not already done
+            send_invitation_email(db, email, project_id)
 
             # You may want to store invited users in your database for tracking purposes
             # For example:

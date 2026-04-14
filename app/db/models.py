@@ -12,7 +12,17 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String, nullable=True)
     name = Column(String)
+    full_name = Column(String, nullable=True)
     role = Column(String)
+    avatar_url = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+    workflow_type = Column(String, nullable=True)  # "agency", "freelancer", "internal"
+    plan = Column(String, nullable=True)  # "basic", "pro", "elite"
+    onboarding_completed = Column(Boolean, server_default="false", nullable=False)
+    trial_start_date = Column(TIMESTAMP, nullable=True)
+    stripe_customer_id = Column(String, nullable=True)
+    stripe_subscription_id = Column(String, nullable=True)
+    subscription_status = Column(String, nullable=True)
     auth_provider = Column(String, nullable=True, server_default="local")
     google_sub = Column(String, unique=True, index=True, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
@@ -20,6 +30,34 @@ class User(Base):
 
     # Define the relationship to projects
     projects = relationship("Project", back_populates="creator")
+    subscriptions = relationship(
+        "Subscription", back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class Subscription(Base):
+    """One row per Stripe subscription id (history preserved when customers resubscribe)."""
+
+    __tablename__ = "subscriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    stripe_subscription_id = Column(String, unique=True, index=True, nullable=False)
+    stripe_customer_id = Column(String, nullable=True)
+    stripe_price_id = Column(String, nullable=True)
+    customer_email = Column(String, nullable=True)  # snapshot from User at sync time
+    status = Column(String, nullable=False)
+    plan = Column(String, nullable=True)  # basic | pro | elite (from metadata)
+    trial_start = Column(TIMESTAMP, nullable=True)
+    current_period_start = Column(TIMESTAMP, nullable=True)
+    current_period_end = Column(TIMESTAMP, nullable=True)
+    cancel_at_period_end = Column(Boolean, server_default="false", nullable=False)
+    ended_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="subscriptions")
+
 
 class Project(Base):
     __tablename__ = "projects"
@@ -33,6 +71,7 @@ class Project(Base):
 
     collaborators = relationship("ProjectCollaborator", back_populates="project")
     videos = relationship("Video", back_populates="project")
+    folders = relationship("Folder", back_populates="project", cascade="all, delete-orphan")
 
 class ProjectCollaborator(Base):
     __tablename__ = "project_collaborators"
@@ -44,35 +83,95 @@ class ProjectCollaborator(Base):
     user = relationship("User")
     created_at = Column(TIMESTAMP, server_default=func.now())
 
+class Folder(Base):
+    __tablename__ = "folders"
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    parent_id = Column(Integer, ForeignKey("folders.id"), nullable=True)
+    name = Column(String, nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+    project = relationship("Project", back_populates="folders")
+    parent = relationship("Folder", remote_side=[id], back_populates="children")
+    children = relationship("Folder", back_populates="parent", cascade="all, delete-orphan")
+    videos = relationship("Video", back_populates="folder", cascade="all, delete-orphan")
+    creator = relationship("User")
+
 class Video(Base):
     __tablename__ = "videos"
     id = Column(Integer, primary_key=True, index=True)
     project_id = Column(Integer, ForeignKey("projects.id"))
+    folder_id = Column(Integer, ForeignKey("folders.id"), nullable=True)
     name = Column(String)
     description = Column(Text)
     version = Column(Integer)
     file_path = Column(String)
+    thumbnail_url = Column(String, nullable=True)
+    status = Column(String, server_default="in_progress", nullable=False)  # in_progress, in_review, approved, needs_changes
+    duration = Column(Integer, nullable=True)  # duration in seconds
     uploader_id = Column(Integer, ForeignKey("users.id"))
     uploader = relationship("User")
     project = relationship("Project", back_populates="videos")
+    folder = relationship("Folder", back_populates="videos")
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
     comments = relationship("Comment", back_populates="video")
     annotations = relationship("Annotation", back_populates="video")
+    transcription = relationship(
+        "VideoTranscription",
+        back_populates="video",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class VideoTranscription(Base):
+    __tablename__ = "video_transcriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(
+        Integer,
+        ForeignKey("videos.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    status = Column(
+        String,
+        nullable=False,
+        server_default="pending",
+    )  # pending, queued, processing, completed, failed
+    segments = Column(JSONB, nullable=True)
+    error_message = Column(Text, nullable=True)
+    model_name = Column(String, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+    video = relationship("Video", back_populates="transcription")
+
 
 class Comment(Base):
     __tablename__ = "comments"
     id = Column(Integer, primary_key=True, index=True)
     video_id = Column(Integer, ForeignKey("videos.id"))
     user_id = Column(Integer, ForeignKey("users.id"))
+    parent_id = Column(Integer, ForeignKey("comments.id"), nullable=True)
     text = Column(Text)
     timecode = Column(Integer)
+    end_timecode = Column(Integer, nullable=True)  # null means point comment, set means range comment
+    drawing_data = Column(JSONB, nullable=True)  # FabricJS canvas objects drawn with the comment
+    is_resolved = Column(Boolean, server_default="false", nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
     video = relationship("Video", back_populates="comments")
     user = relationship("User")
+    parent = relationship("Comment", remote_side=[id], back_populates="replies")
+    replies = relationship("Comment", back_populates="parent", cascade="all, delete-orphan")
+    likes = relationship("CommentLike", back_populates="comment", cascade="all, delete-orphan")
 
 
 class Annotation(Base):
@@ -82,12 +181,24 @@ class Annotation(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     annotation_type = Column(String(50), nullable=False)
     annotation_data = Column(JSONB, nullable=False)
-    timecode = Column(String, nullable=False)  # Assuming this should be a string
+    timecode = Column(Integer, nullable=False)
+    duration = Column(Integer, server_default="5", nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 
     video = relationship("Video", back_populates="annotations")
     user = relationship("User")
+
+class CommentLike(Base):
+    __tablename__ = "comment_likes"
+    id = Column(Integer, primary_key=True, index=True)
+    comment_id = Column(Integer, ForeignKey("comments.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+
+    comment = relationship("Comment", back_populates="likes")
+    user = relationship("User")
+
 
 class Notification(Base):
     __tablename__ = "notifications"

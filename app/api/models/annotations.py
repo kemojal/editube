@@ -1,46 +1,40 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional, Dict, Union
-# from app.api.models.users import UserResponse
-
-class AnnotationBase(BaseModel):
-    # annotation_type: str
-    # annotation_data: dict
-    annotation_data: Optional[Dict[str, Union[str, int, float, bool, None]]] = None  # Adjust types as necessary
-    annotation_type: Optional[str] = None
-    timecode: Optional[str] = None
-
-class AnnotationCreate(AnnotationBase):
-    pass
-
-class AnnotationUpdate(AnnotationBase):
-    annotation_type: Optional[str] = None
-    annotation_data: Optional[dict] = None
-    timecode: Optional[str] = None
+from typing import Optional, Any, List
 
 
+class AnnotationCreate(BaseModel):
+    annotation_type: str  # "fabric_object" — the shape type
+    annotation_data: Any  # Full FabricJS serialized object (nested dict)
+    timecode: int  # Video second when this annotation was placed
+    duration: Optional[int] = 5  # How long (seconds) to display; default 5s
 
-class UserResponse(BaseModel):
+
+class AnnotationUpdate(BaseModel):
+    annotation_data: Optional[Any] = None
+    timecode: Optional[int] = None
+    duration: Optional[int] = None
+
+
+class AnnotationUserResponse(BaseModel):
     id: int
     name: str
     email: str
-    role: str
-
-    class Config:
-        orm_mode = True    
-class AnnotationResponse( AnnotationBase):
-    id: int
-    video_id: int
-    user: UserResponse  # Ensure `user` is correctly populated as `UserResponse`
-    # annotation_data: Optional[Dict[str, str]] = None  # Adjust types as necessary
-    # annotation_type: Optional[str] = None
-    # timecode: Optional[str] = None
-    # user_id: int
-    created_at: datetime
-    updated_at: datetime
-    shadow: Optional[Dict[str, Union[str, int, float, bool, None]]] = None
-    strokeDashArray: Optional[list[Union[str, int, float, bool, None]]] = None
 
     class Config:
         orm_mode = True
-        
+
+
+class AnnotationResponse(BaseModel):
+    id: int
+    video_id: int
+    user: AnnotationUserResponse
+    annotation_type: str
+    annotation_data: Any
+    timecode: int
+    duration: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        orm_mode = True

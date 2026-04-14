@@ -1,15 +1,16 @@
 import cloudinary
-import os 
+import logging
+import os
+import re
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-# from app.websocket_manager import app as websocket_app
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import logging
-
 
 from .api import api_router
 
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,28 +28,49 @@ app = FastAPI(
 )
 
 
+# Explicit production / known hosts; local dev also covered by allow_origin_regex below.
 origins = [
-   
     "http://localhost:3000",
     "http://localhost:3001",
     "http://localhost:3002",
     "http://localhost:3003",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://127.0.0.1:3002",
+    "http://127.0.0.1:3003",
     "https://editube-kemojals-projects.vercel.app",
-
 ]
+_extra = os.getenv("CORS_ORIGINS", "")
+if _extra.strip():
+    origins.extend(o.strip() for o in _extra.split(",") if o.strip())
+
+# Browsers may use 127.0.0.1 or [::1] even when the bar says "localhost"; any dev port.
+_local_origin_regex = r"^http://(localhost|127\.0\.0\.1|\[::1\]):\d+$"
+_local_origin_pattern = re.compile(_local_origin_regex)
+
+
+def _cors_headers_for_request(request: Request) -> dict[str, str]:
+    """Mirror CORSMiddleware so error responses still expose CORS (avoids misleading browser CORS noise on 500)."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return {}
+    if origin not in origins and not _local_origin_pattern.fullmatch(origin):
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+    }
+
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=_local_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-
-load_dotenv()
-          
 # cloudinary.config( 
 #   cloud_name = "dtpnbesbx", 
 #   api_key = "811133693665998", 
@@ -83,4 +105,5 @@ async def unicorn_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
         content={"message": "Internal server error"},
+        headers=_cors_headers_for_request(request),
     )

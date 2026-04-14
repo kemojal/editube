@@ -33,10 +33,32 @@ class UserResponse(BaseModel):
     name: str
     email: str
     role: str
+    full_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    phone: Optional[str] = None
+    workflow_type: Optional[str] = None
+    plan: Optional[str] = None
+    onboarding_completed: bool = False
+    subscription_status: Optional[str] = None
+    stripe_customer_id: Optional[str] = None
     auth_provider: Optional[str] = None
     google_sub: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class OnboardingProfileUpdate(BaseModel):
+    full_name: str
+    phone: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+
+class OnboardingWorkflowUpdate(BaseModel):
+    workflow_type: str  # "agency", "freelancer", "internal"
+
+
+class OnboardingPlanUpdate(BaseModel):
+    plan: str  # "basic", "pro", "elite"
 
 class UserCreate(UserBase):
     password: str

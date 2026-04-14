@@ -125,6 +125,7 @@ def google_oauth_callback(req: Request, code: str | None = None, error: str | No
             user = User(
                 email=email,
                 name=name,
+                full_name=name,
                 role="user",
                 hashed_password=None,
                 google_sub=google_sub,
@@ -134,10 +135,11 @@ def google_oauth_callback(req: Request, code: str | None = None, error: str | No
         db.commit()
         db.refresh(user)
 
-    app_access_token = create_access_token(data={"user_id": user.id})
+    app_access_token = create_access_token(data={"user_id": user.id, "onboarding_completed": user.onboarding_completed})
     app_refresh_token = create_refresh_token(data={"user_id": user.id})
     redirect_url = (
         f"{frontend_callback}?access_token={parse.quote(app_access_token)}"
         f"&refresh_token={parse.quote(app_refresh_token)}"
+        f"&onboarding_completed={'true' if user.onboarding_completed else 'false'}"
     )
     return RedirectResponse(url=redirect_url, status_code=302)
