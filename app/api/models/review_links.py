@@ -1,0 +1,165 @@
+from datetime import datetime
+from typing import Any, List, Optional
+
+from pydantic import BaseModel
+
+
+class ReviewLinkCreate(BaseModel):
+    label: Optional[str] = None
+    password: Optional[str] = None
+    expires_at: Optional[datetime] = None
+    allow_download: bool = False
+    allow_comments: bool = True
+    watermark_enabled: bool = True
+    require_email: bool = False
+
+
+class ReviewLinkUpdate(BaseModel):
+    label: Optional[str] = None
+    password: Optional[str] = None  # empty string to remove
+    expires_at: Optional[datetime] = None
+    allow_download: Optional[bool] = None
+    allow_comments: Optional[bool] = None
+    watermark_enabled: Optional[bool] = None
+    require_email: Optional[bool] = None
+    revoked: Optional[bool] = None
+
+
+class ReviewLinkResponse(BaseModel):
+    id: int
+    video_id: int
+    token: str
+    label: Optional[str] = None
+    has_password: bool
+    expires_at: Optional[datetime] = None
+    allow_download: bool
+    allow_comments: bool
+    watermark_enabled: bool
+    require_email: bool
+    revoked_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+    view_count: int = 0
+    unique_viewers: int = 0
+    total_comments: int = 0
+    approvals: int = 0
+
+    class Config:
+        orm_mode = True
+
+
+class ReviewSessionSummary(BaseModel):
+    id: int
+    guest_name: Optional[str] = None
+    guest_email: Optional[str] = None
+    ip_address: Optional[str] = None
+    total_watch_seconds: int
+    max_position: int
+    reached_end: bool
+    view_count: int
+    first_viewed_at: datetime
+    last_viewed_at: datetime
+    approved_at: Optional[datetime] = None
+
+    class Config:
+        orm_mode = True
+
+
+class ReviewHeatmapBucket(BaseModel):
+    second: int
+    views: int
+
+
+class ReviewAnalyticsResponse(BaseModel):
+    link: ReviewLinkResponse
+    sessions: List[ReviewSessionSummary]
+    heatmap: List[ReviewHeatmapBucket]
+
+
+# ---- Public (no-auth) endpoint payloads ----
+
+
+class PublicReviewVideo(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    file_path: str
+    duration: Optional[int] = None
+    thumbnail_url: Optional[str] = None
+
+
+class PublicReviewLinkInfo(BaseModel):
+    token: str
+    label: Optional[str] = None
+    has_password: bool
+    requires_email: bool
+    allow_download: bool
+    allow_comments: bool
+    watermark_enabled: bool
+    expired: bool
+    revoked: bool
+    video: Optional[PublicReviewVideo] = None  # null if password required
+
+
+class PublicReviewAuthRequest(BaseModel):
+    password: Optional[str] = None
+    guest_name: Optional[str] = None
+    guest_email: Optional[str] = None
+    fingerprint: str
+
+
+class PublicReviewAuthResponse(BaseModel):
+    ok: bool
+    session_id: Optional[int] = None
+    video: Optional[PublicReviewVideo] = None
+    watermark_text: Optional[str] = None
+    error: Optional[str] = None
+
+
+class PublicReviewEventCreate(BaseModel):
+    session_id: int
+    event_type: str  # play|pause|seek|progress|ended
+    position: int
+    range_end: Optional[int] = None
+
+
+class PublicReviewCommentCreate(BaseModel):
+    session_id: int
+    text: str
+    timecode: int
+    end_timecode: Optional[int] = None
+    drawing_data: Optional[Any] = None
+    parent_id: Optional[int] = None
+
+
+class PublicReviewCommentUser(BaseModel):
+    id: Optional[int] = None
+    name: str
+    email: Optional[str] = None
+    avatar_url: Optional[str] = None
+    is_guest: bool
+
+
+class PublicReviewCommentResponse(BaseModel):
+    id: int
+    video_id: int
+    parent_id: Optional[int] = None
+    text: str
+    timecode: int
+    end_timecode: Optional[int] = None
+    drawing_data: Optional[Any] = None
+    is_resolved: bool = False
+    user: PublicReviewCommentUser
+    likes_count: int = 0
+    replies_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+    replies: List["PublicReviewCommentResponse"] = []
+
+
+PublicReviewCommentResponse.update_forward_refs()
+
+
+class PublicReviewApproveRequest(BaseModel):
+    session_id: int
+    approved: bool = True

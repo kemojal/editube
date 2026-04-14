@@ -157,7 +157,7 @@ class Comment(Base):
     __tablename__ = "comments"
     id = Column(Integer, primary_key=True, index=True)
     video_id = Column(Integer, ForeignKey("videos.id"))
-    user_id = Column(Integer, ForeignKey("users.id"))
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     parent_id = Column(Integer, ForeignKey("comments.id"), nullable=True)
     text = Column(Text)
     timecode = Column(Integer)
@@ -165,6 +165,12 @@ class Comment(Base):
     drawing_data = Column(JSONB, nullable=True)  # FabricJS canvas objects drawn with the comment
     is_resolved = Column(Boolean, server_default="false", nullable=False)
     is_private = Column(Boolean, server_default="false", nullable=False)
+    # Guest (review-link) commenter fields — used when user_id is null
+    guest_name = Column(String, nullable=True)
+    guest_email = Column(String, nullable=True)
+    review_link_id = Column(
+        Integer, ForeignKey("review_links.id", ondelete="SET NULL"), nullable=True
+    )
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -173,6 +179,93 @@ class Comment(Base):
     parent = relationship("Comment", remote_side=[id], back_populates="replies")
     replies = relationship("Comment", back_populates="parent", cascade="all, delete-orphan")
     likes = relationship("CommentLike", back_populates="comment", cascade="all, delete-orphan")
+    review_link = relationship("ReviewLink")
+
+
+class ReviewLink(Base):
+    """Tokenised no-signup review link for a video."""
+
+    __tablename__ = "review_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(
+        Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_by = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    token = Column(String, unique=True, index=True, nullable=False)
+    # Human label shown to creator in UI ("Client Q1 review")
+    label = Column(String, nullable=True)
+    password_hash = Column(String, nullable=True)
+    expires_at = Column(TIMESTAMP, nullable=True)
+    allow_download = Column(Boolean, server_default="false", nullable=False)
+    allow_comments = Column(Boolean, server_default="true", nullable=False)
+    watermark_enabled = Column(Boolean, server_default="true", nullable=False)
+    require_email = Column(Boolean, server_default="false", nullable=False)
+    revoked_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    video = relationship("Video")
+    creator = relationship("User")
+    sessions = relationship(
+        "ReviewSession", back_populates="review_link", cascade="all, delete-orphan"
+    )
+
+
+class ReviewSession(Base):
+    """One row per guest (identified by fingerprint cookie) on a review link."""
+
+    __tablename__ = "review_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    review_link_id = Column(
+        Integer,
+        ForeignKey("review_links.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    fingerprint = Column(String, nullable=False, index=True)
+    guest_name = Column(String, nullable=True)
+    guest_email = Column(String, nullable=True)
+    ip_address = Column(String, nullable=True)
+    user_agent = Column(Text, nullable=True)
+    total_watch_seconds = Column(Integer, server_default="0", nullable=False)
+    max_position = Column(Integer, server_default="0", nullable=False)  # furthest point reached, seconds
+    reached_end = Column(Boolean, server_default="false", nullable=False)
+    view_count = Column(Integer, server_default="0", nullable=False)
+    first_viewed_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    last_viewed_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    approved_at = Column(TIMESTAMP, nullable=True)
+
+    review_link = relationship("ReviewLink", back_populates="sessions")
+    events = relationship(
+        "ReviewEvent", back_populates="session", cascade="all, delete-orphan"
+    )
+
+
+class ReviewEvent(Base):
+    """Granular watch events for heatmap / analytics."""
+
+    __tablename__ = "review_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(
+        Integer,
+        ForeignKey("review_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    event_type = Column(String, nullable=False)  # play|pause|seek|progress|ended|comment
+    position = Column(Integer, nullable=False)  # seconds
+    # For progress events: range end (exclusive); lets us build heatmaps cheaply
+    range_end = Column(Integer, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    session = relationship("ReviewSession", back_populates="events")
 
 
 class Annotation(Base):
