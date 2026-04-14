@@ -164,3 +164,39 @@ def send_subscription_canceled_email(
         "Your Editube subscription has been canceled",
         text,
     )
+
+
+def send_review_magic_link_email(
+    to_email: str,
+    review_label: str,
+    verify_url: str,
+    expires_minutes: int = 20,
+    recipient_name: str | None = None,
+    inviter_name: str | None = None,
+) -> bool:
+    subject = f"Secure review link: {review_label}"
+    greet = f"Hi {recipient_name}," if recipient_name else "Hi,"
+    inviter_line = (
+        f"{inviter_name} invited you to review this video.\n\n"
+        if inviter_name
+        else "You requested access to this review.\n\n"
+    )
+    text = (
+        f"{greet}\n\n"
+        f"{inviter_line}"
+        f"Review: {review_label}\n\n"
+        f"Open your one-time secure link:\n{verify_url}\n\n"
+        "This email link is tied to this recipient address.\n"
+        f"This link expires in {expires_minutes} minutes and can only be used once.\n"
+        "If you did not request this, you can ignore this email."
+    )
+    html = f"""
+    <p>{greet}</p>
+    <p>{inviter_name + " invited you to review this video." if inviter_name else "You requested access to this review."}</p>
+    <p>Review: <strong>{review_label}</strong></p>
+    <p><a href="{verify_url}">Open one-time secure review link</a></p>
+    <p>This email link is tied to this recipient address.</p>
+    <p>This link expires in {expires_minutes} minutes and can only be used once.</p>
+    <p>If you did not request this, you can ignore this email.</p>
+    """
+    return send_transactional_email(to_email, subject, text, html)

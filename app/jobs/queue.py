@@ -18,13 +18,14 @@ def enqueue_transcription_job(video_id: int) -> bool:
         logger.warning("REDIS_URL not set; transcription job not enqueued for video %s", video_id)
         return False
     try:
+        from app.jobs.transcription import transcribe_video
         from redis import Redis
         from rq import Queue
 
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=3600)
         q.enqueue(
-            "app.jobs.transcription.transcribe_video",
+            transcribe_video,
             video_id,
             job_timeout=3600,
         )

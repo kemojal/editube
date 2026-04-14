@@ -9,9 +9,12 @@ class ReviewLinkCreate(BaseModel):
     password: Optional[str] = None
     expires_at: Optional[datetime] = None
     allow_download: bool = False
+    approval_required_for_download: bool = False
     allow_comments: bool = True
     watermark_enabled: bool = True
     require_email: bool = False
+    version_group_id: Optional[str] = None
+    version_label: Optional[str] = None
 
 
 class ReviewLinkUpdate(BaseModel):
@@ -19,9 +22,12 @@ class ReviewLinkUpdate(BaseModel):
     password: Optional[str] = None  # empty string to remove
     expires_at: Optional[datetime] = None
     allow_download: Optional[bool] = None
+    approval_required_for_download: Optional[bool] = None
     allow_comments: Optional[bool] = None
     watermark_enabled: Optional[bool] = None
     require_email: Optional[bool] = None
+    version_group_id: Optional[str] = None
+    version_label: Optional[str] = None
     revoked: Optional[bool] = None
 
 
@@ -33,9 +39,12 @@ class ReviewLinkResponse(BaseModel):
     has_password: bool
     expires_at: Optional[datetime] = None
     allow_download: bool
+    approval_required_for_download: bool = False
     allow_comments: bool
     watermark_enabled: bool
     require_email: bool
+    version_group_id: Optional[str] = None
+    version_label: Optional[str] = None
     revoked_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
@@ -74,6 +83,10 @@ class ReviewAnalyticsResponse(BaseModel):
     link: ReviewLinkResponse
     sessions: List[ReviewSessionSummary]
     heatmap: List[ReviewHeatmapBucket]
+    rewatch_hotspots: List[ReviewHeatmapBucket] = []
+    scene_groups: List["ReviewSceneGroup"] = []
+    signoff_count: int = 0
+    completion_rate: float = 0.0
 
 
 # ---- Public (no-auth) endpoint payloads ----
@@ -94,8 +107,11 @@ class PublicReviewLinkInfo(BaseModel):
     has_password: bool
     requires_email: bool
     allow_download: bool
+    approval_required_for_download: bool = False
     allow_comments: bool
     watermark_enabled: bool
+    version_group_id: Optional[str] = None
+    version_label: Optional[str] = None
     expired: bool
     revoked: bool
     video: Optional[PublicReviewVideo] = None  # null if password required
@@ -105,6 +121,7 @@ class PublicReviewAuthRequest(BaseModel):
     password: Optional[str] = None
     guest_name: Optional[str] = None
     guest_email: Optional[str] = None
+    guest_avatar_url: Optional[str] = None
     fingerprint: str
 
 
@@ -163,3 +180,52 @@ PublicReviewCommentResponse.update_forward_refs()
 class PublicReviewApproveRequest(BaseModel):
     session_id: int
     approved: bool = True
+
+
+class PublicReviewMagicSendRequest(BaseModel):
+    email: str
+    guest_name: Optional[str] = None
+    fingerprint: Optional[str] = None
+
+
+class PublicReviewMagicVerifyRequest(BaseModel):
+    magic_token: str
+    fingerprint: str
+    guest_name: Optional[str] = None
+    guest_avatar_url: Optional[str] = None
+
+
+class PublicReviewSignoffRequest(BaseModel):
+    session_id: int
+    declaration_text: str
+
+
+class PublicReviewSignoffResponse(BaseModel):
+    ok: bool
+    signed_at: datetime
+    signer_name: Optional[str] = None
+    signer_email: Optional[str] = None
+    declaration_text: str
+
+
+class PublicReviewDraftRequest(BaseModel):
+    session_id: int
+    text: str
+    timecode: int = 0
+
+
+class PublicReviewDraftResponse(BaseModel):
+    text: str
+    timecode: int
+    updated_at: datetime
+
+
+class ReviewSceneGroup(BaseModel):
+    key: str
+    label: str
+    comment_count: int
+    start_timecode: int
+    end_timecode: int
+
+
+ReviewAnalyticsResponse.update_forward_refs()

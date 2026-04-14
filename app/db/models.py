@@ -66,6 +66,17 @@ class Project(Base):
     description = Column(Text)
     creator_id = Column(Integer, ForeignKey("users.id"))
     creator = relationship("User", back_populates="projects")
+    # Freelancer business layer
+    scope_revisions_included = Column(Integer, server_default="3", nullable=False)
+    revision_count = Column(Integer, server_default="0", nullable=False)
+    change_request_fee_cents = Column(Integer, server_default="0", nullable=False)
+    currency = Column(String, server_default="USD", nullable=False)
+    hourly_rate_cents = Column(Integer, nullable=True)
+    deliverables_locked = Column(Boolean, server_default="true", nullable=False)
+    portfolio_public = Column(Boolean, server_default="false", nullable=False)
+    portfolio_slug = Column(String, unique=True, index=True, nullable=True)
+    client_name = Column(String, nullable=True)
+    client_email = Column(String, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -231,9 +242,14 @@ class ReviewLink(Base):
     password_hash = Column(String, nullable=True)
     expires_at = Column(TIMESTAMP, nullable=True)
     allow_download = Column(Boolean, server_default="false", nullable=False)
+    approval_required_for_download = Column(
+        Boolean, server_default="false", nullable=False
+    )
     allow_comments = Column(Boolean, server_default="true", nullable=False)
     watermark_enabled = Column(Boolean, server_default="true", nullable=False)
     require_email = Column(Boolean, server_default="false", nullable=False)
+    version_group_id = Column(String, nullable=True, index=True)
+    version_label = Column(String, nullable=True)
     revoked_at = Column(TIMESTAMP, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(
@@ -262,6 +278,7 @@ class ReviewSession(Base):
     fingerprint = Column(String, nullable=False, index=True)
     guest_name = Column(String, nullable=True)
     guest_email = Column(String, nullable=True)
+    guest_avatar_url = Column(String, nullable=True)
     ip_address = Column(String, nullable=True)
     user_agent = Column(Text, nullable=True)
     total_watch_seconds = Column(Integer, server_default="0", nullable=False)
@@ -275,6 +292,9 @@ class ReviewSession(Base):
     review_link = relationship("ReviewLink", back_populates="sessions")
     events = relationship(
         "ReviewEvent", back_populates="session", cascade="all, delete-orphan"
+    )
+    signoffs = relationship(
+        "ReviewSignoff", back_populates="session", cascade="all, delete-orphan"
     )
 
 
@@ -297,6 +317,86 @@ class ReviewEvent(Base):
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
     session = relationship("ReviewSession", back_populates="events")
+
+
+class ReviewMagicToken(Base):
+    __tablename__ = "review_magic_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    review_link_id = Column(
+        Integer,
+        ForeignKey("review_links.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    email = Column(String, nullable=False, index=True)
+    guest_name = Column(String, nullable=True)
+    token_hash = Column(String, nullable=False, unique=True, index=True)
+    fingerprint = Column(String, nullable=True, index=True)
+    ip_address = Column(String, nullable=True)
+    invited_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    source = Column(String, nullable=False, server_default="self_service")
+    expires_at = Column(TIMESTAMP, nullable=False)
+    used_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    review_link = relationship("ReviewLink")
+    inviter = relationship("User")
+
+
+class ReviewSignoff(Base):
+    __tablename__ = "review_signoffs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    review_link_id = Column(
+        Integer,
+        ForeignKey("review_links.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    session_id = Column(
+        Integer,
+        ForeignKey("review_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    signer_name = Column(String, nullable=True)
+    signer_email = Column(String, nullable=True)
+    declaration_text = Column(Text, nullable=False)
+    legal_snapshot_json = Column(JSONB, nullable=True)
+    signed_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    review_link = relationship("ReviewLink")
+    session = relationship("ReviewSession", back_populates="signoffs")
+
+
+class ReviewCommentDraft(Base):
+    __tablename__ = "review_comment_drafts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    review_link_id = Column(
+        Integer,
+        ForeignKey("review_links.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    session_id = Column(
+        Integer,
+        ForeignKey("review_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    video_id = Column(
+        Integer,
+        ForeignKey("videos.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    text = Column(Text, nullable=False)
+    timecode = Column(Integer, nullable=False, server_default="0")
+    updated_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
 
 class Annotation(Base):
@@ -353,6 +453,260 @@ class ActivityFeed(Base):
 
     project = relationship("Project")
     user = relationship("User")
+
+
+# =====================================================================
+# Creator-native models (YouTube publish, social exports, thumbnails)
+# =====================================================================
+
+
+class VideoPublication(Base):
+    __tablename__ = "video_publications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    platform = Column(String, nullable=False)  # youtube|tiktok|instagram|twitter
+    status = Column(String, server_default="draft", nullable=False)
+    title = Column(String, nullable=True)
+    description = Column(Text, nullable=True)
+    tags = Column(Text, nullable=True)
+    category = Column(String, nullable=True)
+    privacy = Column(String, server_default="private", nullable=False)
+    scheduled_at = Column(TIMESTAMP, nullable=True)
+    published_at = Column(TIMESTAMP, nullable=True)
+    external_id = Column(String, nullable=True)
+    external_url = Column(String, nullable=True)
+    thumbnail_variant_id = Column(Integer, nullable=True)
+    extra = Column(JSONB, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    video = relationship("Video")
+    creator = relationship("User")
+
+
+class VideoAspectExport(Base):
+    __tablename__ = "video_aspect_exports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    aspect_ratio = Column(String, nullable=False)
+    platform_preset = Column(String, nullable=True)
+    status = Column(String, server_default="pending", nullable=False)
+    output_path = Column(String, nullable=True)
+    thumbnail_url = Column(String, nullable=True)
+    duration = Column(Integer, nullable=True)
+    subject_tracking = Column(Boolean, server_default="true", nullable=False)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    video = relationship("Video")
+
+
+class VideoChapter(Base):
+    __tablename__ = "video_chapters"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    start_time = Column(Integer, nullable=False)
+    end_time = Column(Integer, nullable=True)
+    title = Column(String, nullable=False)
+    source = Column(String, server_default="manual", nullable=False)
+    order_index = Column(Integer, server_default="0", nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    video = relationship("Video")
+
+
+class VideoEndScreen(Base):
+    __tablename__ = "video_end_screens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), unique=True, nullable=False)
+    cards = Column(JSONB, nullable=True)
+    pinned_comment = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    video = relationship("Video")
+
+
+class BrandDeal(Base):
+    __tablename__ = "brand_deals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="SET NULL"), nullable=True)
+    sponsor_name = Column(String, nullable=False)
+    contact_email = Column(String, nullable=True)
+    amount_cents = Column(Integer, server_default="0", nullable=False)
+    currency = Column(String, server_default="USD", nullable=False)
+    segment_start = Column(Integer, nullable=True)
+    segment_end = Column(Integer, nullable=True)
+    integration_notes = Column(Text, nullable=True)
+    payout_status = Column(String, server_default="pending", nullable=False)
+    paid_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    project = relationship("Project")
+    video = relationship("Video")
+
+
+class ThumbnailVariant(Base):
+    __tablename__ = "thumbnail_variants"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(String, nullable=True)
+    image_url = Column(String, nullable=False)
+    is_winner = Column(Boolean, server_default="false", nullable=False)
+    impressions = Column(Integer, server_default="0", nullable=False)
+    clicks = Column(Integer, server_default="0", nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    video = relationship("Video")
+
+
+# =====================================================================
+# Freelancer Business Layer models
+# =====================================================================
+
+
+class ProjectRevision(Base):
+    __tablename__ = "project_revisions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="SET NULL"), nullable=True)
+    round_number = Column(Integer, nullable=False)
+    triggered_by = Column(String, nullable=True)
+    note = Column(Text, nullable=True)
+    billable = Column(Boolean, server_default="false", nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    project = relationship("Project")
+    video = relationship("Video")
+
+
+class Invoice(Base):
+    __tablename__ = "invoices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    number = Column(String, nullable=True)
+    client_name = Column(String, nullable=True)
+    client_email = Column(String, nullable=True)
+    currency = Column(String, server_default="USD", nullable=False)
+    subtotal_cents = Column(Integer, server_default="0", nullable=False)
+    tax_cents = Column(Integer, server_default="0", nullable=False)
+    total_cents = Column(Integer, server_default="0", nullable=False)
+    status = Column(String, server_default="draft", nullable=False)
+    stripe_invoice_id = Column(String, nullable=True)
+    stripe_payment_link = Column(String, nullable=True)
+    due_at = Column(TIMESTAMP, nullable=True)
+    sent_at = Column(TIMESTAMP, nullable=True)
+    paid_at = Column(TIMESTAMP, nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    project = relationship("Project")
+    items = relationship("InvoiceItem", back_populates="invoice", cascade="all, delete-orphan")
+
+
+class InvoiceItem(Base):
+    __tablename__ = "invoice_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id", ondelete="CASCADE"), nullable=False, index=True)
+    description = Column(Text, nullable=False)
+    quantity = Column(Integer, server_default="1", nullable=False)
+    unit_price_cents = Column(Integer, server_default="0", nullable=False)
+    total_cents = Column(Integer, server_default="0", nullable=False)
+
+    invoice = relationship("Invoice", back_populates="items")
+
+
+class ProjectMilestone(Base):
+    __tablename__ = "project_milestones"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    amount_cents = Column(Integer, server_default="0", nullable=False)
+    currency = Column(String, server_default="USD", nullable=False)
+    percentage = Column(Integer, nullable=True)
+    due_at = Column(TIMESTAMP, nullable=True)
+    status = Column(String, server_default="pending", nullable=False)
+    invoice_id = Column(Integer, ForeignKey("invoices.id", ondelete="SET NULL"), nullable=True)
+    order_index = Column(Integer, server_default="0", nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    project = relationship("Project")
+
+
+class Contract(Base):
+    __tablename__ = "contracts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String, nullable=False)
+    body = Column(Text, nullable=False)
+    status = Column(String, server_default="draft", nullable=False)
+    signer_name = Column(String, nullable=True)
+    signer_email = Column(String, nullable=True)
+    signature_data = Column(Text, nullable=True)
+    signed_at = Column(TIMESTAMP, nullable=True)
+    signing_token = Column(String, unique=True, index=True, nullable=True)
+    pdf_url = Column(String, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    project = relationship("Project")
+
+
+class TimeEntry(Base):
+    __tablename__ = "time_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    started_at = Column(TIMESTAMP, nullable=False)
+    ended_at = Column(TIMESTAMP, nullable=True)
+    duration_seconds = Column(Integer, server_default="0", nullable=False)
+    note = Column(Text, nullable=True)
+    billable = Column(Boolean, server_default="true", nullable=False)
+    hourly_rate_cents = Column(Integer, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    project = relationship("Project")
+    user = relationship("User")
+
+
+class ProjectEstimate(Base):
+    __tablename__ = "project_estimates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String, nullable=True)
+    runtime_minutes = Column(Integer, server_default="0", nullable=False)
+    complexity = Column(String, server_default="standard", nullable=False)
+    rate_cents_per_hour = Column(Integer, server_default="0", nullable=False)
+    estimated_hours = Column(Integer, server_default="0", nullable=False)
+    line_items = Column(JSONB, nullable=True)
+    total_cents = Column(Integer, server_default="0", nullable=False)
+    currency = Column(String, server_default="USD", nullable=False)
+    status = Column(String, server_default="draft", nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    project = relationship("Project")
 
 
 
