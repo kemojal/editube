@@ -25,6 +25,44 @@ def _check_video_access(project_id: int, video_id: int, db: Session, current_use
     return db_video, db_project
 
 
+def _comment_visible_to_viewer(comment: Comment, viewer_id: int) -> bool:
+    """Public comments are visible to all; private top-level only to author."""
+    if not comment.is_private:
+        return True
+    if comment.user_id == viewer_id:
+        return True
+    return False
+
+
+def _reply_visible_to_viewer(reply: Comment, parent: Comment, viewer_id: int) -> bool:
+    """Private replies are visible to the author and to the parent comment author."""
+    if not reply.is_private:
+        return True
+    if reply.user_id == viewer_id:
+        return True
+    if parent.user_id == viewer_id:
+        return True
+    return False
+
+
+def _comment_or_reply_visible(
+    db: Session, comment: Comment, viewer_id: int, parent: Comment | None = None
+) -> bool:
+    """Visibility for any comment row (top-level or reply) for like/update/delete/list."""
+    if comment.parent_id is None:
+        return _comment_visible_to_viewer(comment, viewer_id)
+    if parent is not None and parent.id == comment.parent_id:
+        return _reply_visible_to_viewer(comment, parent, viewer_id)
+    parent_row = (
+        db.query(Comment)
+        .filter(Comment.id == comment.parent_id, Comment.video_id == comment.video_id)
+        .first()
+    )
+    if not parent_row:
+        return False
+    return _reply_visible_to_viewer(comment, parent_row, viewer_id)
+
+
 def _comment_response(comment: Comment, current_user_id: int) -> dict:
     likes_count = len(comment.likes) if comment.likes else 0
     liked_by_me = any(like.user_id == current_user_id for like in (comment.likes or []))
@@ -38,6 +76,7 @@ def _comment_response(comment: Comment, current_user_id: int) -> dict:
         "end_timecode": comment.end_timecode,
         "drawing_data": comment.drawing_data,
         "is_resolved": comment.is_resolved,
+        "is_private": comment.is_private,
         "user": comment.user,
         "likes_count": likes_count,
         "liked_by_me": liked_by_me,
@@ -61,7 +100,7 @@ def add_comment(
         parent = db.query(Comment).filter(
             Comment.id == comment.parent_id, Comment.video_id == video_id
         ).first()
-        if not parent:
+        if not parent or not _comment_visible_to_viewer(parent, current_user.id):
             raise HTTPException(status_code=404, detail="Parent comment not found")
 
     db_comment = Comment(
@@ -72,6 +111,7 @@ def add_comment(
         timecode=comment.timecode,
         end_timecode=comment.end_timecode,
         drawing_data=comment.drawing_data,
+        is_private=comment.is_private,
     )
     db.add(db_comment)
     db.commit()
@@ -98,11 +138,16 @@ def get_comments(
 
     result = []
     for comment in top_comments:
-        data = _comment_response(comment, current_user.id)
-        data["replies"] = [
+        if not _comment_visible_to_viewer(comment, current_user.id):
+            continue
+        visible_replies = [
             _comment_response(reply, current_user.id)
             for reply in sorted(comment.replies or [], key=lambda r: r.created_at)
+            if _reply_visible_to_viewer(reply, comment, current_user.id)
         ]
+        data = _comment_response(comment, current_user.id)
+        data["replies"] = visible_replies
+        data["replies_count"] = len(visible_replies)
         result.append(data)
     return result
 
@@ -118,7 +163,9 @@ def update_comment(
 ):
     _check_video_access(project_id, video_id, db, current_user)
     db_comment = db.query(Comment).filter(Comment.id == comment_id, Comment.video_id == video_id).first()
-    if not db_comment:
+    if not db_comment or not _comment_or_reply_visible(
+        db, db_comment, current_user.id
+    ):
         raise HTTPException(status_code=404, detail="Comment not found")
 
     # Only the author can edit text; project creator/collaborators can resolve
@@ -143,7 +190,9 @@ def delete_comment(
 ):
     _, db_project = _check_video_access(project_id, video_id, db, current_user)
     db_comment = db.query(Comment).filter(Comment.id == comment_id, Comment.video_id == video_id).first()
-    if not db_comment:
+    if not db_comment or not _comment_or_reply_visible(
+        db, db_comment, current_user.id
+    ):
         raise HTTPException(status_code=404, detail="Comment not found")
     if db_comment.user_id != current_user.id and db_project.creator_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized to delete this comment")
@@ -163,7 +212,9 @@ def toggle_like(
 ):
     _check_video_access(project_id, video_id, db, current_user)
     db_comment = db.query(Comment).filter(Comment.id == comment_id, Comment.video_id == video_id).first()
-    if not db_comment:
+    if not db_comment or not _comment_or_reply_visible(
+        db, db_comment, current_user.id
+    ):
         raise HTTPException(status_code=404, detail="Comment not found")
 
     existing = db.query(CommentLike).filter(

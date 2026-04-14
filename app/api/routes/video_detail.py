@@ -14,11 +14,13 @@ router = APIRouter(
 )
 
 
-def _video_detail(video: Video) -> dict:
-    return video_detail_dict(video)
+def _video_detail(video: Video, viewer_user_id: int | None = None) -> dict:
+    return video_detail_dict(video, viewer_user_id)
 
 
-def _video_with_project_payload(db: Session, db_video: Video) -> dict:
+def _video_with_project_payload(
+    db: Session, db_video: Video, viewer_user_id: int | None = None
+) -> dict:
     db_project = db.query(Project).filter(Project.id == db_video.project_id).first()
     all_versions = (
         db.query(Video)
@@ -26,7 +28,7 @@ def _video_with_project_payload(db: Session, db_video: Video) -> dict:
         .order_by(Video.version.desc())
         .all()
     )
-    detail = _video_detail(db_video)
+    detail = _video_detail(db_video, viewer_user_id)
     detail["project"] = db_project
     detail["versions"] = [
         {"id": v.id, "version": v.version, "name": v.name, "created_at": v.created_at}
@@ -73,7 +75,7 @@ def start_video_transcription(
         .filter(Video.id == video_id)
         .first()
     )
-    return _video_with_project_payload(db, db_video)
+    return _video_with_project_payload(db, db_video, current_user.id)
 
 
 @router.get("/{video_id}", response_model=VideoWithProjectResponse)
@@ -100,7 +102,7 @@ def get_video_by_id(
     if current_user not in [db_project.creator] + [c.user for c in db_project.collaborators]:
         raise HTTPException(status_code=403, detail="Not authorized to access this video")
 
-    return _video_with_project_payload(db, db_video)
+    return _video_with_project_payload(db, db_video, current_user.id)
 
 
 @router.put("/{video_id}/status", response_model=VideoDetailResponse)
@@ -147,4 +149,4 @@ def update_video_status(
         .filter(Video.id == video_id)
         .first()
     )
-    return _video_detail(db_video)
+    return _video_detail(db_video, current_user.id)

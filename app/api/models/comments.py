@@ -11,6 +11,7 @@ class CommentBase(BaseModel):
 
 class CommentCreate(CommentBase):
     parent_id: Optional[int] = None
+    is_private: bool = False
 
 class CommentUpdate(BaseModel):
     text: Optional[str] = None
@@ -36,6 +37,7 @@ class CommentResponse(BaseModel):
     end_timecode: int | None = None
     drawing_data: Any | None = None
     is_resolved: bool = False
+    is_private: bool = False
     user: CommentUserResponse
     likes_count: int = 0
     liked_by_me: bool = False

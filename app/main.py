@@ -87,6 +87,13 @@ app.include_router(api_router)
 # Include the WebSocket app
 # app.mount("/", websocket_app)
 
+
+@app.get("/health")
+async def health():
+    """Liveness probe for reverse proxies and Dokploy."""
+    return {"status": "ok"}
+
+
 @app.get("/")
 async def read_item():
     return {"hello word"}

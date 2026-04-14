@@ -4,7 +4,29 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.db.models import Video, VideoTranscription
+from app.db.models import Annotation, Comment, Video, VideoTranscription
+
+
+def _comment_row_visible_to_viewer(
+    comment: Comment, viewer_user_id: int, by_id: dict[int, Comment]
+) -> bool:
+    """Match list API: private top-level = author only; private reply = author or parent author."""
+    if not getattr(comment, "is_private", False):
+        return True
+    if comment.user_id == viewer_user_id:
+        return True
+    pid = comment.parent_id
+    if pid is not None:
+        parent = by_id.get(pid)
+        if parent is not None and parent.user_id == viewer_user_id:
+            return True
+    return False
+
+
+def _annotation_visible_to_viewer(annotation: Annotation, viewer_user_id: int) -> bool:
+    if not getattr(annotation, "is_private", False):
+        return True
+    return annotation.user_id == viewer_user_id
 
 
 def transcription_to_dict(tr: VideoTranscription | None) -> dict[str, Any] | None:
@@ -17,7 +39,20 @@ def transcription_to_dict(tr: VideoTranscription | None) -> dict[str, Any] | Non
     }
 
 
-def video_detail_dict(video: Video) -> dict[str, Any]:
+def video_detail_dict(video: Video, viewer_user_id: int | None = None) -> dict[str, Any]:
+    comments = video.comments or []
+    annotations = video.annotations or []
+    if viewer_user_id is not None:
+        by_id = {c.id: c for c in comments}
+        comments_count = sum(
+            1 for c in comments if _comment_row_visible_to_viewer(c, viewer_user_id, by_id)
+        )
+        annotations_count = sum(
+            1 for a in annotations if _annotation_visible_to_viewer(a, viewer_user_id)
+        )
+    else:
+        comments_count = len(comments)
+        annotations_count = len(annotations)
     return {
         "id": video.id,
         "project_id": video.project_id,
@@ -32,7 +67,7 @@ def video_detail_dict(video: Video) -> dict[str, Any]:
         "uploader": video.uploader,
         "created_at": video.created_at,
         "updated_at": video.updated_at,
-        "comments_count": len(video.comments) if video.comments else 0,
-        "annotations_count": len(video.annotations) if video.annotations else 0,
+        "comments_count": comments_count,
+        "annotations_count": annotations_count,
         "transcription": transcription_to_dict(video.transcription),
     }

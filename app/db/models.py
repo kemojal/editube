@@ -164,6 +164,7 @@ class Comment(Base):
     end_timecode = Column(Integer, nullable=True)  # null means point comment, set means range comment
     drawing_data = Column(JSONB, nullable=True)  # FabricJS canvas objects drawn with the comment
     is_resolved = Column(Boolean, server_default="false", nullable=False)
+    is_private = Column(Boolean, server_default="false", nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -183,6 +184,7 @@ class Annotation(Base):
     annotation_data = Column(JSONB, nullable=False)
     timecode = Column(Integer, nullable=False)
     duration = Column(Integer, server_default="5", nullable=False)
+    is_private = Column(Boolean, server_default="false", nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 

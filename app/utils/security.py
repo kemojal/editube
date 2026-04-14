@@ -1,3 +1,5 @@
+import os
+
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import jwt, JWTError, ExpiredSignatureError
@@ -19,8 +21,11 @@ def get_password_hash(password):
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
-# Add your secret key and algorithm here
-SECRET_KEY = "5f647556f4a1a426f08fad0bbb8bbab058aee16e6478e034c3a86855461b7e26"
+# Set JWT_SECRET_KEY in production (Dokploy / .env). Default is dev-only.
+SECRET_KEY = os.getenv(
+    "JWT_SECRET_KEY",
+    "5f647556f4a1a426f08fad0bbb8bbab058aee16e6478e034c3a86855461b7e26",
+)
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 REFRESH_TOKEN_EXPIRE_DAYS = 30

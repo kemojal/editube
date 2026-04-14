@@ -29,8 +29,8 @@ router = APIRouter(
 logger = logging.getLogger(__name__)
 
 
-def _video_detail(video: Video) -> dict:
-    return video_detail_dict(video)
+def _video_detail(video: Video, viewer_user_id: int | None = None) -> dict:
+    return video_detail_dict(video, viewer_user_id)
 
 
 @router.post("/", response_model=VideoDetailResponse)
@@ -101,7 +101,7 @@ def upload_video(
         .filter(Video.id == db_video.id)
         .first()
     )
-    return _video_detail(db_video)
+    return _video_detail(db_video, current_user.id)
 
 
 @router.get("/{video_id}", response_model=VideoWithProjectResponse)
@@ -136,7 +136,7 @@ def get_video(
         .all()
     )
 
-    detail = _video_detail(db_video)
+    detail = _video_detail(db_video, current_user.id)
     detail["project"] = db_project
     detail["versions"] = [
         {"id": v.id, "version": v.version, "name": v.name, "created_at": v.created_at}
@@ -189,7 +189,7 @@ def start_project_video_transcription(
         .order_by(Video.version.desc())
         .all()
     )
-    detail = _video_detail(db_video)
+    detail = _video_detail(db_video, current_user.id)
     detail["project"] = db_project
     detail["versions"] = [
         {"id": v.id, "version": v.version, "name": v.name, "created_at": v.created_at}
@@ -241,4 +241,4 @@ def update_video_status(
         .filter(Video.id == video_id, Video.project_id == project_id)
         .first()
     )
-    return _video_detail(db_video)
+    return _video_detail(db_video, current_user.id)

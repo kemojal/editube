@@ -17,6 +17,12 @@ router = APIRouter(
 )
 
 
+def _annotation_visible_to_viewer(annotation: Annotation, viewer_id: int) -> bool:
+    if not annotation.is_private:
+        return True
+    return annotation.user_id == viewer_id
+
+
 def _annotation_response(a: Annotation) -> dict:
     return {
         "id": a.id,
@@ -30,6 +36,7 @@ def _annotation_response(a: Annotation) -> dict:
         "annotation_data": a.annotation_data,
         "timecode": int(a.timecode) if isinstance(a.timecode, str) else a.timecode,
         "duration": a.duration or 5,
+        "is_private": a.is_private,
         "created_at": a.created_at,
         "updated_at": a.updated_at,
     }
@@ -60,6 +67,7 @@ def create_annotation(
         annotation_data=annotation.annotation_data,
         timecode=annotation.timecode,
         duration=annotation.duration or 5,
+        is_private=annotation.is_private,
     )
 
     db.add(db_annotation)
@@ -95,7 +103,11 @@ def get_video_annotations(
         .all()
     )
 
-    return [_annotation_response(a) for a in annotations]
+    return [
+        _annotation_response(a)
+        for a in annotations
+        if _annotation_visible_to_viewer(a, current_user.id)
+    ]
 
 
 @router.put("/{annotation_id}", response_model=AnnotationResponse)
@@ -108,7 +120,9 @@ def update_annotation(
     db_annotation = (
         db.query(Annotation).filter(Annotation.id == annotation_id).first()
     )
-    if not db_annotation:
+    if not db_annotation or not _annotation_visible_to_viewer(
+        db_annotation, current_user.id
+    ):
         raise HTTPException(status_code=404, detail="Annotation not found")
 
     db_video = db.query(Video).filter(Video.id == db_annotation.video_id).first()
@@ -139,7 +153,9 @@ def delete_annotation(
     db_annotation = (
         db.query(Annotation).filter(Annotation.id == annotation_id).first()
     )
-    if not db_annotation:
+    if not db_annotation or not _annotation_visible_to_viewer(
+        db_annotation, current_user.id
+    ):
         raise HTTPException(status_code=404, detail="Annotation not found")
 
     db_video = db.query(Video).filter(Video.id == db_annotation.video_id).first()

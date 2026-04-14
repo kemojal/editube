@@ -114,6 +114,17 @@ Existing videos created before this feature will have **`transcription: null`** 
 | **`failed`** with ffmpeg message | `ffmpeg` missing on the **worker** host, or bad/corrupt download. |
 | **`failed`** with CUDA / model errors | Wrong `TRANSCRIPTION_DEVICE` / `TRANSCRIPTION_COMPUTE_TYPE` for your machine. |
 
+## Docker and Dokploy (Hetzner)
+
+Production container image: **[`Dockerfile`](Dockerfile)** at this repo root (use this folder as the Git repo root when you split from a monorepo).
+
+- **Health check:** `GET /health`
+- **Port:** set `PORT` in the environment (default `8000`).
+- **Optional migrations on start:** `RUN_MIGRATIONS_ON_START=1` (see [`docker-entrypoint.sh`](docker-entrypoint.sh)).
+- **Secrets template:** [`.env.example`](.env.example) — copy locally; in Dokploy set variables in the UI.
+
+Step-by-step deploy (worker second app, migrations, CORS): **[`DEPLOY.md`](DEPLOY.md)**.
+
 ## Notes
 
 - `email-validator` is required by the current Pydantic model definitions and should be installed in the virtual environment.
