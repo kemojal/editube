@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.db.models import Annotation, Comment, Video, VideoTranscription
+from sqlalchemy.orm import Session
+
+from app.db.models import Annotation, Comment, Project, Video, VideoTranscription
+from app.services.project_access import can_moderate_video_comments
 
 
 def _comment_row_visible_to_viewer(
@@ -41,7 +44,13 @@ def transcription_to_dict(tr: VideoTranscription | None) -> dict[str, Any] | Non
     }
 
 
-def video_detail_dict(video: Video, viewer_user_id: int | None = None) -> dict[str, Any]:
+def video_detail_dict(
+    video: Video,
+    viewer_user_id: int | None = None,
+    *,
+    db: Session | None = None,
+    db_project: Project | None = None,
+) -> dict[str, Any]:
     comments = video.comments or []
     annotations = video.annotations or []
     if viewer_user_id is not None:
@@ -55,6 +64,13 @@ def video_detail_dict(video: Video, viewer_user_id: int | None = None) -> dict[s
     else:
         comments_count = len(comments)
         annotations_count = len(annotations)
+    can_moderate = False
+    if (
+        viewer_user_id is not None
+        and db is not None
+        and db_project is not None
+    ):
+        can_moderate = can_moderate_video_comments(db, db_project, viewer_user_id)
     return {
         "id": video.id,
         "project_id": video.project_id,
@@ -72,4 +88,5 @@ def video_detail_dict(video: Video, viewer_user_id: int | None = None) -> dict[s
         "comments_count": comments_count,
         "annotations_count": annotations_count,
         "transcription": transcription_to_dict(video.transcription),
+        "can_moderate": can_moderate,
     }

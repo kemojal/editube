@@ -53,6 +53,7 @@ from app.jobs.queue import enqueue_aspect_export_job, enqueue_chapter_synthesis_
 from app.publishers import get_publisher
 from app.services.youtube_chapters import youtube_description_block
 from app.utils.security import get_current_user
+from app.services.project_access import can_access_project
 
 
 router = APIRouter(prefix="/creator", tags=["Creator"])
@@ -62,9 +63,7 @@ def _get_owned_video(db: Session, video_id: int, user: User) -> Video:
     video = db.query(Video).filter(Video.id == video_id).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
-    if video.project.creator_id != user.id and user not in [
-        c.user for c in video.project.collaborators
-    ]:
+    if not can_access_project(db, user.id, video.project):
         raise HTTPException(status_code=403, detail="Not authorized")
     return video
 
@@ -73,7 +72,7 @@ def _get_owned_project(db: Session, project_id: int, user: User) -> Project:
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if project.creator_id != user.id:
+    if not can_access_project(db, user.id, project):
         raise HTTPException(status_code=403, detail="Not authorized")
     return project
 

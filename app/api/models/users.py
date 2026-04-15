@@ -55,6 +55,7 @@ class UserSettingsResponse(BaseModel):
     date_format: str = "MMM d, yyyy"
     email_comments: bool = True
     email_mentions: bool = True
+    email_mention_digest: str = "off"
     product_updates: bool = False
     two_factor: bool = False
     session_timeout: str = "30"
@@ -70,6 +71,7 @@ class UserSettingsUpdate(BaseModel):
     date_format: Optional[Literal["MMM d, yyyy", "yyyy-MM-dd", "MM/dd/yyyy"]] = None
     email_comments: Optional[bool] = None
     email_mentions: Optional[bool] = None
+    email_mention_digest: Optional[Literal["off", "daily", "weekly"]] = None
     product_updates: Optional[bool] = None
     two_factor: Optional[bool] = None
     session_timeout: Optional[Literal["15", "30", "60", "120"]] = None

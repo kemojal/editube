@@ -46,6 +46,11 @@ class User(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+    workspace_memberships = relationship(
+        "WorkspaceMember",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
 
 
 class UserSettings(Base):
@@ -59,6 +64,8 @@ class UserSettings(Base):
     date_format = Column(String, server_default="MMM d, yyyy", nullable=False)
     email_comments = Column(Boolean, server_default="true", nullable=False)
     email_mentions = Column(Boolean, server_default="true", nullable=False)
+    # off | daily | weekly — digest of @mentions (immediate emails still follow email_mentions)
+    email_mention_digest = Column(String, server_default="off", nullable=False)
     product_updates = Column(Boolean, server_default="false", nullable=False)
     two_factor = Column(Boolean, server_default="false", nullable=False)
     session_timeout = Column(String, server_default="30", nullable=False)
@@ -108,13 +115,153 @@ class Subscription(Base):
     user = relationship("User", back_populates="subscriptions")
 
 
+class Workspace(Base):
+    __tablename__ = "workspaces"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    slug = Column(String, unique=True, index=True, nullable=False)
+    owner_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    settings = Column(JSONB, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    owner = relationship("User", foreign_keys=[owner_user_id])
+    members = relationship(
+        "WorkspaceMember",
+        back_populates="workspace",
+        cascade="all, delete-orphan",
+    )
+    projects = relationship("Project", back_populates="workspace")
+    branding = relationship(
+        "WorkspaceBranding",
+        back_populates="workspace",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+    invites = relationship(
+        "WorkspaceInvite",
+        back_populates="workspace",
+        cascade="all, delete-orphan",
+    )
+    assets = relationship(
+        "WorkspaceAsset",
+        back_populates="workspace",
+        cascade="all, delete-orphan",
+    )
+
+
+class WorkspaceMember(Base):
+    __tablename__ = "workspace_members"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(
+        Integer,
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    # owner | producer | editor | assistant | client
+    role = Column(String, nullable=False, server_default="editor")
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    workspace = relationship("Workspace", back_populates="members")
+    user = relationship("User", back_populates="workspace_memberships")
+
+    __table_args__ = (UniqueConstraint("workspace_id", "user_id", name="uq_workspace_members_ws_user"),)
+
+
+class WorkspaceInvite(Base):
+    __tablename__ = "workspace_invites"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    email = Column(String, nullable=False, index=True)
+    role = Column(String, nullable=False, server_default="editor")
+    token = Column(String, unique=True, index=True, nullable=False)
+    invited_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    expires_at = Column(TIMESTAMP, nullable=False)
+    accepted_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    workspace = relationship("Workspace", back_populates="invites")
+
+
+class WorkspaceBranding(Base):
+    __tablename__ = "workspace_brandings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(
+        Integer,
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    logo_url = Column(String, nullable=True)
+    primary_color = Column(String, nullable=True)
+    accent_color = Column(String, nullable=True)
+    client_footer_text = Column(Text, nullable=True)
+    custom_domain = Column(String, unique=True, index=True, nullable=True)
+    domain_verification_token = Column(String, nullable=True)
+    domain_verified_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    workspace = relationship("Workspace", back_populates="branding")
+
+
+class ProjectTemplate(Base):
+    """Preset folder trees + review stages (system or per-workspace)."""
+
+    __tablename__ = "project_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=True, index=True)
+    template_key = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    definition = Column(JSONB, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    workspace = relationship("Workspace", foreign_keys=[workspace_id])
+
+
+class WorkspaceAsset(Base):
+    __tablename__ = "workspace_assets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    category = Column(String, nullable=False, index=True)
+    title = Column(String, nullable=False)
+    file_url = Column(String, nullable=False)
+    extra = Column(JSONB, nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    workspace = relationship("Workspace", back_populates="assets")
+
+
 class Project(Base):
     __tablename__ = "projects"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String)
     description = Column(Text)
     creator_id = Column(Integer, ForeignKey("users.id"))
+    workspace_id = Column(
+        Integer,
+        ForeignKey("workspaces.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    created_from_template_id = Column(
+        Integer,
+        ForeignKey("project_templates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     creator = relationship("User", back_populates="projects")
+    workspace = relationship("Workspace", back_populates="projects")
+    created_from_template = relationship("ProjectTemplate", foreign_keys=[created_from_template_id])
     # Freelancer business layer
     scope_revisions_included = Column(Integer, server_default="3", nullable=False)
     revision_count = Column(Integer, server_default="0", nullable=False)
@@ -133,6 +280,11 @@ class Project(Base):
     collaborators = relationship("ProjectCollaborator", back_populates="project")
     videos = relationship("Video", back_populates="project")
     folders = relationship("Folder", back_populates="project", cascade="all, delete-orphan")
+    review_workflow_templates = relationship(
+        "ReviewWorkflowTemplate",
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
 
 class ProjectCollaborator(Base):
     __tablename__ = "project_collaborators"
@@ -257,9 +409,19 @@ class Comment(Base):
     drawing_data = Column(JSONB, nullable=True)  # FabricJS canvas objects drawn with the comment
     is_resolved = Column(Boolean, server_default="false", nullable=False)
     is_private = Column(Boolean, server_default="false", nullable=False)
+    # public (client-visible on review) | team (internal) | author_only (legacy private note)
+    visibility = Column(String, server_default="public", nullable=False, index=True)
+    due_at = Column(TIMESTAMP, nullable=True)
+    # comment | change_request — change requests can block client approval until resolved/wontfix
+    kind = Column(String, server_default="comment", nullable=False, index=True)
+    # open | in_progress | resolved | wontfix | reopened
+    status = Column(String, server_default="open", nullable=False, index=True)
+    assignee_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    status_changed_at = Column(TIMESTAMP, nullable=True)
     # Guest (review-link) commenter fields — used when user_id is null
     guest_name = Column(String, nullable=True)
     guest_email = Column(String, nullable=True)
+    guest_avatar_url = Column(String, nullable=True)
     review_link_id = Column(
         Integer, ForeignKey("review_links.id", ondelete="SET NULL"), nullable=True
     )
@@ -267,7 +429,8 @@ class Comment(Base):
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
     video = relationship("Video", back_populates="comments")
-    user = relationship("User")
+    user = relationship("User", foreign_keys=[user_id])
+    assignee = relationship("User", foreign_keys=[assignee_user_id])
     parent = relationship("Comment", remote_side=[id], back_populates="replies")
     replies = relationship("Comment", back_populates="parent", cascade="all, delete-orphan")
     likes = relationship("CommentLike", back_populates="comment", cascade="all, delete-orphan")
@@ -301,6 +464,7 @@ class ReviewLink(Base):
     version_group_id = Column(String, nullable=True, index=True)
     version_label = Column(String, nullable=True)
     revoked_at = Column(TIMESTAMP, nullable=True)
+    allow_export = Column(Boolean, server_default="false", nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(
         TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
@@ -310,6 +474,12 @@ class ReviewLink(Base):
     creator = relationship("User")
     sessions = relationship(
         "ReviewSession", back_populates="review_link", cascade="all, delete-orphan"
+    )
+    workflow_run = relationship(
+        "ReviewWorkflowRun",
+        back_populates="review_link",
+        uselist=False,
+        cascade="all, delete-orphan",
     )
 
 
@@ -417,9 +587,79 @@ class ReviewSignoff(Base):
     declaration_text = Column(Text, nullable=False)
     legal_snapshot_json = Column(JSONB, nullable=True)
     signed_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    signature_type = Column(String, server_default="none", nullable=False)  # none | typed | drawn
+    typed_signature = Column(Text, nullable=True)
+    signature_image_data = Column(Text, nullable=True)  # data URL or raw base64
+    pdf_url = Column(String, nullable=True)
 
     review_link = relationship("ReviewLink")
     session = relationship("ReviewSession", back_populates="signoffs")
+
+
+class ReviewWorkflowTemplate(Base):
+    """Ordered approval stages for a project (Editor → Producer → …)."""
+
+    __tablename__ = "review_workflow_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    project = relationship("Project", back_populates="review_workflow_templates")
+    stages = relationship(
+        "ReviewWorkflowStage",
+        back_populates="template",
+        cascade="all, delete-orphan",
+    )
+    runs = relationship("ReviewWorkflowRun", back_populates="template")
+
+
+class ReviewWorkflowStage(Base):
+    __tablename__ = "review_workflow_stages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    template_id = Column(
+        Integer,
+        ForeignKey("review_workflow_templates.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    stage_index = Column(Integer, nullable=False)
+    stage_key = Column(String, nullable=False)
+    label = Column(String, nullable=False)
+    notify_user_ids = Column(JSONB, nullable=False, server_default="[]")
+
+    template = relationship("ReviewWorkflowTemplate", back_populates="stages")
+
+
+class ReviewWorkflowRun(Base):
+    """Runtime progress of a workflow for one review link."""
+
+    __tablename__ = "review_workflow_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    review_link_id = Column(
+        Integer,
+        ForeignKey("review_links.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    template_id = Column(
+        Integer,
+        ForeignKey("review_workflow_templates.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    current_stage_index = Column(Integer, server_default="0", nullable=False)
+    completed_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    review_link = relationship("ReviewLink", back_populates="workflow_run")
+    template = relationship("ReviewWorkflowTemplate", back_populates="runs")
 
 
 class ReviewCommentDraft(Base):

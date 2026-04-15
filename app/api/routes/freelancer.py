@@ -35,6 +35,7 @@ from app.db.models import (
     ProjectEstimate,
 )
 from app.utils.security import get_current_user
+from app.services.project_access import assert_manage_freelancer_financials
 from app.api.models.freelancer import (
     ProjectScopeUpdate,
     ProjectScopeResponse,
@@ -78,8 +79,7 @@ def _owned(db: Session, project_id: int, user: User) -> Project:
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if project.creator_id != user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    assert_manage_freelancer_financials(db, user, project)
     return project
 
 

@@ -58,6 +58,8 @@ class VideoDetailResponse(BaseModel):
     comments_count: int = 0
     annotations_count: int = 0
     transcription: Optional[VideoTranscriptionNested] = None
+    # True when the viewer may moderate others' comments (workflow status, assignee, etc.).
+    can_moderate: bool = False
 
     class Config:
         orm_mode = True

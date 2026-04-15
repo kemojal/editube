@@ -13,6 +13,7 @@ from app.jobs.ai_jobs import (
 )
 from app.services.ai_client import generate_json
 from app.utils.security import get_current_user
+from app.services.project_access import can_access_project
 
 router = APIRouter(
     prefix="/videos",
@@ -27,7 +28,7 @@ def _check_video_access(video_id: int, db: Session, current_user: User) -> Video
     project = db.query(Project).filter(Project.id == video.project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if current_user not in [project.creator] + [c.user for c in project.collaborators]:
+    if not can_access_project(db, current_user.id, project):
         raise HTTPException(status_code=403, detail="Not authorized to access this video")
     return video
 

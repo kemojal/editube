@@ -143,3 +143,25 @@ def enqueue_chapter_synthesis_job(video_id: int) -> bool:
     except Exception as e:
         logger.exception("Failed to enqueue chapter synthesis for video %s: %s", video_id, e)
         return False
+
+
+def enqueue_mention_digest_all_job() -> bool:
+    """Enqueue batch mention digest for users with email_mention_digest daily/weekly."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; mention digest job not enqueued")
+        return False
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=900)
+        q.enqueue(
+            "app.jobs.mention_digest.run_digest_for_all_users",
+            job_timeout=900,
+        )
+        return True
+    except Exception as e:
+        logger.exception("Failed to enqueue mention digest job: %s", e)
+        return False

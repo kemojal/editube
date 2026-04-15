@@ -11,6 +11,7 @@ class ReviewLinkCreate(BaseModel):
     allow_download: bool = False
     approval_required_for_download: bool = False
     allow_comments: bool = True
+    allow_export: bool = False
     watermark_enabled: bool = True
     require_email: bool = False
     version_group_id: Optional[str] = None
@@ -24,6 +25,7 @@ class ReviewLinkUpdate(BaseModel):
     allow_download: Optional[bool] = None
     approval_required_for_download: Optional[bool] = None
     allow_comments: Optional[bool] = None
+    allow_export: Optional[bool] = None
     watermark_enabled: Optional[bool] = None
     require_email: Optional[bool] = None
     version_group_id: Optional[str] = None
@@ -41,6 +43,7 @@ class ReviewLinkResponse(BaseModel):
     allow_download: bool
     approval_required_for_download: bool = False
     allow_comments: bool
+    allow_export: bool = False
     watermark_enabled: bool
     require_email: bool
     version_group_id: Optional[str] = None
@@ -97,7 +100,8 @@ class PublicReviewVideo(BaseModel):
     id: int
     name: str
     description: Optional[str] = None
-    file_path: str
+    # Signed app URL for review playback; null until a session exists (never raw storage URL).
+    file_path: Optional[str] = None
     duration: Optional[int] = None
     thumbnail_url: Optional[str] = None
 
@@ -119,6 +123,7 @@ class PublicReviewLinkInfo(BaseModel):
     allow_download: bool
     approval_required_for_download: bool = False
     allow_comments: bool
+    allow_export: bool = False
     watermark_enabled: bool
     version_group_id: Optional[str] = None
     version_label: Optional[str] = None
@@ -126,6 +131,8 @@ class PublicReviewLinkInfo(BaseModel):
     revoked: bool
     video: Optional[PublicReviewVideo] = None  # null if password required
     scope: Optional[PublicReviewScope] = None
+    client_approve_blockers: List[dict] = []
+    workspace_branding: Optional[dict] = None
 
 
 class PublicReviewAuthRequest(BaseModel):
@@ -158,6 +165,7 @@ class PublicReviewCommentCreate(BaseModel):
     end_timecode: Optional[int] = None
     drawing_data: Optional[Any] = None
     parent_id: Optional[int] = None
+    kind: Optional[str] = "comment"  # comment | change_request
 
 
 class PublicReviewCommentUser(BaseModel):
@@ -177,6 +185,8 @@ class PublicReviewCommentResponse(BaseModel):
     end_timecode: Optional[int] = None
     drawing_data: Optional[Any] = None
     is_resolved: bool = False
+    kind: str = "comment"
+    status: str = "open"
     user: PublicReviewCommentUser
     likes_count: int = 0
     replies_count: int = 0
@@ -186,6 +196,19 @@ class PublicReviewCommentResponse(BaseModel):
 
 
 PublicReviewCommentResponse.update_forward_refs()
+
+
+class PublicReviewCommentDeltaItem(BaseModel):
+    id: int
+    parent_id: Optional[int] = None
+    updated_at: datetime
+    kind: str = "comment"
+    status: str = "open"
+
+
+class PublicReviewCommentDeltaResponse(BaseModel):
+    items: List[PublicReviewCommentDeltaItem] = []
+    server_time: datetime
 
 
 class PublicReviewApproveRequest(BaseModel):
@@ -209,14 +232,18 @@ class PublicReviewMagicVerifyRequest(BaseModel):
 class PublicReviewSignoffRequest(BaseModel):
     session_id: int
     declaration_text: str
+    typed_signature: Optional[str] = None
+    signature_image_data: Optional[str] = None  # data:image/png;base64,...
 
 
 class PublicReviewSignoffResponse(BaseModel):
+    id: Optional[int] = None
     ok: bool
     signed_at: datetime
     signer_name: Optional[str] = None
     signer_email: Optional[str] = None
     declaration_text: str
+    pdf_url: Optional[str] = None
 
 
 class PublicReviewDraftRequest(BaseModel):

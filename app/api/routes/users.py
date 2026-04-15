@@ -39,6 +39,7 @@ DEFAULT_USER_SETTINGS = {
     "two_factor": False,
     "session_timeout": "30",
     "allow_project_invites": True,
+    "email_mention_digest": "off",
 }
 ALLOWED_TIMEZONES = {
     "America/Los_Angeles",
@@ -86,6 +87,10 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
+
+    from app.services.workspace_bootstrap import ensure_personal_workspace
+
+    ensure_personal_workspace(db, db_user)
 
     session_id = create_user_session(db, db_user.id)
     access_token = create_access_token(
@@ -228,6 +233,12 @@ def update_current_user_settings(
         if not value:
             raise HTTPException(status_code=400, detail="Workspace name cannot be empty")
         update_data["workspace_name"] = value[:120]
+    if "email_mention_digest" in update_data and update_data["email_mention_digest"] not in {
+        "off",
+        "daily",
+        "weekly",
+    }:
+        raise HTTPException(status_code=400, detail="Invalid mention digest setting")
 
     for key, value in update_data.items():
         setattr(settings, key, value)

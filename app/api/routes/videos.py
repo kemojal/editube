@@ -5,6 +5,7 @@ import logging
 
 from app.db.database import get_db
 from app.db.models import Project, Video, VideoTranscription, User, Folder
+from app.services.project_access import assert_write_project_content, can_access_project
 from app.api.video_payload import video_detail_dict
 from app.api.models.videos import (
     VideoCreate,
@@ -29,8 +30,16 @@ router = APIRouter(
 logger = logging.getLogger(__name__)
 
 
-def _video_detail(video: Video, viewer_user_id: int | None = None) -> dict:
-    return video_detail_dict(video, viewer_user_id)
+def _video_detail(
+    video: Video,
+    viewer_user_id: int | None = None,
+    *,
+    db: Session | None = None,
+    db_project: Project | None = None,
+) -> dict:
+    return video_detail_dict(
+        video, viewer_user_id, db=db, db_project=db_project
+    )
 
 
 @router.post("/", response_model=VideoDetailResponse)
@@ -46,8 +55,9 @@ def upload_video(
     db_project = db.query(Project).filter(Project.id == project_id).first()
     if not db_project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if current_user not in [db_project.creator] + [c.user for c in db_project.collaborators]:
+    if not can_access_project(db, current_user.id, db_project):
         raise HTTPException(status_code=403, detail="Not authorized to upload videos to this project")
+    assert_write_project_content(db, current_user, db_project)
 
     if folder_id is not None:
         folder = db.query(Folder).filter(Folder.id == folder_id, Folder.project_id == project_id).first()
@@ -101,7 +111,9 @@ def upload_video(
         .filter(Video.id == db_video.id)
         .first()
     )
-    return _video_detail(db_video, current_user.id)
+    return _video_detail(
+        db_video, current_user.id, db=db, db_project=db_project
+    )
 
 
 @router.get("/{video_id}", response_model=VideoWithProjectResponse)
@@ -125,7 +137,7 @@ def get_video(
     if not db_video:
         raise HTTPException(status_code=404, detail="Video not found")
     db_project = db.query(Project).filter(Project.id == project_id).first()
-    if current_user not in [db_project.creator] + [c.user for c in db_project.collaborators]:
+    if not can_access_project(db, current_user.id, db_project):
         raise HTTPException(status_code=403, detail="Not authorized to access this video")
 
     # Get all versions of this video in the project
@@ -136,7 +148,9 @@ def get_video(
         .all()
     )
 
-    detail = _video_detail(db_video, current_user.id)
+    detail = _video_detail(
+        db_video, current_user.id, db=db, db_project=db_project
+    )
     detail["project"] = db_project
     detail["versions"] = [
         {"id": v.id, "version": v.version, "name": v.name, "created_at": v.created_at}
@@ -167,8 +181,9 @@ def start_project_video_transcription(
     if not db_video:
         raise HTTPException(status_code=404, detail="Video not found")
     db_project = db.query(Project).filter(Project.id == project_id).first()
-    if current_user not in [db_project.creator] + [c.user for c in db_project.collaborators]:
+    if not can_access_project(db, current_user.id, db_project):
         raise HTTPException(status_code=403, detail="Not authorized to access this video")
+    assert_write_project_content(db, current_user, db_project)
 
     prepare_and_enqueue_transcription(db, video_id)
 
@@ -189,7 +204,9 @@ def start_project_video_transcription(
         .order_by(Video.version.desc())
         .all()
     )
-    detail = _video_detail(db_video, current_user.id)
+    detail = _video_detail(
+        db_video, current_user.id, db=db, db_project=db_project
+    )
     detail["project"] = db_project
     detail["versions"] = [
         {"id": v.id, "version": v.version, "name": v.name, "created_at": v.created_at}
@@ -224,8 +241,9 @@ def update_video_status(
     if not db_video:
         raise HTTPException(status_code=404, detail="Video not found")
     db_project = db.query(Project).filter(Project.id == project_id).first()
-    if current_user not in [db_project.creator] + [c.user for c in db_project.collaborators]:
+    if not can_access_project(db, current_user.id, db_project):
         raise HTTPException(status_code=403, detail="Not authorized")
+    assert_write_project_content(db, current_user, db_project)
 
     db_video.status = data.status
     db.commit()
@@ -241,4 +259,6 @@ def update_video_status(
         .filter(Video.id == video_id, Video.project_id == project_id)
         .first()
     )
-    return _video_detail(db_video, current_user.id)
+    return _video_detail(
+        db_video, current_user.id, db=db, db_project=db_project
+    )

@@ -1,7 +1,9 @@
+import asyncio
 import cloudinary
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -18,6 +20,40 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def _app_lifespan(app: FastAPI):
+    """
+    Optional in-process scheduler for mention digest batch enqueue.
+    Prefer external cron calling the same RQ job in production; see docs/review_nle_integration.md.
+    """
+    digest_hours_raw = os.getenv("MENTION_DIGEST_INTERVAL_HOURS", "").strip()
+    digest_hours = float(digest_hours_raw) if digest_hours_raw else 0.0
+    task = None
+    if digest_hours > 0:
+
+        async def _mention_digest_loop() -> None:
+            while True:
+                await asyncio.sleep(digest_hours * 3600)
+                try:
+                    from app.jobs.queue import enqueue_mention_digest_all_job
+
+                    enqueue_mention_digest_all_job()
+                except Exception:
+                    logger.exception("Scheduled mention digest enqueue failed")
+
+        task = asyncio.create_task(_mention_digest_loop())
+
+    yield
+
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 app = FastAPI(
     title="Editube API",
     description=(
@@ -28,6 +64,7 @@ app = FastAPI(
     contact={
         "name": "Editube Team",
     },
+    lifespan=_app_lifespan,
 )
 
 

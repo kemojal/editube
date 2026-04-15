@@ -3,7 +3,8 @@ from sqlalchemy.orm import Session
 from typing import Optional, List
 
 from app.db.database import get_db
-from app.db.models import Project, Folder, Video, User, ProjectCollaborator
+from app.db.models import Project, Folder, Video, User
+from app.services.project_access import assert_write_project_content, can_access_project
 from app.api.models.folders import (
     FolderCreate,
     FolderUpdate,
@@ -23,17 +24,7 @@ def _check_project_access(db: Session, project_id: int, current_user: User) -> P
     db_project = db.query(Project).filter(Project.id == project_id).first()
     if not db_project:
         raise HTTPException(status_code=404, detail="Project not found")
-    is_creator = db_project.creator_id == current_user.id
-    is_collaborator = (
-        db.query(ProjectCollaborator)
-        .filter(
-            ProjectCollaborator.project_id == project_id,
-            ProjectCollaborator.user_id == current_user.id,
-        )
-        .first()
-        is not None
-    )
-    if not is_creator and not is_collaborator:
+    if not can_access_project(db, current_user.id, db_project):
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
     return db_project
 
@@ -143,7 +134,8 @@ def create_folder(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _check_project_access(db, project_id, current_user)
+    db_project = _check_project_access(db, project_id, current_user)
+    assert_write_project_content(db, current_user, db_project)
 
     if folder_data.parent_id is not None:
         parent = db.query(Folder).filter(
@@ -173,7 +165,8 @@ def update_folder(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _check_project_access(db, project_id, current_user)
+    db_project = _check_project_access(db, project_id, current_user)
+    assert_write_project_content(db, current_user, db_project)
 
     db_folder = db.query(Folder).filter(
         Folder.id == folder_id, Folder.project_id == project_id
@@ -201,7 +194,8 @@ def delete_folder(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _check_project_access(db, project_id, current_user)
+    db_project = _check_project_access(db, project_id, current_user)
+    assert_write_project_content(db, current_user, db_project)
 
     db_folder = db.query(Folder).filter(
         Folder.id == folder_id, Folder.project_id == project_id

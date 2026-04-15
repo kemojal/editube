@@ -47,7 +47,7 @@ def upgrade() -> None:
     op.execute(
         """
         UPDATE comments SET status = 'resolved'
-        WHERE is_resolved = true AND (status IS NULL OR status = 'open')
+        WHERE is_resolved = true
         """
     )
 
@@ -66,7 +66,7 @@ def upgrade() -> None:
 
     op.create_table(
         "review_workflow_templates",
-        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("id", sa.Integer(), nullable=False, primary_key=True, autoincrement=True),
         sa.Column("project_id", sa.Integer(), nullable=False),
         sa.Column("name", sa.String(), nullable=False),
         sa.Column("created_at", sa.TIMESTAMP(), server_default=sa.text("now()"), nullable=False),
@@ -83,7 +83,7 @@ def upgrade() -> None:
 
     op.create_table(
         "review_workflow_stages",
-        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("id", sa.Integer(), nullable=False, primary_key=True, autoincrement=True),
         sa.Column("template_id", sa.Integer(), nullable=False),
         sa.Column("stage_index", sa.Integer(), nullable=False),
         sa.Column("stage_key", sa.String(), nullable=False),
@@ -101,7 +101,7 @@ def upgrade() -> None:
 
     op.create_table(
         "review_workflow_runs",
-        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("id", sa.Integer(), nullable=False, primary_key=True, autoincrement=True),
         sa.Column("review_link_id", sa.Integer(), nullable=False),
         sa.Column("template_id", sa.Integer(), nullable=False),
         sa.Column("current_stage_index", sa.Integer(), server_default="0", nullable=False),

@@ -11,17 +11,21 @@ Two route groups live here:
 
 from __future__ import annotations
 
+import io
 import secrets
 import hashlib
 import logging
 import os
 from collections import defaultdict
+from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import RedirectResponse, StreamingResponse
+from starlette.responses import Response
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.api.models.review_links import (
     PublicReviewApproveRequest,
@@ -32,6 +36,8 @@ from app.api.models.review_links import (
     PublicReviewCommentUser,
     PublicReviewDraftRequest,
     PublicReviewDraftResponse,
+    PublicReviewCommentDeltaResponse,
+    PublicReviewCommentDeltaItem,
     PublicReviewMagicSendRequest,
     PublicReviewMagicVerifyRequest,
     PublicReviewSignoffRequest,
@@ -60,10 +66,27 @@ from app.db.models import (
     ReviewMagicToken,
     ReviewSignoff,
     ReviewSession,
+    ReviewWorkflowRun,
+    ReviewWorkflowStage,
+    ReviewWorkflowTemplate,
     UserSettings,
     User,
     Video,
     ReviewCommentDraft,
+)
+from app.api.models.review_workflow import (
+    AttachWorkflowRunBody,
+    ReviewWorkflowRunResponse,
+)
+from app.services.comment_export import export_comments
+from app.services.comment_workflow import (
+    COMMENT_KIND_CHANGE_REQUEST,
+    COMMENT_KIND_COMMENT,
+    advance_workflow_run,
+    client_approve_blockers,
+    download_blockers,
+    notify_user_ids_for_new_run,
+    sync_is_resolved_from_status,
 )
 from app.jobs.queue import enqueue_mention_email_job
 from app.services.mentions import extract_mention_handles, resolve_mentioned_users
@@ -74,6 +97,17 @@ from app.utils.security import (
     get_password_hash,
     verify_password,
 )
+from app.utils.cloudinary import upload_file_to_cloudinary
+from app.services.review_media import (
+    build_review_media_url,
+    head_upstream_video,
+    proxy_review_media,
+    verify_review_media_sig,
+)
+from app.services.review_comment_groups import build_review_scene_groups
+from app.services.project_access import can_access_project, list_users_for_mentions
+from app.services.comment_visibility import COMMENT_VISIBILITY_PUBLIC, is_client_visible
+from app.services.workspace_branding_resolve import branding_public_dict
 
 
 # =============================================================================
@@ -101,8 +135,7 @@ def _check_video_owner(
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    allowed = [project.creator] + [c.user for c in project.collaborators]
-    if current_user not in allowed:
+    if not can_access_project(db, current_user.id, project):
         raise HTTPException(status_code=403, detail="Not authorized")
     return video, project
 
@@ -136,6 +169,7 @@ def _link_to_response(link: ReviewLink, db: Session) -> dict:
         "allow_download": link.allow_download,
         "approval_required_for_download": link.approval_required_for_download,
         "allow_comments": link.allow_comments,
+        "allow_export": getattr(link, "allow_export", False),
         "watermark_enabled": link.watermark_enabled,
         "require_email": link.require_email,
         "version_group_id": link.version_group_id,
@@ -180,6 +214,10 @@ def _is_session_download_unlocked(
     if db is not None and video is not None:
         if not _project_deliverables_paid(db, video.project_id):
             return False
+        blockers = download_blockers(db, link, session)
+        if blockers:
+            return False
+        return True
     if not link.approval_required_for_download:
         return True
     return bool(session and session.approved_at)
@@ -207,6 +245,7 @@ def create_review_link(
         allow_download=body.allow_download,
         approval_required_for_download=body.approval_required_for_download,
         allow_comments=body.allow_comments,
+        allow_export=getattr(body, "allow_export", False),
         watermark_enabled=body.watermark_enabled,
         require_email=body.require_email,
         version_group_id=body.version_group_id,
@@ -343,33 +382,13 @@ def link_analytics(
     )
     completed_sessions = sum(1 for s in sessions if s.reached_end)
     completion_rate = (completed_sessions / len(sessions)) if sessions else 0.0
-    scene_groups: list[ReviewSceneGroup] = []
     comments = (
         db.query(Comment)
         .filter(Comment.review_link_id == link.id, Comment.parent_id.is_(None))
         .order_by(Comment.timecode.asc())
         .all()
     )
-    for idx, c in enumerate(comments):
-        if c.timecode is None:
-            continue
-        bucket = (int(c.timecode) // 60) * 60
-        key = f"minute-{bucket}"
-        label = f"{bucket//60:02d}:{bucket%60:02d} - {(bucket+59)//60:02d}:{(bucket+59)%60:02d}"
-        existing = next((s for s in scene_groups if s.key == key), None)
-        if existing:
-            existing.comment_count += 1
-            existing.end_timecode = max(existing.end_timecode, int(c.timecode))
-        else:
-            scene_groups.append(
-                ReviewSceneGroup(
-                    key=key,
-                    label=label,
-                    comment_count=1,
-                    start_timecode=int(c.timecode),
-                    end_timecode=int(c.timecode),
-                )
-            )
+    scene_groups = build_review_scene_groups(db, link.video_id, comments)
     return ReviewAnalyticsResponse(
         link=_link_to_response(link, db),
         sessions=sessions,
@@ -447,6 +466,155 @@ def send_owner_invite(
     return {"ok": bool(sent), "require_email": True}
 
 
+async def _notify_review_workflow_users(
+    db: Session,
+    user_ids: list[int],
+    project_id: int,
+    video_id: int,
+) -> None:
+    if not user_ids:
+        return
+    created: list[Notification] = []
+    for uid in set(user_ids):
+        n = Notification(
+            user_id=uid,
+            type="review_workflow",
+            project_id=project_id,
+            video_id=video_id,
+            read=False,
+        )
+        db.add(n)
+        created.append(n)
+    db.commit()
+    for n in created:
+        await notifications_ws_manager.send_to_user(
+            n.user_id,
+            {
+                "event": "notification.new",
+                "payload": {
+                    "id": n.id,
+                    "type": n.type,
+                    "read": n.read,
+                    "project_id": n.project_id,
+                    "video_id": n.video_id,
+                    "created_at": n.created_at.isoformat() if n.created_at else None,
+                },
+            },
+        )
+
+
+def _workflow_run_api_response(db: Session, run: ReviewWorkflowRun) -> dict:
+    total = (
+        db.query(func.count(ReviewWorkflowStage.id))
+        .filter(ReviewWorkflowStage.template_id == run.template_id)
+        .scalar()
+        or 0
+    )
+    return {
+        "id": run.id,
+        "review_link_id": run.review_link_id,
+        "template_id": run.template_id,
+        "current_stage_index": run.current_stage_index,
+        "completed_at": run.completed_at,
+        "total_stages": int(total),
+    }
+
+
+@auth_router.post("/{link_id}/workflow-run", response_model=ReviewWorkflowRunResponse)
+async def attach_workflow_run(
+    project_id: int,
+    video_id: int,
+    link_id: int,
+    body: AttachWorkflowRunBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_owner(project_id, video_id, db, current_user)
+    link = (
+        db.query(ReviewLink)
+        .filter(ReviewLink.id == link_id, ReviewLink.video_id == video_id)
+        .first()
+    )
+    if not link:
+        raise HTTPException(status_code=404, detail="Review link not found")
+    tpl = (
+        db.query(ReviewWorkflowTemplate)
+        .filter(
+            ReviewWorkflowTemplate.id == body.template_id,
+            ReviewWorkflowTemplate.project_id == project_id,
+        )
+        .first()
+    )
+    if not tpl:
+        raise HTTPException(status_code=404, detail="Workflow template not found")
+    existing = (
+        db.query(ReviewWorkflowRun).filter(ReviewWorkflowRun.review_link_id == link.id).first()
+    )
+    if existing:
+        db.delete(existing)
+        db.flush()
+    run = ReviewWorkflowRun(
+        review_link_id=link.id,
+        template_id=tpl.id,
+        current_stage_index=0,
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    targets = notify_user_ids_for_new_run(db, run)
+    await _notify_review_workflow_users(db, targets, project_id, video_id)
+    return _workflow_run_api_response(db, run)
+
+
+@auth_router.post("/{link_id}/workflow-run/advance", response_model=ReviewWorkflowRunResponse)
+async def advance_review_workflow(
+    project_id: int,
+    video_id: int,
+    link_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_owner(project_id, video_id, db, current_user)
+    link = (
+        db.query(ReviewLink)
+        .filter(ReviewLink.id == link_id, ReviewLink.video_id == video_id)
+        .first()
+    )
+    if not link:
+        raise HTTPException(status_code=404, detail="Review link not found")
+    run = db.query(ReviewWorkflowRun).filter(ReviewWorkflowRun.review_link_id == link.id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="No workflow attached to this link")
+    targets = advance_workflow_run(db, run)
+    db.commit()
+    db.refresh(run)
+    await _notify_review_workflow_users(db, targets, project_id, video_id)
+    return _workflow_run_api_response(db, run)
+
+
+@auth_router.delete("/{link_id}/workflow-run")
+def delete_workflow_run(
+    project_id: int,
+    video_id: int,
+    link_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_owner(project_id, video_id, db, current_user)
+    link = (
+        db.query(ReviewLink)
+        .filter(ReviewLink.id == link_id, ReviewLink.video_id == video_id)
+        .first()
+    )
+    if not link:
+        raise HTTPException(status_code=404, detail="Review link not found")
+    run = db.query(ReviewWorkflowRun).filter(ReviewWorkflowRun.review_link_id == link.id).first()
+    if run:
+        db.delete(run)
+        db.commit()
+    return {"ok": True}
+
+
 # =============================================================================
 # Public router — no auth, token-based
 # =============================================================================
@@ -471,12 +639,38 @@ def _link_expired(link: ReviewLink) -> bool:
     return exp < now
 
 
-def _public_video(video: Video) -> PublicReviewVideo:
+def _api_base(request: Request) -> str:
+    return str(request.base_url).rstrip("/")
+
+
+def _public_video_meta(video: Video) -> PublicReviewVideo:
     return PublicReviewVideo(
         id=video.id,
-        name=video.name,
+        name=video.name or "",
         description=video.description,
-        file_path=video.file_path,
+        file_path=None,
+        duration=video.duration,
+        thumbnail_url=video.thumbnail_url,
+    )
+
+
+def _public_video_streaming(
+    video: Video,
+    request: Request,
+    token: str,
+    session_id: int,
+) -> PublicReviewVideo:
+    playback_url = build_review_media_url(
+        api_base=_api_base(request),
+        token=token,
+        session_id=session_id,
+        purpose="playback",
+    )
+    return PublicReviewVideo(
+        id=video.id,
+        name=video.name or "",
+        description=video.description,
+        file_path=playback_url,
         duration=video.duration,
         thumbnail_url=video.thumbnail_url,
     )
@@ -489,6 +683,85 @@ def _assert_link_usable(link: ReviewLink) -> None:
         raise HTTPException(status_code=410, detail="Review link has expired")
 
 
+@public_router.api_route("/{token}/media", methods=["GET", "HEAD"])
+async def review_media_proxy(
+    token: str,
+    request: Request,
+    session_id: int,
+    purpose: str,
+    exp: int,
+    sig: str,
+    db: Session = Depends(get_db),
+):
+    if purpose not in ("playback", "download"):
+        raise HTTPException(status_code=400, detail="Invalid purpose")
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    if not verify_review_media_sig(token, session_id, purpose, exp, sig):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    if exp < now_ts:
+        raise HTTPException(status_code=403, detail="Signature expired")
+    session = _get_session_or_404(link, session_id, db)
+    video = db.query(Video).filter(Video.id == link.video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if purpose == "download":
+        if not _is_session_download_unlocked(link, session, db=db, video=video):
+            raise HTTPException(status_code=403, detail="Download not allowed")
+    fp = (video.file_path or "").strip()
+    if request.method == "HEAD" and (
+        fp.startswith("http://") or fp.startswith("https://")
+    ):
+        status, headers = await head_upstream_video(fp)
+        return Response(status_code=status, headers=headers)
+    return await proxy_review_media(request=request, video=video, purpose=purpose)
+
+
+@public_router.get("/{token}/download-url")
+def review_download_url(
+    token: str,
+    session_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    session = _get_session_or_404(link, session_id, db)
+    video = db.query(Video).filter(Video.id == link.video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if not _is_session_download_unlocked(link, session, db=db, video=video):
+        raise HTTPException(status_code=403, detail="Download not allowed")
+    url = build_review_media_url(
+        api_base=_api_base(request),
+        token=token,
+        session_id=session_id,
+        purpose="download",
+    )
+    return {"ok": True, "url": url}
+
+
+@public_router.post("/{token}/guest-avatar")
+def upload_guest_avatar(
+    token: str,
+    session_id: int = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    session = _get_session_or_404(link, session_id, db)
+    ct = (file.content_type or "").lower()
+    if ct not in ("image/jpeg", "image/jpg", "image/png", "image/webp"):
+        raise HTTPException(status_code=400, detail="Use JPEG, PNG, or WebP")
+    url = upload_file_to_cloudinary(file, resource_type="image")
+    session.guest_avatar_url = url
+    db.commit()
+    db.refresh(session)
+    return {"ok": True, "guest_avatar_url": url}
+
+
 @public_router.get("/{token}", response_model=PublicReviewLinkInfo)
 def get_public_link_info(token: str, db: Session = Depends(get_db)):
     link = _get_link_or_404(token, db)
@@ -498,7 +771,7 @@ def get_public_link_info(token: str, db: Session = Depends(get_db)):
     scope_payload: Optional[PublicReviewScope] = None
     video = db.query(Video).filter(Video.id == link.video_id).first()
     if not link.password_hash and not expired and not revoked and video:
-        video_payload = _public_video(video)
+        video_payload = _public_video_meta(video)
     if video:
         project = db.query(Project).filter(Project.id == video.project_id).first()
         if project:
@@ -510,6 +783,16 @@ def get_public_link_info(token: str, db: Session = Depends(get_db)):
                 deliverables_locked=bool(project.deliverables_locked),
                 deliverables_unlocked=_project_deliverables_paid(db, project.id),
             )
+    blockers: list[dict] = []
+    if video_payload:
+        blockers = client_approve_blockers(db, link)
+
+    branding = None
+    if video:
+        proj = db.query(Project).filter(Project.id == video.project_id).first()
+        if proj:
+            branding = branding_public_dict(db, proj)
+
     return PublicReviewLinkInfo(
         token=link.token,
         label=link.label,
@@ -518,6 +801,7 @@ def get_public_link_info(token: str, db: Session = Depends(get_db)):
         allow_download=link.allow_download,
         approval_required_for_download=link.approval_required_for_download,
         allow_comments=link.allow_comments,
+        allow_export=getattr(link, "allow_export", False),
         watermark_enabled=link.watermark_enabled,
         version_group_id=link.version_group_id,
         version_label=link.version_label,
@@ -525,6 +809,8 @@ def get_public_link_info(token: str, db: Session = Depends(get_db)):
         revoked=revoked,
         video=video_payload,
         scope=scope_payload,
+        client_approve_blockers=blockers,
+        workspace_branding=branding,
     )
 
 
@@ -591,7 +877,9 @@ def start_session(
     return PublicReviewAuthResponse(
         ok=True,
         session_id=session.id,
-        video=_public_video(video) if video else None,
+        video=_public_video_streaming(video, request, link.token, session.id)
+        if video
+        else None,
         watermark_text=watermark,
     )
 
@@ -658,6 +946,15 @@ def _public_comment_user(c: Comment) -> PublicReviewCommentUser:
             avatar_url=getattr(c.user, "avatar_url", None),
             is_guest=False,
         )
+    ga = getattr(c, "guest_avatar_url", None)
+    if ga:
+        return PublicReviewCommentUser(
+            id=None,
+            name=c.guest_name or "Guest",
+            email=c.guest_email,
+            avatar_url=ga,
+            is_guest=True,
+        )
     return PublicReviewCommentUser(
         id=None,
         name=c.guest_name or "Guest",
@@ -681,6 +978,8 @@ def _serialize_public_comment(
         end_timecode=c.end_timecode,
         drawing_data=c.drawing_data,
         is_resolved=c.is_resolved,
+        kind=getattr(c, "kind", None) or COMMENT_KIND_COMMENT,
+        status=getattr(c, "status", None) or "open",
         user=_public_comment_user(c),
         likes_count=len(c.likes) if c.likes else 0,
         replies_count=len(replies) if replies is not None else (len(c.replies) if c.replies else 0),
@@ -690,30 +989,142 @@ def _serialize_public_comment(
     )
 
 
+def _public_comment_visible(c: Comment) -> bool:
+    return is_client_visible(getattr(c, "visibility", None), c.is_private)
+
+
+def _build_public_comment_tree(rows: List[Comment]) -> List[PublicReviewCommentResponse]:
+    by_parent: dict[int | None, List[Comment]] = defaultdict(list)
+    for c in rows:
+        by_parent[c.parent_id].append(c)
+
+    def build(parent_id: int | None) -> List[PublicReviewCommentResponse]:
+        children = sorted(
+            by_parent.get(parent_id, []),
+            key=lambda x: (x.timecode or 0, x.created_at),
+        )
+        out: List[PublicReviewCommentResponse] = []
+        for c in children:
+            if not _public_comment_visible(c):
+                continue
+            nested = build(c.id)
+            item = PublicReviewCommentResponse(
+                id=c.id,
+                video_id=c.video_id,
+                parent_id=c.parent_id,
+                text=c.text,
+                timecode=c.timecode,
+                end_timecode=c.end_timecode,
+                drawing_data=c.drawing_data,
+                is_resolved=c.is_resolved,
+                kind=getattr(c, "kind", None) or COMMENT_KIND_COMMENT,
+                status=getattr(c, "status", None) or "open",
+                user=_public_comment_user(c),
+                likes_count=len(c.likes) if c.likes else 0,
+                replies_count=len(nested),
+                created_at=c.created_at,
+                updated_at=c.updated_at,
+                replies=nested,
+            )
+            out.append(item)
+        return out
+
+    return build(None)
+
+
 @public_router.get(
     "/{token}/comments", response_model=List[PublicReviewCommentResponse]
 )
 def list_public_comments(token: str, db: Session = Depends(get_db)):
     link = _get_link_or_404(token, db)
     _assert_link_usable(link)
-    top = (
+    rows = (
+        db.query(Comment)
+        .filter(Comment.video_id == link.video_id)
+        .options(joinedload(Comment.likes), joinedload(Comment.user))
+        .order_by(Comment.created_at.asc())
+        .all()
+    )
+    return _build_public_comment_tree(rows)
+
+
+@public_router.get(
+    "/{token}/comments/delta", response_model=PublicReviewCommentDeltaResponse
+)
+def public_comments_delta(
+    token: str,
+    session_id: int,
+    since: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    session = _get_session_or_404(link, session_id, db)
+    t0 = session.first_viewed_at
+    if since:
+        try:
+            raw = since.strip().replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            t0 = parsed
+        except Exception:
+            pass
+    rows = (
         db.query(Comment)
         .filter(
             Comment.video_id == link.video_id,
-            Comment.parent_id.is_(None),
-            Comment.is_private == False,  # noqa: E712
+            Comment.updated_at > t0,
         )
+        .order_by(Comment.updated_at.asc())
+        .limit(500)
+        .all()
+    )
+    now = datetime.now(timezone.utc)
+    items = [
+        PublicReviewCommentDeltaItem(
+            id=r.id,
+            parent_id=r.parent_id,
+            updated_at=r.updated_at,
+            kind=getattr(r, "kind", COMMENT_KIND_COMMENT) or COMMENT_KIND_COMMENT,
+            status=getattr(r, "status", "open") or "open",
+        )
+        for r in rows
+        if _public_comment_visible(r)
+    ]
+    return PublicReviewCommentDeltaResponse(items=items, server_time=now)
+
+
+@public_router.get("/{token}/comments/export")
+def public_export_comments(
+    token: str,
+    session_id: int,
+    format: str = "csv",
+    db: Session = Depends(get_db),
+):
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    if not getattr(link, "allow_export", False):
+        raise HTTPException(status_code=403, detail="Export disabled for this link")
+    _get_session_or_404(link, session_id, db)
+    video = db.query(Video).filter(Video.id == link.video_id).first()
+    rows = (
+        db.query(Comment)
+        .filter(Comment.video_id == link.video_id, Comment.review_link_id == link.id)
+        .options(joinedload(Comment.user))
         .order_by(Comment.timecode.asc(), Comment.created_at.asc())
         .all()
     )
-    result: List[PublicReviewCommentResponse] = []
-    for c in top:
-        replies = sorted(
-            [r for r in (c.replies or []) if not r.is_private],
-            key=lambda r: r.created_at,
-        )
-        result.append(_serialize_public_comment(c, replies))
-    return result
+    rows = [r for r in rows if _public_comment_visible(r)]
+    try:
+        data, mime, filename = export_comments(rows, format, video.name if video else "Video")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type=mime,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @public_router.post(
@@ -739,9 +1150,12 @@ async def create_public_comment(
             )
             .first()
         )
-        if not parent or parent.is_private:
+        if not parent or not is_client_visible(getattr(parent, "visibility", None), parent.is_private):
             raise HTTPException(status_code=404, detail="Parent comment not found")
 
+    cr_kind = (getattr(body, "kind", None) or "comment").strip().lower()
+    if cr_kind not in (COMMENT_KIND_COMMENT, COMMENT_KIND_CHANGE_REQUEST):
+        cr_kind = COMMENT_KIND_COMMENT
     comment = Comment(
         video_id=link.video_id,
         user_id=None,
@@ -752,8 +1166,14 @@ async def create_public_comment(
         drawing_data=body.drawing_data,
         guest_name=session.guest_name or "Guest",
         guest_email=session.guest_email,
+        guest_avatar_url=session.guest_avatar_url,
         review_link_id=link.id,
+        kind=cr_kind,
+        status="open",
+        visibility=COMMENT_VISIBILITY_PUBLIC,
+        is_private=False,
     )
+    sync_is_resolved_from_status(comment)
     db.add(comment)
 
     # Also log as an event for analytics
@@ -772,10 +1192,18 @@ async def create_public_comment(
         video = db.query(Video).filter(Video.id == link.video_id).first()
         project = db.query(Project).filter(Project.id == video.project_id).first() if video else None
         if project:
-            project_users = [project.creator] + [c.user for c in project.collaborators if c.user]
-            recipients = resolve_mentioned_users(handles, project_users)
+            project_users = list_users_for_mentions(db, project)
+            recipients = resolve_mentioned_users(
+                mention_handles=handles,
+                candidate_users=project_users,
+                actor_user_id=None,
+            )
             frontend_base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
-            comment_url = f"{frontend_base}/projects/{project.id}/videos/{link.video_id}?commentId={comment.id}"
+            # Mention recipients are project team — deep-link to authenticated player.
+            comment_url = (
+                f"{frontend_base}/player/{link.video_id}?"
+                + urlencode({"tab": "comments", "commentId": str(comment.id)})
+            )
             actor_name = session.guest_name or session.guest_email or "Guest reviewer"
 
             created_notifications: list[Notification] = []
@@ -822,7 +1250,17 @@ async def create_public_comment(
                     },
                 )
 
-    return _serialize_public_comment(comment)
+    reply_rows = (
+        db.query(Comment)
+        .filter(
+            Comment.parent_id == comment.id,
+            Comment.visibility == COMMENT_VISIBILITY_PUBLIC,
+            Comment.is_private == False,  # noqa: E712
+        )
+        .order_by(Comment.created_at.asc())
+        .all()
+    )
+    return _serialize_public_comment(comment, reply_rows)
 
 
 @public_router.get("/{token}/comments/grouped", response_model=List[ReviewSceneGroup])
@@ -834,31 +1272,13 @@ def grouped_public_comments(token: str, db: Session = Depends(get_db)):
         .filter(
             Comment.video_id == link.video_id,
             Comment.parent_id.is_(None),
+            Comment.visibility == COMMENT_VISIBILITY_PUBLIC,
             Comment.is_private == False,  # noqa: E712
         )
         .order_by(Comment.timecode.asc())
         .all()
     )
-    grouped: dict[int, ReviewSceneGroup] = {}
-    for c in comments:
-        if c.timecode is None:
-            continue
-        sec = int(c.timecode)
-        bucket = (sec // 60) * 60
-        if bucket not in grouped:
-            grouped[bucket] = ReviewSceneGroup(
-                key=f"minute-{bucket}",
-                label=f"Scene around {bucket//60:02d}:{bucket%60:02d}",
-                comment_count=1,
-                start_timecode=sec,
-                end_timecode=sec,
-            )
-        else:
-            g = grouped[bucket]
-            g.comment_count += 1
-            g.start_timecode = min(g.start_timecode, sec)
-            g.end_timecode = max(g.end_timecode, sec)
-    return sorted(grouped.values(), key=lambda g: g.start_timecode)
+    return build_review_scene_groups(db, link.video_id, comments)
 
 
 @public_router.post("/{token}/magic-link/send")
@@ -1028,6 +1448,13 @@ def approve(
     link = _get_link_or_404(token, db)
     _assert_link_usable(link)
     session = _get_session_or_404(link, body.session_id, db)
+    if body.approved:
+        blockers = client_approve_blockers(db, link)
+        if blockers:
+            raise HTTPException(
+                status_code=400,
+                detail=blockers[0].get("message", "Approval blocked"),
+            )
     session.approved_at = (
         datetime.now(timezone.utc) if body.approved else None
     )
@@ -1042,9 +1469,20 @@ def signoff(
     request: Request,
     db: Session = Depends(get_db),
 ):
+    from app.services.review_signoff_pdf import build_review_signoff_pdf_bytes, upload_review_signoff_pdf
+
     link = _get_link_or_404(token, db)
     _assert_link_usable(link)
     session = _get_session_or_404(link, body.session_id, db)
+    img = (body.signature_image_data or "").strip()
+    typed = (body.typed_signature or "").strip()
+    sig_type = "none"
+    if img:
+        sig_type = "drawn"
+    elif typed:
+        sig_type = "typed"
+    sig_payload = img or typed or "—"
+    signed_at = datetime.now(timezone.utc)
     record = ReviewSignoff(
         review_link_id=link.id,
         session_id=session.id,
@@ -1056,17 +1494,34 @@ def signoff(
             "user_agent": request.headers.get("user-agent"),
             "approved_at": session.approved_at.isoformat() if session.approved_at else None,
         },
-        signed_at=datetime.now(timezone.utc),
+        signed_at=signed_at,
+        signature_type=sig_type,
+        typed_signature=typed or None,
+        signature_image_data=img or None,
     )
     db.add(record)
+    db.flush()
+    try:
+        pdf_bytes = build_review_signoff_pdf_bytes(
+            body.declaration_text.strip(),
+            record.signer_name or "",
+            record.signer_email or "",
+            sig_payload,
+            record.signed_at,
+        )
+        record.pdf_url = upload_review_signoff_pdf(pdf_bytes, record.id)
+    except Exception:
+        logger.exception("Review sign-off PDF failed")
     db.commit()
     db.refresh(record)
     return PublicReviewSignoffResponse(
+        id=record.id,
         ok=True,
         signed_at=record.signed_at,
         signer_name=record.signer_name,
         signer_email=record.signer_email,
         declaration_text=record.declaration_text,
+        pdf_url=record.pdf_url,
     )
 
 
@@ -1082,14 +1537,30 @@ def list_signoffs(token: str, db: Session = Depends(get_db)):
     )
     return [
         PublicReviewSignoffResponse(
+            id=row.id,
             ok=True,
             signed_at=row.signed_at,
             signer_name=row.signer_name,
             signer_email=row.signer_email,
             declaration_text=row.declaration_text,
+            pdf_url=row.pdf_url,
         )
         for row in rows
     ]
+
+
+@public_router.get("/{token}/signoff/{signoff_id}/pdf")
+def download_signoff_pdf(token: str, signoff_id: int, db: Session = Depends(get_db)):
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    row = (
+        db.query(ReviewSignoff)
+        .filter(ReviewSignoff.id == signoff_id, ReviewSignoff.review_link_id == link.id)
+        .first()
+    )
+    if not row or not row.pdf_url:
+        raise HTTPException(status_code=404, detail="PDF not available")
+    return RedirectResponse(url=row.pdf_url, status_code=302)
 
 
 @public_router.get("/{token}/download-allowed")

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.db.models import Annotation, Video, User
+from app.services.project_access import assert_write_project_content, can_access_project
 from app.db.database import get_db
 from app.utils.security import get_current_user
 from app.api.models.annotations import (
@@ -53,12 +54,11 @@ def create_annotation(
     if not db_video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    if current_user not in [db_video.project.creator] + [
-        c.user for c in db_video.project.collaborators
-    ]:
+    if not can_access_project(db, current_user.id, db_video.project):
         raise HTTPException(
             status_code=403, detail="Not authorized to annotate this video"
         )
+    assert_write_project_content(db, current_user, db_video.project)
 
     db_annotation = Annotation(
         video_id=video_id,
@@ -87,10 +87,7 @@ def get_video_annotations(
     if not db_video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    authorized_users = [db_video.project.creator] + [
-        c.user for c in db_video.project.collaborators
-    ]
-    if current_user not in authorized_users:
+    if not can_access_project(db, current_user.id, db_video.project):
         raise HTTPException(
             status_code=403,
             detail="Not authorized to access annotations for this video",
@@ -126,13 +123,10 @@ def update_annotation(
         raise HTTPException(status_code=404, detail="Annotation not found")
 
     db_video = db.query(Video).filter(Video.id == db_annotation.video_id).first()
-    if (
-        current_user.id != db_annotation.user_id
-        and current_user.id != db_video.project.creator_id
-    ):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to update this annotation"
-        )
+    if not can_access_project(db, current_user.id, db_video.project):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if current_user.id != db_annotation.user_id:
+        assert_write_project_content(db, current_user, db_video.project)
 
     update_data = annotation.dict(exclude_unset=True)
     for field, value in update_data.items():
@@ -159,13 +153,10 @@ def delete_annotation(
         raise HTTPException(status_code=404, detail="Annotation not found")
 
     db_video = db.query(Video).filter(Video.id == db_annotation.video_id).first()
-    if (
-        current_user.id != db_annotation.user_id
-        and current_user.id != db_video.project.creator_id
-    ):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to delete this annotation"
-        )
+    if not can_access_project(db, current_user.id, db_video.project):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if current_user.id != db_annotation.user_id:
+        assert_write_project_content(db, current_user, db_video.project)
 
     db.delete(db_annotation)
     db.commit()
