@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import mimetypes
 import os
 import secrets
 import uuid
@@ -9,16 +11,24 @@ from datetime import datetime, timedelta, timezone
 from typing import List
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy import exists, func, or_
+from urllib.parse import quote
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.models.workspaces import (
     CapacityMemberRow,
     ProjectTemplateResponse,
+    WorkspaceAssetUpdate,
+    WorkspaceBrandingResponse,
     WorkspaceBrandingUpdate,
     WorkspaceInviteAccept,
     WorkspaceInviteCreate,
+    WorkspaceInviteCreatedResponse,
+    WorkspaceInviteListItem,
     WorkspaceMemberResponse,
+    WorkspaceProvisionMemberBody,
+    WorkspaceProvisionMemberResponse,
     WorkspaceSummaryResponse,
     WorkspaceUpdate,
 )
@@ -38,15 +48,22 @@ from app.db.models import (
     WorkspaceMember,
 )
 from app.services.project_access import get_workspace_member
+from app.services.workspace_roles import normalize_invite_role
 from app.services.workspace_permissions import (
     can_edit_workspace_branding,
     can_manage_workspace_members,
 )
-from app.utils.security import get_current_user
+from app.services.dns_domain_verify import verify_editube_domain_txt
+from app.services.workspace_bootstrap import ensure_personal_workspace
+from app.utils.email import send_workspace_invite_email, send_workspace_provisioned_account_email
+from app.utils.security import get_current_user, get_password_hash
 
 router = APIRouter(prefix="/workspaces", tags=["Workspaces"])
 
 ASSET_UPLOAD_SUBDIR = "workspace_assets"
+ALLOWED_ASSET_CATEGORIES = frozenset(
+    {"logo", "lut", "music", "sfx", "lower_third", "other"}
+)
 
 
 def _utcnow() -> datetime:
@@ -65,6 +82,30 @@ def _workspace_or_404(db: Session, workspace_id: int) -> Workspace:
     if not ws:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return ws
+
+
+def _public_app_base() -> str:
+    return (
+        os.getenv("WORKSPACE_INVITE_PUBLIC_BASE_URL")
+        or os.getenv("FRONTEND_BASE_URL")
+        or "https://knee-quote-doing-sword.trycloudflare.com"
+    ).rstrip("/")
+
+
+def _workspace_invite_accept_url(token: str) -> str:
+    base = _public_app_base()
+    return f"{base}/account/team?tab=members&invite={quote(token, safe='')}"
+
+
+def _invite_status(inv: WorkspaceInvite, now: datetime) -> str:
+    if inv.accepted_at is not None:
+        return "accepted"
+    exp = inv.expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp < now:
+        return "expired"
+    return "pending"
 
 
 @router.get("", response_model=List[WorkspaceSummaryResponse])
@@ -155,31 +196,88 @@ def list_members(
             role=r.role,
             name=(r.user.name if r.user else None),
             email=(r.user.email if r.user else None),
+            avatar_url=(r.user.avatar_url if r.user else None),
             created_at=r.created_at,
         )
         for r in rows
     ]
 
 
-@router.post("/{workspace_id}/invites")
+@router.get("/{workspace_id}/invites", response_model=List[WorkspaceInviteListItem])
+def list_workspace_invites(
+    workspace_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _workspace_or_404(db, workspace_id)
+    _require_workspace_member(db, workspace_id, current_user)
+    rows = (
+        db.query(WorkspaceInvite)
+        .filter(WorkspaceInvite.workspace_id == workspace_id)
+        .order_by(WorkspaceInvite.created_at.desc())
+        .limit(200)
+        .all()
+    )
+    now = _utcnow()
+    return [
+        WorkspaceInviteListItem(
+            id=r.id,
+            email=r.email,
+            role=r.role,
+            expires_at=r.expires_at,
+            accepted_at=r.accepted_at,
+            created_at=r.created_at,
+            status=_invite_status(r, now),
+        )
+        for r in rows
+    ]
+
+
+@router.post("/{workspace_id}/invites", response_model=WorkspaceInviteCreatedResponse)
 def create_invite(
     workspace_id: int,
     body: WorkspaceInviteCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _workspace_or_404(db, workspace_id)
+    ws = _workspace_or_404(db, workspace_id)
     wm = _require_workspace_member(db, workspace_id, current_user)
     if not can_manage_workspace_members(wm.role):
         raise HTTPException(status_code=403, detail="Not allowed to invite")
     email = body.email.strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="Email required")
+    if "@" not in email or len(email) < 4:
+        raise HTTPException(status_code=400, detail="Invalid email address")
+
+    existing_user = db.query(User).filter(func.lower(User.email) == email).first()
+    if existing_user:
+        already = (
+            db.query(WorkspaceMember)
+            .filter(
+                WorkspaceMember.workspace_id == workspace_id,
+                WorkspaceMember.user_id == existing_user.id,
+            )
+            .first()
+        )
+        if already:
+            raise HTTPException(
+                status_code=400,
+                detail="That user is already a member of this workspace",
+            )
+
+    db.query(WorkspaceInvite).filter(
+        WorkspaceInvite.workspace_id == workspace_id,
+        WorkspaceInvite.email == email,
+        WorkspaceInvite.accepted_at.is_(None),
+    ).delete(synchronize_session=False)
+
     raw = secrets.token_urlsafe(24)
+    invite_role = normalize_invite_role(body.role)
     inv = WorkspaceInvite(
         workspace_id=workspace_id,
         email=email,
-        role=(body.role or "editor").strip() or "editor",
+        role=invite_role,
         token=raw,
         invited_by_user_id=current_user.id,
         expires_at=_utcnow() + timedelta(days=14),
@@ -187,7 +285,93 @@ def create_invite(
     db.add(inv)
     db.commit()
     db.refresh(inv)
-    return {"token": raw, "expires_at": inv.expires_at.isoformat()}
+
+    url = _workspace_invite_accept_url(raw)
+    inviter_name = current_user.name or current_user.email or "A teammate"
+    email_sent = send_workspace_invite_email(
+        to_email=email,
+        workspace_name=ws.name,
+        inviter_name=inviter_name,
+        invite_role=invite_role,
+        invite_url=url,
+        expires_days=14,
+    )
+    return WorkspaceInviteCreatedResponse(
+        token=raw,
+        expires_at=inv.expires_at,
+        email_sent=email_sent,
+    )
+
+
+@router.post("/{workspace_id}/invites/{invite_id}/resend")
+def resend_workspace_invite(
+    workspace_id: int,
+    invite_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ws = _workspace_or_404(db, workspace_id)
+    wm = _require_workspace_member(db, workspace_id, current_user)
+    if not can_manage_workspace_members(wm.role):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    inv = (
+        db.query(WorkspaceInvite)
+        .filter(
+            WorkspaceInvite.id == invite_id,
+            WorkspaceInvite.workspace_id == workspace_id,
+        )
+        .first()
+    )
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    if inv.accepted_at is not None:
+        raise HTTPException(status_code=400, detail="Invite was already accepted")
+    now = _utcnow()
+    exp = inv.expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp < now:
+        raise HTTPException(status_code=410, detail="Invite has expired; create a new invite")
+    remaining_days = max(1, math.ceil((exp - now).total_seconds() / 86400.0))
+    url = _workspace_invite_accept_url(inv.token)
+    inviter_name = current_user.name or current_user.email or "A teammate"
+    email_sent = send_workspace_invite_email(
+        to_email=inv.email,
+        workspace_name=ws.name,
+        inviter_name=inviter_name,
+        invite_role=inv.role,
+        invite_url=url,
+        expires_days=remaining_days,
+    )
+    return {"email_sent": email_sent}
+
+
+@router.delete("/{workspace_id}/invites/{invite_id}")
+def revoke_workspace_invite(
+    workspace_id: int,
+    invite_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _workspace_or_404(db, workspace_id)
+    wm = _require_workspace_member(db, workspace_id, current_user)
+    if not can_manage_workspace_members(wm.role):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    inv = (
+        db.query(WorkspaceInvite)
+        .filter(
+            WorkspaceInvite.id == invite_id,
+            WorkspaceInvite.workspace_id == workspace_id,
+        )
+        .first()
+    )
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    if inv.accepted_at is not None:
+        raise HTTPException(status_code=400, detail="Cannot revoke an invite that was already accepted")
+    db.delete(inv)
+    db.commit()
+    return {"ok": True}
 
 
 @router.post("/invites/accept")
@@ -212,11 +396,12 @@ def accept_invite(
         inv.accepted_at = _utcnow()
         db.commit()
         return {"ok": True, "workspace_id": inv.workspace_id}
+    member_role = normalize_invite_role(inv.role)
     db.add(
         WorkspaceMember(
             workspace_id=inv.workspace_id,
             user_id=current_user.id,
-            role=inv.role or "editor",
+            role=member_role,
         )
     )
     inv.accepted_at = _utcnow()
@@ -247,6 +432,100 @@ def remove_member(
     db.delete(target)
     db.commit()
     return {"ok": True}
+
+
+@router.post(
+    "/{workspace_id}/members/provision",
+    response_model=WorkspaceProvisionMemberResponse,
+)
+def provision_workspace_member(
+    workspace_id: int,
+    body: WorkspaceProvisionMemberBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Only the workspace owner may create a password account or add an existing user here."""
+    ws = _workspace_or_404(db, workspace_id)
+    if ws.owner_user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the workspace owner can provision accounts")
+    email = body.email.strip().lower()
+    if not email or "@" not in email or len(email) < 4:
+        raise HTTPException(status_code=400, detail="Invalid email address")
+    member_role = normalize_invite_role(body.role)
+    inviter_name = current_user.name or current_user.email or "Workspace owner"
+    login_url = f"{_public_app_base()}/login"
+
+    existing = db.query(User).filter(func.lower(User.email) == email).first()
+    if existing:
+        if not existing.hashed_password:
+            raise HTTPException(
+                status_code=400,
+                detail="This email uses Google sign-in. Add them with an invite instead, or use another email.",
+            )
+        already = (
+            db.query(WorkspaceMember)
+            .filter(
+                WorkspaceMember.workspace_id == workspace_id,
+                WorkspaceMember.user_id == existing.id,
+            )
+            .first()
+        )
+        if already:
+            raise HTTPException(status_code=400, detail="That user is already a member of this workspace")
+        db.add(
+            WorkspaceMember(
+                workspace_id=workspace_id,
+                user_id=existing.id,
+                role=member_role,
+            )
+        )
+        db.commit()
+        return WorkspaceProvisionMemberResponse(
+            created_new_user=False,
+            email=email,
+            workspace_role=member_role,
+            temporary_password=None,
+            email_sent=False,
+            detail="Existing account linked to this workspace. Share access separately—they already have a password.",
+        )
+
+    display_name = (body.name or "").strip() or email.split("@")[0]
+    temp_password = secrets.token_urlsafe(14)
+    db_user = User(
+        email=email,
+        hashed_password=get_password_hash(temp_password),
+        name=display_name,
+        role="user",
+    )
+    db.add(db_user)
+    db.flush()
+    ensure_personal_workspace(db, db_user)
+    db.add(
+        WorkspaceMember(
+            workspace_id=workspace_id,
+            user_id=db_user.id,
+            role=member_role,
+        )
+    )
+    db.commit()
+
+    email_sent = send_workspace_provisioned_account_email(
+        to_email=email,
+        display_name=display_name,
+        workspace_name=ws.name,
+        inviter_name=inviter_name,
+        login_url=login_url,
+        temporary_password=temp_password,
+        workspace_role=member_role,
+    )
+    return WorkspaceProvisionMemberResponse(
+        created_new_user=True,
+        email=email,
+        workspace_role=member_role,
+        temporary_password=temp_password,
+        email_sent=email_sent,
+        detail=None if email_sent else "Account created; email not sent (configure SMTP). Copy the password below.",
+    )
 
 
 @router.get("/{workspace_id}/project-templates", response_model=List[ProjectTemplateResponse])
@@ -338,6 +617,74 @@ async def upload_asset(
     return {"id": a.id, "file_url": a.file_url, "title": a.title, "category": a.category}
 
 
+@router.get("/{workspace_id}/assets/{asset_id}/media")
+def get_workspace_asset_media(
+    workspace_id: int,
+    asset_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Serve binary asset for members (e.g. thumbnails in the library UI)."""
+    _workspace_or_404(db, workspace_id)
+    _require_workspace_member(db, workspace_id, current_user)
+    a = (
+        db.query(WorkspaceAsset)
+        .filter(WorkspaceAsset.id == asset_id, WorkspaceAsset.workspace_id == workspace_id)
+        .first()
+    )
+    if not a:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    path = a.file_url
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    media_type, _ = mimetypes.guess_type(path)
+    return FileResponse(path, media_type=media_type or "application/octet-stream")
+
+
+@router.patch("/{workspace_id}/assets/{asset_id}")
+def patch_workspace_asset(
+    workspace_id: int,
+    asset_id: int,
+    body: WorkspaceAssetUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _workspace_or_404(db, workspace_id)
+    wm = _require_workspace_member(db, workspace_id, current_user)
+    if wm.role not in ("owner", "producer", "editor"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    if body.title is None and body.category is None:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    a = (
+        db.query(WorkspaceAsset)
+        .filter(WorkspaceAsset.id == asset_id, WorkspaceAsset.workspace_id == workspace_id)
+        .first()
+    )
+    if not a:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    if body.title is not None:
+        t = body.title.strip()
+        a.title = t if t else "Untitled"
+    if body.category is not None:
+        c = body.category.strip().lower()
+        if c not in ALLOWED_ASSET_CATEGORIES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid category; allowed: {', '.join(sorted(ALLOWED_ASSET_CATEGORIES))}",
+            )
+        a.category = c
+    db.commit()
+    db.refresh(a)
+    return {
+        "id": a.id,
+        "category": a.category,
+        "title": a.title,
+        "file_url": a.file_url,
+        "extra": a.extra,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+    }
+
+
 @router.delete("/{workspace_id}/assets/{asset_id}")
 def delete_asset(
     workspace_id: int,
@@ -366,7 +713,38 @@ def delete_asset(
     return {"ok": True}
 
 
-@router.patch("/{workspace_id}/branding")
+def _workspace_branding_response(db: Session, workspace_id: int, wm: WorkspaceMember) -> WorkspaceBrandingResponse:
+    b = (
+        db.query(WorkspaceBranding)
+        .filter(WorkspaceBranding.workspace_id == workspace_id)
+        .first()
+    )
+    show_token = can_edit_workspace_branding(wm.role)
+    if not b:
+        return WorkspaceBrandingResponse()
+    return WorkspaceBrandingResponse(
+        logo_url=b.logo_url,
+        primary_color=b.primary_color,
+        accent_color=b.accent_color,
+        client_footer_text=b.client_footer_text,
+        custom_domain=b.custom_domain,
+        domain_verified_at=b.domain_verified_at,
+        domain_verification_token=(b.domain_verification_token if show_token else None),
+    )
+
+
+@router.get("/{workspace_id}/branding", response_model=WorkspaceBrandingResponse)
+def get_workspace_branding(
+    workspace_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _workspace_or_404(db, workspace_id)
+    wm = _require_workspace_member(db, workspace_id, current_user)
+    return _workspace_branding_response(db, workspace_id, wm)
+
+
+@router.patch("/{workspace_id}/branding", response_model=WorkspaceBrandingResponse)
 def update_branding(
     workspace_id: int,
     body: WorkspaceBrandingUpdate,
@@ -394,14 +772,7 @@ def update_branding(
         setattr(b, k, v)
     db.commit()
     db.refresh(b)
-    return {
-        "logo_url": b.logo_url,
-        "primary_color": b.primary_color,
-        "accent_color": b.accent_color,
-        "client_footer_text": b.client_footer_text,
-        "custom_domain": b.custom_domain,
-        "domain_verified_at": b.domain_verified_at.isoformat() if b.domain_verified_at else None,
-    }
+    return _workspace_branding_response(db, workspace_id, wm)
 
 
 @router.post("/{workspace_id}/branding/start-domain-verification")
@@ -427,9 +798,53 @@ def start_domain_verification(
     b.domain_verification_token = tok
     b.domain_verified_at = None
     db.commit()
+    cd = (b.custom_domain or "").strip().lower().rstrip(".")
+    record_example = f"_editube-verify.{cd}" if cd else "_editube-verify.your-subdomain.example.com"
     return {
         "verification_token": tok,
-        "instructions": "Add a TXT record on your DNS: host _editube-verify value set to the verification_token.",
+        "instructions": (
+            f"Add a TXT record at DNS name {record_example} whose value is exactly this token. "
+            "After propagation, click Verify DNS."
+        ),
+    }
+
+
+@router.post("/{workspace_id}/branding/verify-domain-dns")
+def verify_domain_dns(
+    workspace_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Checks public DNS for TXT at _editube-verify.<custom_domain>; sets domain_verified_at on success."""
+
+    _workspace_or_404(db, workspace_id)
+    wm = _require_workspace_member(db, workspace_id, current_user)
+    if not can_edit_workspace_branding(wm.role):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    b = (
+        db.query(WorkspaceBranding)
+        .filter(WorkspaceBranding.workspace_id == workspace_id)
+        .first()
+    )
+    if not b or not (b.custom_domain or "").strip():
+        raise HTTPException(status_code=400, detail="Save a custom domain on this workspace first.")
+    if not (b.domain_verification_token or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Generate a verification token first, add the TXT record at DNS, then try again.",
+        )
+
+    ok, msg = verify_editube_domain_txt(b.custom_domain, b.domain_verification_token)
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+
+    b.domain_verified_at = _utcnow()
+    db.commit()
+    db.refresh(b)
+    return {
+        "ok": True,
+        "domain_verified_at": b.domain_verified_at.isoformat(),
+        "detail": msg,
     }
 
 
@@ -439,7 +854,17 @@ def confirm_domain(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Marks domain verified (ops would verify DNS externally); dev-friendly confirm."""
+    """Marks domain verified without DNS check. Disabled when EDITUBE_ALLOW_MANUAL_DOMAIN_CONFIRM is not truthy."""
+
+    manual_ok = (
+        os.getenv("EDITUBE_ALLOW_MANUAL_DOMAIN_CONFIRM", "1").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    if not manual_ok:
+        raise HTTPException(
+            status_code=403,
+            detail="Manual domain confirmation is disabled. Use Verify DNS instead.",
+        )
 
     _workspace_or_404(db, workspace_id)
     wm = _require_workspace_member(db, workspace_id, current_user)
@@ -476,7 +901,7 @@ def workspace_capacity(
     out: list[CapacityMemberRow] = []
     ws_project_ids = [r[0] for r in db.query(Project.id).filter(Project.workspace_id == workspace_id).all()]
     for m in members:
-        if m.role == "client":
+        if m.role in ("client", "guest"):
             continue
         uid = m.user_id
         collab_exists = exists().where(

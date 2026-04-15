@@ -202,6 +202,78 @@ def send_review_magic_link_email(
     return send_transactional_email(to_email, subject, text, html)
 
 
+def send_workspace_invite_email(
+    to_email: str,
+    workspace_name: str,
+    inviter_name: str,
+    invite_role: str,
+    invite_url: str,
+    expires_days: int = 14,
+) -> bool:
+    """Notify invitee to sign in with this email and open the workspace invite link."""
+    subject = f"You are invited to {workspace_name} on Editube"
+    role_line = f"You will join as: {invite_role}.\n\n" if invite_role else ""
+    text = (
+        f"Hi,\n\n"
+        f"{inviter_name} invited you to join the workspace \"{workspace_name}\" on Editube.\n\n"
+        f"{role_line}"
+        f"Important: sign in with this same email address ({to_email}) to accept the invite.\n\n"
+        f"Accept your invite (link expires in {expires_days} days):\n{invite_url}\n\n"
+        "If you do not have an account yet, create one with this email, then open the link again.\n\n"
+        "If you were not expecting this, you can ignore this email."
+    )
+    role_html = (
+        f"<p>You will join as: <strong>{invite_role}</strong>.</p>" if invite_role else ""
+    )
+    html = f"""
+    <p>Hi,</p>
+    <p><strong>{inviter_name}</strong> invited you to join the workspace
+    <strong>{workspace_name}</strong> on Editube.</p>
+    {role_html}
+    <p>Sign in with this same email address (<strong>{to_email}</strong>) to accept the invite.</p>
+    <p><a href="{invite_url}">Accept workspace invite</a></p>
+    <p>This link expires in {expires_days} days.</p>
+    <p>If you do not have an account yet, create one with this email, then open the link again.</p>
+    <p>If you were not expecting this, you can ignore this email.</p>
+    """
+    return send_transactional_email(to_email, subject, text, html)
+
+
+def send_workspace_provisioned_account_email(
+    to_email: str,
+    display_name: str,
+    workspace_name: str,
+    inviter_name: str,
+    login_url: str,
+    temporary_password: str,
+    workspace_role: str,
+) -> bool:
+    """Send login email after workspace owner created a password account for this address."""
+    subject = f"Your Editube login for {workspace_name}"
+    greet = f"Hi {display_name}," if display_name else "Hi,"
+    text = (
+        f"{greet}\n\n"
+        f"{inviter_name} created an Editube account for you to join the workspace \"{workspace_name}\".\n"
+        f"You will have the role: {workspace_role}.\n\n"
+        f"Sign in here: {login_url}\n"
+        f"Email: {to_email}\n"
+        f"Temporary password: {temporary_password}\n\n"
+        "Change your password under Account after you sign in.\n\n"
+        "If you did not expect this, contact the person who invited you."
+    )
+    html = f"""
+    <p>{greet}</p>
+    <p><strong>{inviter_name}</strong> created an Editube account for you to join the workspace
+    <strong>{workspace_name}</strong> (role: <strong>{workspace_role}</strong>).</p>
+    <p><a href="{login_url}">Sign in to Editube</a></p>
+    <p>Email: <strong>{to_email}</strong><br/>
+    Temporary password: <code>{temporary_password}</code></p>
+    <p>Change your password under Account after you sign in.</p>
+    <p>If you did not expect this, contact the person who invited you.</p>
+    """
+    return send_transactional_email(to_email, subject, text, html)
+
+
 def send_comment_mention_email(
     to_email: str,
     recipient_name: str | None,

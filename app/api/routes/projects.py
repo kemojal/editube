@@ -4,7 +4,7 @@ import logging
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.api.models.projects import (
     CollaboratorEmailList,
@@ -13,12 +13,25 @@ from app.api.models.projects import (
     ProjectResponse,
     ProjectUpdate,
     UserResponse,
+    WorkspaceAssetLinkCreate,
+    WorkspaceAssetLinkResponse,
 )
 from app.db.database import get_db
-from app.db.models import Project, ProjectCollaborator, ProjectTemplate, User, WorkspaceMember
+from app.db.models import (
+    Folder,
+    Project,
+    ProjectCollaborator,
+    ProjectTemplate,
+    ProjectWorkspaceAssetLink,
+    User,
+    WorkspaceAsset,
+    WorkspaceMember,
+)
 from app.services.project_access import (
+    assert_write_project_content,
     can_access_project,
     can_manage_project_settings,
+    get_project_for_user,
     get_workspace_member,
 )
 from app.services.project_template_apply import apply_project_template
@@ -92,6 +105,11 @@ def create_project(
         wm = get_workspace_member(db, ws_id, current_user.id)
         if not wm:
             raise HTTPException(status_code=403, detail="Not a member of that workspace")
+        if wm.role in ("client", "guest"):
+            raise HTTPException(
+                status_code=403,
+                detail="Not allowed to create projects in this workspace with your role",
+            )
     else:
         ws = ensure_personal_workspace(db, current_user)
         ws_id = ws.id
@@ -289,3 +307,124 @@ def remove_collaborator(
     db.commit()
     db.refresh(db_project)
     return convert_project_to_response(db_project)
+
+
+def _workspace_asset_link_dict(link: ProjectWorkspaceAssetLink) -> dict:
+    a = link.workspace_asset
+    return {
+        "id": link.id,
+        "project_id": link.project_id,
+        "workspace_asset_id": link.workspace_asset_id,
+        "folder_id": link.folder_id,
+        "category": a.category if a else "",
+        "title": a.title if a else "",
+        "file_url": a.file_url if a else "",
+        "created_at": link.created_at,
+    }
+
+
+@router.get("/{project_id}/workspace-assets", response_model=List[WorkspaceAssetLinkResponse])
+def list_project_workspace_assets(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = get_project_for_user(db, project_id, current_user)
+    rows = (
+        db.query(ProjectWorkspaceAssetLink)
+        .options(joinedload(ProjectWorkspaceAssetLink.workspace_asset))
+        .filter(ProjectWorkspaceAssetLink.project_id == project.id)
+        .order_by(ProjectWorkspaceAssetLink.created_at.desc())
+        .all()
+    )
+    return [_workspace_asset_link_dict(r) for r in rows]
+
+
+@router.post("/{project_id}/workspace-assets", response_model=WorkspaceAssetLinkResponse)
+def attach_workspace_asset_to_project(
+    project_id: int,
+    body: WorkspaceAssetLinkCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    db_project = get_project_for_user(db, project_id, current_user)
+    assert_write_project_content(db, current_user, db_project)
+
+    asset = (
+        db.query(WorkspaceAsset)
+        .filter(WorkspaceAsset.id == body.workspace_asset_id)
+        .first()
+    )
+    if not asset or asset.workspace_id != db_project.workspace_id:
+        raise HTTPException(status_code=404, detail="Workspace asset not found in this workspace")
+
+    if body.folder_id is not None:
+        folder = (
+            db.query(Folder)
+            .filter(Folder.id == body.folder_id, Folder.project_id == project_id)
+            .first()
+        )
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found in this project")
+    else:
+        folder = None
+
+    existing = (
+        db.query(ProjectWorkspaceAssetLink)
+        .filter(
+            ProjectWorkspaceAssetLink.project_id == project_id,
+            ProjectWorkspaceAssetLink.workspace_asset_id == body.workspace_asset_id,
+        )
+        .first()
+    )
+    if existing:
+        existing.folder_id = body.folder_id
+        db.commit()
+        existing = (
+            db.query(ProjectWorkspaceAssetLink)
+            .filter(ProjectWorkspaceAssetLink.id == existing.id)
+            .options(joinedload(ProjectWorkspaceAssetLink.workspace_asset))
+            .first()
+        )
+        return _workspace_asset_link_dict(existing)
+
+    link = ProjectWorkspaceAssetLink(
+        project_id=project_id,
+        workspace_asset_id=body.workspace_asset_id,
+        folder_id=body.folder_id,
+        created_by_user_id=current_user.id,
+    )
+    db.add(link)
+    db.commit()
+    db.refresh(link)
+    link = (
+        db.query(ProjectWorkspaceAssetLink)
+        .filter(ProjectWorkspaceAssetLink.id == link.id)
+        .options(joinedload(ProjectWorkspaceAssetLink.workspace_asset))
+        .first()
+    )
+    return _workspace_asset_link_dict(link)
+
+
+@router.delete("/{project_id}/workspace-assets/{link_id}")
+def detach_workspace_asset_from_project(
+    project_id: int,
+    link_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    db_project = get_project_for_user(db, project_id, current_user)
+    assert_write_project_content(db, current_user, db_project)
+    link = (
+        db.query(ProjectWorkspaceAssetLink)
+        .filter(
+            ProjectWorkspaceAssetLink.id == link_id,
+            ProjectWorkspaceAssetLink.project_id == project_id,
+        )
+        .first()
+    )
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found")
+    db.delete(link)
+    db.commit()
+    return {"ok": True}

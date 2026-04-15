@@ -65,7 +65,7 @@ def can_moderate_video_comments(db: Session, project: Project, user_id: int) -> 
     if row:
         return str(row.role or "").lower() != "client"
     wm = get_workspace_member(db, project.workspace_id, user_id)
-    return bool(wm and wm.role != "client")
+    return bool(wm and wm.role not in ("client", "guest"))
 
 
 def collaborator_role(db: Session, project_id: int, user_id: int) -> str | None:

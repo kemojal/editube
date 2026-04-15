@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+dnspython>=2.6.0
 email-validator>=2.0.0
 sqlalchemy
 psycopg2-binary>=2.9.9

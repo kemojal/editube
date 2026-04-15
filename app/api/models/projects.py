@@ -2,6 +2,25 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 
+
+class WorkspaceAssetLinkCreate(BaseModel):
+    workspace_asset_id: int
+    folder_id: Optional[int] = None
+
+
+class WorkspaceAssetLinkResponse(BaseModel):
+    id: int
+    project_id: int
+    workspace_asset_id: int
+    folder_id: Optional[int] = None
+    category: str
+    title: str
+    file_url: str
+    created_at: Optional[datetime] = None
+
+    class Config:
+        orm_mode = True
+
 class ProjectBase(BaseModel):
     name: str
     description: str | None = None

@@ -162,7 +162,7 @@ class WorkspaceMember(Base):
         index=True,
     )
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    # owner | producer | editor | assistant | client
+    # owner | producer | editor | assistant | client | guest
     role = Column(String, nullable=False, server_default="editor")
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
@@ -240,6 +240,37 @@ class WorkspaceAsset(Base):
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
     workspace = relationship("Workspace", back_populates="assets")
+    project_links = relationship(
+        "ProjectWorkspaceAssetLink",
+        back_populates="workspace_asset",
+        cascade="all, delete-orphan",
+    )
+
+
+class ProjectWorkspaceAssetLink(Base):
+    """Attach a shared workspace library asset to a project (reference row)."""
+
+    __tablename__ = "project_workspace_asset_links"
+    __table_args__ = (
+        UniqueConstraint("project_id", "workspace_asset_id", name="uq_project_workspace_asset"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    workspace_asset_id = Column(
+        Integer,
+        ForeignKey("workspace_assets.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    folder_id = Column(Integer, ForeignKey("folders.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    project = relationship("Project", back_populates="workspace_asset_links")
+    workspace_asset = relationship("WorkspaceAsset", back_populates="project_links")
+    folder = relationship("Folder", back_populates="workspace_asset_links")
+    created_by = relationship("User", foreign_keys=[created_by_user_id])
 
 
 class Project(Base):
@@ -285,6 +316,12 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
     )
+    workspace_asset_links = relationship(
+        "ProjectWorkspaceAssetLink",
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
+
 
 class ProjectCollaborator(Base):
     __tablename__ = "project_collaborators"
@@ -310,6 +347,10 @@ class Folder(Base):
     parent = relationship("Folder", remote_side=[id], back_populates="children")
     children = relationship("Folder", back_populates="parent", cascade="all, delete-orphan")
     videos = relationship("Video", back_populates="folder", cascade="all, delete-orphan")
+    workspace_asset_links = relationship(
+        "ProjectWorkspaceAssetLink",
+        back_populates="folder",
+    )
     creator = relationship("User")
 
 class Video(Base):
