@@ -7,7 +7,7 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.db.models import Notification, User
+from app.db.models import DevicePushToken, Notification, User
 from app.utils.security import get_current_user
 from app.websocket_manager import notifications_ws_manager
 
@@ -25,6 +25,10 @@ class NotificationResponse(BaseModel):
     project_id: Optional[int] = None
     video_id: Optional[int] = None
     comment_id: Optional[int] = None
+    workspace_id: Optional[int] = None
+    workspace_invite_id: Optional[int] = None
+    invite_token: Optional[str] = None
+    message: Optional[str] = None
     created_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -38,6 +42,13 @@ class NotificationsPageResponse(BaseModel):
     has_more: bool
     next_cursor_created_at: Optional[datetime] = None
     next_cursor_id: Optional[int] = None
+
+
+class DevicePushTokenUpsert(BaseModel):
+    token: str
+    platform: str
+    device_name: Optional[str] = None
+    app_version: Optional[str] = None
 
 
 def _serialize_notification(notification: Notification) -> NotificationResponse:
@@ -172,3 +183,55 @@ async def mark_all_notifications_as_read(
             {"ids": changed_ids},
         )
     return {"ok": True, "updated_count": len(changed_ids)}
+
+
+@router.post("/push-tokens")
+def upsert_push_token(
+    body: DevicePushTokenUpsert,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    normalized = body.token.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="token is required")
+    token_row = db.query(DevicePushToken).filter(DevicePushToken.token == normalized).first()
+    if token_row is None:
+        token_row = DevicePushToken(
+            user_id=current_user.id,
+            token=normalized,
+            platform=(body.platform or "unknown").strip().lower(),
+            device_name=body.device_name,
+            app_version=body.app_version,
+            enabled=True,
+        )
+        db.add(token_row)
+    else:
+        token_row.user_id = current_user.id
+        token_row.platform = (body.platform or token_row.platform or "unknown").strip().lower()
+        token_row.device_name = body.device_name
+        token_row.app_version = body.app_version
+        token_row.enabled = True
+    db.commit()
+    db.refresh(token_row)
+    return {"ok": True, "id": token_row.id}
+
+
+@router.delete("/push-tokens")
+def revoke_push_token(
+    token: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    row = (
+        db.query(DevicePushToken)
+        .filter(
+            DevicePushToken.user_id == current_user.id,
+            DevicePushToken.token == token.strip(),
+        )
+        .first()
+    )
+    if not row:
+        return {"ok": True, "revoked": False}
+    row.enabled = False
+    db.commit()
+    return {"ok": True, "revoked": True}

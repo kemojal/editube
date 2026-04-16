@@ -44,6 +44,7 @@ class UserResponse(BaseModel):
     stripe_customer_id: Optional[str] = None
     auth_provider: Optional[str] = None
     google_sub: Optional[str] = None
+    mfa_required: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -78,6 +79,33 @@ class UserSettingsUpdate(BaseModel):
     allow_project_invites: Optional[bool] = None
 
 
+class UserMFAEnrollResponse(BaseModel):
+    secret: str
+    otpauth_url: str
+    backup_codes: list[str]
+
+
+class UserMFAVerifyRequest(BaseModel):
+    code: str
+
+
+class UserMFAChallengeRequest(BaseModel):
+    challenge_token: str
+    code: Optional[str] = None
+    recovery_code: Optional[str] = None
+
+
+class UserMFAChallengeResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    refresh_token: str
+    onboarding_completed: bool
+
+
+class WorkspaceSSOLoginRequest(BaseModel):
+    email: str
+
+
 class OnboardingProfileUpdate(BaseModel):
     full_name: str
     phone: Optional[str] = None
@@ -89,7 +117,7 @@ class OnboardingWorkflowUpdate(BaseModel):
 
 
 class OnboardingPlanUpdate(BaseModel):
-    plan: str  # "basic", "pro", "elite"
+    plan: str  # "free", "pro", "scale", "enterprise" (+ legacy aliases)
 
 class UserCreate(UserBase):
     password: str

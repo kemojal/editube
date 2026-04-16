@@ -52,12 +52,26 @@ class WorkspaceInviteListItem(BaseModel):
     status: str  # pending | accepted | expired
 
 
+class MyPendingWorkspaceInviteItem(BaseModel):
+    id: int
+    workspace_id: int
+    workspace_name: str
+    email: str
+    role: str
+    token: str
+    expires_at: datetime
+    invited_by_name: Optional[str] = None
+    created_at: datetime
+    status: str  # pending
+
+
 class WorkspaceProvisionMemberBody(BaseModel):
     """Workspace owner only: create a password account and add to this workspace, or add existing user."""
 
     email: str
     name: Optional[str] = None
     role: str = Field(default="editor")
+    password: Optional[str] = None
 
 
 class WorkspaceProvisionMemberResponse(BaseModel):
@@ -116,3 +130,54 @@ class CapacityMemberRow(BaseModel):
     active_project_count: int
     tracked_hours: float
     open_assigned_comments: int
+
+
+class WorkspaceSSOProviderCreate(BaseModel):
+    provider: str  # google | okta | azure_ad
+    issuer: str
+    client_id: str
+    client_secret: str
+    domain_hint: Optional[str] = None
+    enabled: bool = True
+
+
+class WorkspaceSSOProviderResponse(BaseModel):
+    id: int
+    provider: str
+    issuer: str
+    client_id: str
+    domain_hint: Optional[str] = None
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkspaceAuthPolicyUpdate(BaseModel):
+    enforce_sso: Optional[bool] = None
+    allowed_login_methods: Optional[list[str]] = None
+    mfa_required: Optional[bool] = None
+
+
+class WorkspaceAuthPolicyResponse(BaseModel):
+    workspace_id: int
+    enforce_sso: bool
+    allowed_login_methods: list[str] = []
+    mfa_required: bool
+
+
+class NDADocumentCreate(BaseModel):
+    name: str
+    version: str
+    body_markdown: str
+    is_active: bool = True
+
+
+class NDADocumentResponse(BaseModel):
+    id: int
+    workspace_id: int
+    name: str
+    version: str
+    body_markdown: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime

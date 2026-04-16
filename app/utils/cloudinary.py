@@ -20,7 +20,7 @@ _VIDEO_CHUNK_BYTES = 6 * 1024 * 1024
 _CLOUDINARY_UPLOAD_TIMEOUT = 900  # seconds; large videos + processing need headroom
 
 
-def upload_file_to_cloudinary(file: UploadFile, resource_type: str = "video") -> str:
+def upload_file_to_cloudinary_with_meta(file: UploadFile, resource_type: str = "video") -> dict:
     try:
         stream = file.file
         if hasattr(stream, "seek"):
@@ -49,7 +49,12 @@ def upload_file_to_cloudinary(file: UploadFile, resource_type: str = "video") ->
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Cloudinary returned no URL for the upload.",
             )
-        return url
+        return {
+            "url": url,
+            "bytes": int(result.get("bytes") or 0),
+            "public_id": result.get("public_id"),
+            "resource_type": result.get("resource_type"),
+        }
     except CloudinaryError as e:
         err = str(e)
         # Cloudinary/nginx returns HTML 413; SDK wraps it as Error parsing server response (413)
@@ -66,6 +71,11 @@ def upload_file_to_cloudinary(file: UploadFile, resource_type: str = "video") ->
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Cloudinary upload failed: {err}",
         ) from e
+
+
+def upload_file_to_cloudinary(file: UploadFile, resource_type: str = "video") -> str:
+    result = upload_file_to_cloudinary_with_meta(file, resource_type=resource_type)
+    return str(result["url"])
 
 
 async def upload_image(image: UploadFile):

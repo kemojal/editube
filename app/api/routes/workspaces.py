@@ -26,11 +26,18 @@ from app.api.models.workspaces import (
     WorkspaceInviteCreate,
     WorkspaceInviteCreatedResponse,
     WorkspaceInviteListItem,
+    MyPendingWorkspaceInviteItem,
     WorkspaceMemberResponse,
     WorkspaceProvisionMemberBody,
     WorkspaceProvisionMemberResponse,
     WorkspaceSummaryResponse,
     WorkspaceUpdate,
+    WorkspaceSSOProviderCreate,
+    WorkspaceSSOProviderResponse,
+    WorkspaceAuthPolicyUpdate,
+    WorkspaceAuthPolicyResponse,
+    NDADocumentCreate,
+    NDADocumentResponse,
 )
 from app.db.database import get_db
 from app.db.models import (
@@ -46,6 +53,10 @@ from app.db.models import (
     WorkspaceBranding,
     WorkspaceInvite,
     WorkspaceMember,
+    WorkspaceSSOProvider,
+    WorkspaceAuthPolicy,
+    NDADocument,
+    Notification,
 )
 from app.services.project_access import get_workspace_member
 from app.services.workspace_roles import normalize_invite_role
@@ -57,6 +68,10 @@ from app.services.dns_domain_verify import verify_editube_domain_txt
 from app.services.workspace_bootstrap import ensure_personal_workspace
 from app.utils.email import send_workspace_invite_email, send_workspace_provisioned_account_email
 from app.utils.security import get_current_user, get_password_hash
+from app.services.oidc_sso import discover_oidc_metadata
+from app.services.security_audit import log_security_audit_event
+from app.jobs.queue import enqueue_push_notification_job
+from app.websocket_manager import notifications_ws_manager
 
 router = APIRouter(prefix="/workspaces", tags=["Workspaces"])
 
@@ -164,6 +179,16 @@ def update_workspace(
         raise HTTPException(status_code=403, detail="Not allowed to rename workspace")
     if body.name is not None:
         ws.name = body.name.strip() or ws.name
+    log_security_audit_event(
+        db,
+        action="workspace.update",
+        resource_type="workspace",
+        resource_id=str(workspace_id),
+        actor_user_id=current_user.id,
+        actor_type="user",
+        workspace_id=workspace_id,
+        metadata={"updated_name": bool(body.name)},
+    )
     db.commit()
     db.refresh(ws)
     return WorkspaceSummaryResponse(
@@ -233,8 +258,133 @@ def list_workspace_invites(
     ]
 
 
+@router.get("/invites/me/pending", response_model=List[MyPendingWorkspaceInviteItem])
+def list_my_pending_invites(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    email = (current_user.email or "").strip().lower()
+    if not email:
+        return []
+    now = _utcnow()
+    already_member = exists().where(
+        WorkspaceMember.workspace_id == WorkspaceInvite.workspace_id,
+        WorkspaceMember.user_id == current_user.id,
+    )
+    rows = (
+        db.query(WorkspaceInvite, Workspace, User)
+        .join(Workspace, Workspace.id == WorkspaceInvite.workspace_id)
+        .outerjoin(User, User.id == WorkspaceInvite.invited_by_user_id)
+        .filter(
+            WorkspaceInvite.accepted_at.is_(None),
+            WorkspaceInvite.email == email,
+            WorkspaceInvite.expires_at >= now,
+            ~already_member,
+        )
+        .order_by(WorkspaceInvite.created_at.desc())
+        .all()
+    )
+    return [
+        MyPendingWorkspaceInviteItem(
+            id=invite.id,
+            workspace_id=invite.workspace_id,
+            workspace_name=workspace.name,
+            email=invite.email,
+            role=invite.role,
+            token=invite.token,
+            expires_at=invite.expires_at,
+            invited_by_name=((inviter.name or inviter.email) if inviter else None),
+            created_at=invite.created_at,
+            status=_invite_status(invite, now),
+        )
+        for invite, workspace, inviter in rows
+    ]
+
+
+async def _emit_workspace_invite_notification(
+    db: Session,
+    *,
+    invite: WorkspaceInvite,
+    workspace: Workspace,
+    inviter: User,
+    invited_user: User | None,
+) -> None:
+    if invited_user is None:
+        return
+    msg = f"{inviter.name or inviter.email or 'A teammate'} invited you to join {workspace.name}"
+    existing_unread = (
+        db.query(Notification)
+        .filter(
+            Notification.user_id == invited_user.id,
+            Notification.type == "workspace_invite",
+            Notification.workspace_invite_id == invite.id,
+            Notification.read.is_(False),
+        )
+        .first()
+    )
+    if existing_unread:
+        existing_unread.message = msg
+        existing_unread.invite_token = invite.token
+        existing_unread.workspace_id = workspace.id
+        db.commit()
+        db.refresh(existing_unread)
+        enqueue_push_notification_job(existing_unread.user_id, existing_unread.id)
+        await notifications_ws_manager.send_to_user(
+            existing_unread.user_id,
+            {
+                "event": "notification.new",
+                "payload": {
+                    "id": existing_unread.id,
+                    "type": existing_unread.type,
+                    "read": existing_unread.read,
+                    "project_id": existing_unread.project_id,
+                    "video_id": existing_unread.video_id,
+                    "comment_id": existing_unread.comment_id,
+                    "workspace_id": existing_unread.workspace_id,
+                    "workspace_invite_id": existing_unread.workspace_invite_id,
+                    "invite_token": existing_unread.invite_token,
+                    "message": existing_unread.message,
+                    "created_at": existing_unread.created_at.isoformat() if existing_unread.created_at else None,
+                },
+            },
+        )
+        return
+    notification = Notification(
+        user_id=invited_user.id,
+        type="workspace_invite",
+        workspace_id=workspace.id,
+        workspace_invite_id=invite.id,
+        invite_token=invite.token,
+        message=msg,
+        read=False,
+    )
+    db.add(notification)
+    db.commit()
+    db.refresh(notification)
+    enqueue_push_notification_job(notification.user_id, notification.id)
+    await notifications_ws_manager.send_to_user(
+        notification.user_id,
+        {
+            "event": "notification.new",
+            "payload": {
+                "id": notification.id,
+                "type": notification.type,
+                "read": notification.read,
+                "project_id": notification.project_id,
+                "video_id": notification.video_id,
+                "comment_id": notification.comment_id,
+                "workspace_id": notification.workspace_id,
+                "workspace_invite_id": notification.workspace_invite_id,
+                "invite_token": notification.invite_token,
+                "message": notification.message,
+                "created_at": notification.created_at.isoformat() if notification.created_at else None,
+            },
+        },
+    )
+
+
 @router.post("/{workspace_id}/invites", response_model=WorkspaceInviteCreatedResponse)
-def create_invite(
+async def create_invite(
     workspace_id: int,
     body: WorkspaceInviteCreate,
     db: Session = Depends(get_db),
@@ -283,6 +433,16 @@ def create_invite(
         expires_at=_utcnow() + timedelta(days=14),
     )
     db.add(inv)
+    log_security_audit_event(
+        db,
+        action="workspace.invite.create",
+        resource_type="workspace_invite",
+        resource_id=email,
+        actor_user_id=current_user.id,
+        actor_type="user",
+        workspace_id=workspace_id,
+        metadata={"role": invite_role},
+    )
     db.commit()
     db.refresh(inv)
 
@@ -296,6 +456,13 @@ def create_invite(
         invite_url=url,
         expires_days=14,
     )
+    await _emit_workspace_invite_notification(
+        db,
+        invite=inv,
+        workspace=ws,
+        inviter=current_user,
+        invited_user=existing_user,
+    )
     return WorkspaceInviteCreatedResponse(
         token=raw,
         expires_at=inv.expires_at,
@@ -304,7 +471,7 @@ def create_invite(
 
 
 @router.post("/{workspace_id}/invites/{invite_id}/resend")
-def resend_workspace_invite(
+async def resend_workspace_invite(
     workspace_id: int,
     invite_id: int,
     db: Session = Depends(get_db),
@@ -343,6 +510,14 @@ def resend_workspace_invite(
         invite_url=url,
         expires_days=remaining_days,
     )
+    invited_user = db.query(User).filter(func.lower(User.email) == inv.email).first()
+    await _emit_workspace_invite_notification(
+        db,
+        invite=inv,
+        workspace=ws,
+        inviter=current_user,
+        invited_user=invited_user,
+    )
     return {"email_sent": email_sent}
 
 
@@ -374,6 +549,17 @@ def revoke_workspace_invite(
     return {"ok": True}
 
 
+def _mark_workspace_invite_notifications_read(db: Session, user_id: int, inv: WorkspaceInvite) -> None:
+    db.query(Notification).filter(
+        Notification.user_id == user_id,
+        Notification.type == "workspace_invite",
+        or_(
+            Notification.workspace_invite_id == inv.id,
+            Notification.invite_token == inv.token,
+        ),
+    ).update({Notification.read: True}, synchronize_session=False)
+
+
 @router.post("/invites/accept")
 def accept_invite(
     body: WorkspaceInviteAccept,
@@ -394,6 +580,7 @@ def accept_invite(
     )
     if exists:
         inv.accepted_at = _utcnow()
+        _mark_workspace_invite_notifications_read(db, current_user.id, inv)
         db.commit()
         return {"ok": True, "workspace_id": inv.workspace_id}
     member_role = normalize_invite_role(inv.role)
@@ -405,6 +592,7 @@ def accept_invite(
         )
     )
     inv.accepted_at = _utcnow()
+    _mark_workspace_invite_notifications_read(db, current_user.id, inv)
     db.commit()
     return {"ok": True, "workspace_id": inv.workspace_id}
 
@@ -490,7 +678,14 @@ def provision_workspace_member(
         )
 
     display_name = (body.name or "").strip() or email.split("@")[0]
-    temp_password = secrets.token_urlsafe(14)
+    provided_password = (body.password or "").strip()
+    if provided_password:
+        password_bytes_len = len(provided_password.encode("utf-8"))
+        if password_bytes_len < 8:
+            raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+        if password_bytes_len > 72:
+            raise HTTPException(status_code=400, detail="Password cannot exceed 72 bytes")
+    temp_password = provided_password or secrets.token_urlsafe(14)
     db_user = User(
         email=email,
         hashed_password=get_password_hash(temp_password),
@@ -955,3 +1150,181 @@ def workspace_capacity(
             )
         )
     return out
+
+
+@router.get("/{workspace_id}/auth-policy", response_model=WorkspaceAuthPolicyResponse)
+def get_workspace_auth_policy(
+    workspace_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    wm = _require_workspace_member(db, workspace_id, current_user)
+    if wm.role not in ("owner", "producer"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    policy = (
+        db.query(WorkspaceAuthPolicy)
+        .filter(WorkspaceAuthPolicy.workspace_id == workspace_id)
+        .first()
+    )
+    if not policy:
+        policy = WorkspaceAuthPolicy(workspace_id=workspace_id, allowed_login_methods=["password", "google"])
+        db.add(policy)
+        db.commit()
+        db.refresh(policy)
+    return WorkspaceAuthPolicyResponse(
+        workspace_id=workspace_id,
+        enforce_sso=policy.enforce_sso,
+        allowed_login_methods=policy.allowed_login_methods or [],
+        mfa_required=policy.mfa_required,
+    )
+
+
+@router.patch("/{workspace_id}/auth-policy", response_model=WorkspaceAuthPolicyResponse)
+def update_workspace_auth_policy(
+    workspace_id: int,
+    body: WorkspaceAuthPolicyUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    wm = _require_workspace_member(db, workspace_id, current_user)
+    if wm.role not in ("owner", "producer"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    policy = (
+        db.query(WorkspaceAuthPolicy)
+        .filter(WorkspaceAuthPolicy.workspace_id == workspace_id)
+        .first()
+    )
+    if not policy:
+        policy = WorkspaceAuthPolicy(workspace_id=workspace_id)
+        db.add(policy)
+    patch = body.model_dump(exclude_unset=True)
+    for key, value in patch.items():
+        setattr(policy, key, value)
+    log_security_audit_event(
+        db,
+        action="workspace.auth_policy.update",
+        resource_type="workspace",
+        resource_id=str(workspace_id),
+        actor_user_id=current_user.id,
+        actor_type="user",
+        workspace_id=workspace_id,
+        metadata={"changed_fields": sorted(list(patch.keys()))},
+    )
+    db.commit()
+    db.refresh(policy)
+    return WorkspaceAuthPolicyResponse(
+        workspace_id=workspace_id,
+        enforce_sso=policy.enforce_sso,
+        allowed_login_methods=policy.allowed_login_methods or [],
+        mfa_required=policy.mfa_required,
+    )
+
+
+@router.get("/{workspace_id}/sso-providers", response_model=List[WorkspaceSSOProviderResponse])
+def list_workspace_sso_providers(
+    workspace_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    wm = _require_workspace_member(db, workspace_id, current_user)
+    if wm.role not in ("owner", "producer"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    rows = (
+        db.query(WorkspaceSSOProvider)
+        .filter(WorkspaceSSOProvider.workspace_id == workspace_id)
+        .order_by(WorkspaceSSOProvider.created_at.desc())
+        .all()
+    )
+    return rows
+
+
+@router.post("/{workspace_id}/sso-providers", response_model=WorkspaceSSOProviderResponse)
+def create_workspace_sso_provider(
+    workspace_id: int,
+    body: WorkspaceSSOProviderCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    wm = _require_workspace_member(db, workspace_id, current_user)
+    if wm.role not in ("owner", "producer"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    metadata = discover_oidc_metadata(body.issuer)
+    row = WorkspaceSSOProvider(
+        workspace_id=workspace_id,
+        provider=body.provider,
+        issuer=body.issuer.rstrip("/"),
+        client_id=body.client_id,
+        client_secret_encrypted=body.client_secret,
+        authorization_endpoint=metadata.get("authorization_endpoint"),
+        token_endpoint=metadata.get("token_endpoint"),
+        userinfo_endpoint=metadata.get("userinfo_endpoint"),
+        jwks_uri=metadata.get("jwks_uri"),
+        domain_hint=(body.domain_hint or "").strip().lower() or None,
+        enabled=body.enabled,
+        created_by_user_id=current_user.id,
+    )
+    db.add(row)
+    log_security_audit_event(
+        db,
+        action="workspace.sso_provider.create",
+        resource_type="workspace_sso_provider",
+        resource_id=body.provider,
+        actor_user_id=current_user.id,
+        actor_type="user",
+        workspace_id=workspace_id,
+    )
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@router.get("/{workspace_id}/nda-documents", response_model=List[NDADocumentResponse])
+def list_workspace_nda_documents(
+    workspace_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_workspace_member(db, workspace_id, current_user)
+    return (
+        db.query(NDADocument)
+        .filter(NDADocument.workspace_id == workspace_id)
+        .order_by(NDADocument.updated_at.desc())
+        .all()
+    )
+
+
+@router.post("/{workspace_id}/nda-documents", response_model=NDADocumentResponse)
+def create_workspace_nda_document(
+    workspace_id: int,
+    body: NDADocumentCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    wm = _require_workspace_member(db, workspace_id, current_user)
+    if wm.role not in ("owner", "producer"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    import hashlib
+
+    normalized_body = body.body_markdown.strip()
+    row = NDADocument(
+        workspace_id=workspace_id,
+        name=body.name.strip(),
+        version=body.version.strip(),
+        body_markdown=normalized_body,
+        content_sha256=hashlib.sha256(normalized_body.encode("utf-8")).hexdigest(),
+        is_active=body.is_active,
+        created_by_user_id=current_user.id,
+    )
+    db.add(row)
+    log_security_audit_event(
+        db,
+        action="workspace.nda_document.create",
+        resource_type="nda_document",
+        resource_id=f"{row.name}:{row.version}",
+        actor_user_id=current_user.id,
+        actor_type="user",
+        workspace_id=workspace_id,
+    )
+    db.commit()
+    db.refresh(row)
+    return row

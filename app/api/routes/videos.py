@@ -6,6 +6,7 @@ import logging
 from app.db.database import get_db
 from app.db.models import Project, Video, VideoTranscription, User, Folder
 from app.services.project_access import assert_write_project_content, can_access_project
+from app.services.storage_policy import assert_storage_upload_allowed
 from app.api.video_payload import video_detail_dict
 from app.api.models.videos import (
     VideoCreate,
@@ -19,7 +20,7 @@ from app.api.models.videos import (
 )
 from app.utils.security import get_current_user
 from app.utils.storage import upload_file, delete_file
-from app.utils.cloudinary import upload_file_to_cloudinary
+from app.utils.cloudinary import upload_file_to_cloudinary_with_meta
 from app.services.transcription_enqueue import prepare_and_enqueue_transcription
 
 router = APIRouter(
@@ -28,6 +29,17 @@ router = APIRouter(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _upload_file_size_bytes(video_file: UploadFile) -> int:
+    stream = video_file.file
+    if not hasattr(stream, "seek") or not hasattr(stream, "tell"):
+        return 0
+    current = stream.tell()
+    stream.seek(0, 2)
+    size = int(stream.tell() or 0)
+    stream.seek(current)
+    return size
 
 
 def _video_detail(
@@ -64,7 +76,26 @@ def upload_video(
         if not folder:
             raise HTTPException(status_code=404, detail="Folder not found in this project")
 
-    file_url = upload_file_to_cloudinary(video_file)
+    incoming_size = _upload_file_size_bytes(video_file)
+    try:
+        assert_storage_upload_allowed(
+            db,
+            user=current_user,
+            workspace_id=db_project.workspace_id,
+            incoming_bytes=incoming_size,
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "Storage cap reached and grace period ended. "
+                "Upgrade plan or add storage to continue uploads."
+            ),
+        )
+
+    upload = upload_file_to_cloudinary_with_meta(video_file)
+    file_url = str(upload["url"])
+    uploaded_size = int(upload.get("bytes") or incoming_size or 0)
 
     latest_version = db.query(Video).filter(Video.project_id == project_id).order_by(Video.version.desc()).first()
     version = 1 if not latest_version else latest_version.version + 1
@@ -76,6 +107,7 @@ def upload_video(
         description=description,
         version=version,
         file_path=file_url,
+        size_bytes=uploaded_size,
         uploader_id=current_user.id,
     )
     db.add(db_video)

@@ -43,6 +43,13 @@ from app.api.models.review_links import (
     PublicReviewSignoffRequest,
     PublicReviewSignoffResponse,
     PublicReviewEventCreate,
+    PublicReviewRoomMessageCreate,
+    PublicReviewRoomMessageResponse,
+    PublicReviewRecordingCreate,
+    PublicReviewRecordingResponse,
+    PublicReviewRecordingGovernanceUpdate,
+    PublicReviewNDAAcceptRequest,
+    PublicReviewNDAAcceptResponse,
     PublicReviewLinkInfo,
     PublicReviewScope,
     PublicReviewVideo,
@@ -66,6 +73,12 @@ from app.db.models import (
     ReviewMagicToken,
     ReviewSignoff,
     ReviewSession,
+    ReviewRoomMessage,
+    ReviewRecordingSession,
+    VideoTranscription,
+    NDADocument,
+    NDAAcceptance,
+    ReviewForensicAsset,
     ReviewWorkflowRun,
     ReviewWorkflowStage,
     ReviewWorkflowTemplate,
@@ -88,7 +101,11 @@ from app.services.comment_workflow import (
     notify_user_ids_for_new_run,
     sync_is_resolved_from_status,
 )
-from app.jobs.queue import enqueue_mention_email_job
+from app.jobs.queue import (
+    enqueue_mention_email_job,
+    enqueue_push_notification_job,
+    enqueue_review_forensic_package_job,
+)
 from app.services.mentions import extract_mention_handles, resolve_mentioned_users
 from app.utils.email import send_review_magic_link_email
 from app.websocket_manager import notifications_ws_manager
@@ -108,6 +125,9 @@ from app.services.review_comment_groups import build_review_scene_groups
 from app.services.project_access import can_access_project, list_users_for_mentions
 from app.services.comment_visibility import COMMENT_VISIBILITY_PUBLIC, is_client_visible
 from app.services.workspace_branding_resolve import branding_public_dict
+from app.services.security_audit import log_security_audit_event
+from app.services.geoip import extract_client_ip, is_country_allowed, resolve_country_code
+from app.services.forensic_watermark import build_forensic_fingerprint, upsert_forensic_asset
 
 
 # =============================================================================
@@ -171,10 +191,18 @@ def _link_to_response(link: ReviewLink, db: Session) -> dict:
         "allow_comments": link.allow_comments,
         "allow_export": getattr(link, "allow_export", False),
         "watermark_enabled": link.watermark_enabled,
+        "watermark_mode": getattr(link, "watermark_mode", "visible_overlay"),
         "require_email": link.require_email,
+        "nda_required": getattr(link, "nda_required", False),
+        "nda_document_id": getattr(link, "nda_document_id", None),
+        "geofence_mode": getattr(link, "geofence_mode", "off"),
+        "geo_allow_countries": getattr(link, "geo_allow_countries", None),
+        "geo_block_countries": getattr(link, "geo_block_countries", None),
+        "recording_detection_mode": getattr(link, "recording_detection_mode", "monitor"),
         "version_group_id": link.version_group_id,
         "version_label": link.version_label,
         "revoked_at": link.revoked_at,
+        "revocation_reason": getattr(link, "revocation_reason", None),
         "created_at": link.created_at,
         "updated_at": link.updated_at,
         "view_count": view_count,
@@ -186,6 +214,23 @@ def _link_to_response(link: ReviewLink, db: Session) -> dict:
 
 def _hash_magic_token(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _nda_identity_key(*, fingerprint: str, guest_email: str | None) -> str:
+    key = (guest_email or "").strip().lower() or (fingerprint or "").strip()
+    return hashlib.sha256(key.encode("utf-8")).hexdigest() if key else ""
+
+
+def _enforce_geofence_or_403(link: ReviewLink, country_code: str) -> None:
+    mode = getattr(link, "geofence_mode", "off")
+    allowed = is_country_allowed(
+        mode=mode,
+        allow_countries=getattr(link, "geo_allow_countries", None),
+        block_countries=getattr(link, "geo_block_countries", None),
+        country_code=country_code,
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Access blocked by geofencing policy")
 
 
 def _project_deliverables_paid(db: Session, project_id: int) -> bool:
@@ -247,11 +292,29 @@ def create_review_link(
         allow_comments=body.allow_comments,
         allow_export=getattr(body, "allow_export", False),
         watermark_enabled=body.watermark_enabled,
+        watermark_mode=getattr(body, "watermark_mode", "visible_overlay"),
         require_email=body.require_email,
+        nda_required=getattr(body, "nda_required", False),
+        nda_document_id=getattr(body, "nda_document_id", None),
+        geofence_mode=getattr(body, "geofence_mode", "off"),
+        geo_allow_countries=getattr(body, "geo_allow_countries", None),
+        geo_block_countries=getattr(body, "geo_block_countries", None),
+        recording_detection_mode=getattr(body, "recording_detection_mode", "monitor"),
         version_group_id=body.version_group_id,
         version_label=body.version_label,
     )
     db.add(link)
+    log_security_audit_event(
+        db,
+        action="review_link.create",
+        resource_type="review_link",
+        actor_user_id=current_user.id,
+        actor_type="user",
+        resource_id=token,
+        project_id=project_id,
+        video_id=video_id,
+        metadata={"nda_required": getattr(body, "nda_required", False), "geofence_mode": getattr(body, "geofence_mode", "off")},
+    )
     db.commit()
     db.refresh(link)
     return _link_to_response(link, db)
@@ -297,9 +360,24 @@ def update_review_link(
         pw = data.pop("password")
         link.password_hash = get_password_hash(pw) if pw else None
     if "revoked" in data:
-        link.revoked_at = datetime.now(timezone.utc) if data.pop("revoked") else None
+        revoked = data.pop("revoked")
+        link.revoked_at = datetime.now(timezone.utc) if revoked else None
+        if revoked and not data.get("revocation_reason"):
+            data["revocation_reason"] = "manual"
     for k, v in data.items():
         setattr(link, k, v)
+    log_security_audit_event(
+        db,
+        action="review_link.update",
+        resource_type="review_link",
+        actor_user_id=current_user.id,
+        actor_type="user",
+        resource_id=str(link.id),
+        project_id=project_id,
+        video_id=video_id,
+        review_link_id=link.id,
+        metadata={"changed_fields": sorted(list(data.keys()))},
+    )
     db.commit()
     db.refresh(link)
     return _link_to_response(link, db)
@@ -321,6 +399,17 @@ def delete_review_link(
     )
     if not link:
         raise HTTPException(status_code=404, detail="Review link not found")
+    log_security_audit_event(
+        db,
+        action="review_link.delete",
+        resource_type="review_link",
+        actor_user_id=current_user.id,
+        actor_type="user",
+        resource_id=str(link.id),
+        project_id=project_id,
+        video_id=video_id,
+        review_link_id=link.id,
+    )
     db.delete(link)
     db.commit()
     return {"ok": True}
@@ -398,6 +487,118 @@ def link_analytics(
         signoff_count=int(signoff_count),
         completion_rate=completion_rate,
     )
+
+
+@auth_router.get("/{link_id}/recordings", response_model=List[PublicReviewRecordingResponse])
+def owner_list_recordings(
+    project_id: int,
+    video_id: int,
+    link_id: int,
+    include_deleted: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_owner(project_id, video_id, db, current_user)
+    q = db.query(ReviewRecordingSession).filter(ReviewRecordingSession.review_link_id == link_id)
+    if not include_deleted:
+        q = q.filter(ReviewRecordingSession.deleted_at.is_(None))
+    rows = q.order_by(ReviewRecordingSession.created_at.desc()).all()
+    return [
+        PublicReviewRecordingResponse(
+            id=row.id,
+            session_id=row.session_id,
+            status=row.status,
+            file_url=row.file_url,
+            mime_type=row.mime_type,
+            bytes_size=row.bytes_size,
+            started_at=row.started_at,
+            ended_at=row.ended_at,
+            archived_at=row.archived_at,
+            deleted_at=row.deleted_at,
+            retention_days=row.retention_days,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+@auth_router.patch(
+    "/{link_id}/recordings/{recording_id}",
+    response_model=PublicReviewRecordingResponse,
+)
+def owner_update_recording_governance(
+    project_id: int,
+    video_id: int,
+    link_id: int,
+    recording_id: int,
+    body: PublicReviewRecordingGovernanceUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_owner(project_id, video_id, db, current_user)
+    row = (
+        db.query(ReviewRecordingSession)
+        .filter(
+            ReviewRecordingSession.id == recording_id,
+            ReviewRecordingSession.review_link_id == link_id,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    now = datetime.now(timezone.utc)
+    if body.archived is not None:
+        row.archived_at = now if body.archived else None
+    if body.deleted is not None:
+        row.deleted_at = now if body.deleted else None
+    if body.retention_days is not None:
+        row.retention_days = max(0, int(body.retention_days))
+    db.commit()
+    db.refresh(row)
+    return PublicReviewRecordingResponse(
+        id=row.id,
+        session_id=row.session_id,
+        status=row.status,
+        file_url=row.file_url,
+        mime_type=row.mime_type,
+        bytes_size=row.bytes_size,
+        started_at=row.started_at,
+        ended_at=row.ended_at,
+        archived_at=row.archived_at,
+        deleted_at=row.deleted_at,
+        retention_days=row.retention_days,
+        created_at=row.created_at,
+    )
+
+
+@auth_router.delete("/{link_id}/recordings/{recording_id}")
+def owner_purge_recording(
+    project_id: int,
+    video_id: int,
+    link_id: int,
+    recording_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_owner(project_id, video_id, db, current_user)
+    row = (
+        db.query(ReviewRecordingSession)
+        .filter(
+            ReviewRecordingSession.id == recording_id,
+            ReviewRecordingSession.review_link_id == link_id,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    if row.deleted_at is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Recording must be soft-deleted before purge",
+        )
+    db.delete(row)
+    db.commit()
+    return {"ok": True}
 
 
 @auth_router.post("/{link_id}/send-invite")
@@ -487,6 +688,7 @@ async def _notify_review_workflow_users(
         created.append(n)
     db.commit()
     for n in created:
+        enqueue_push_notification_job(n.user_id, n.id)
         await notifications_ws_manager.send_to_user(
             n.user_id,
             {
@@ -733,6 +935,19 @@ def review_download_url(
         raise HTTPException(status_code=404, detail="Video not found")
     if not _is_session_download_unlocked(link, session, db=db, video=video):
         raise HTTPException(status_code=403, detail="Download not allowed")
+    log_security_audit_event(
+        db,
+        action="review_link.download_url_issued",
+        resource_type="review_link",
+        resource_id=str(link.id),
+        actor_type="guest",
+        review_link_id=link.id,
+        session_id=session.id,
+        video_id=link.video_id,
+        ip_address=session.ip_address,
+        country_code=getattr(session, "country_code", None),
+        user_agent=session.user_agent,
+    )
     url = build_review_media_url(
         api_base=_api_base(request),
         token=token,
@@ -763,7 +978,7 @@ def upload_guest_avatar(
 
 
 @public_router.get("/{token}", response_model=PublicReviewLinkInfo)
-def get_public_link_info(token: str, db: Session = Depends(get_db)):
+def get_public_link_info(token: str, request: Request, db: Session = Depends(get_db)):
     link = _get_link_or_404(token, db)
     expired = _link_expired(link)
     revoked = link.revoked_at is not None
@@ -793,6 +1008,16 @@ def get_public_link_info(token: str, db: Session = Depends(get_db)):
         if proj:
             branding = branding_public_dict(db, proj)
 
+    client_ip = extract_client_ip(dict(request.headers), request.client.host if request.client else None)
+    country_code = resolve_country_code(client_ip)
+    if not expired and not revoked:
+        _enforce_geofence_or_403(link, country_code)
+
+    nda_doc = None
+    nda_accepted = False
+    if getattr(link, "nda_document_id", None):
+        nda_doc = db.query(NDADocument).filter(NDADocument.id == link.nda_document_id).first()
+
     return PublicReviewLinkInfo(
         token=link.token,
         label=link.label,
@@ -803,8 +1028,15 @@ def get_public_link_info(token: str, db: Session = Depends(get_db)):
         allow_comments=link.allow_comments,
         allow_export=getattr(link, "allow_export", False),
         watermark_enabled=link.watermark_enabled,
+        watermark_mode=getattr(link, "watermark_mode", "visible_overlay"),
         version_group_id=link.version_group_id,
         version_label=link.version_label,
+        nda_required=getattr(link, "nda_required", False),
+        nda_document_id=getattr(link, "nda_document_id", None),
+        nda_document_name=(nda_doc.name if nda_doc else None),
+        nda_accepted=nda_accepted,
+        geofence_mode=getattr(link, "geofence_mode", "off"),
+        recording_detection_mode=getattr(link, "recording_detection_mode", "monitor"),
         expired=expired,
         revoked=revoked,
         video=video_payload,
@@ -840,8 +1072,24 @@ def start_session(
         .first()
     )
     now = datetime.now(timezone.utc)
-    client_ip = request.client.host if request.client else None
+    client_ip = extract_client_ip(dict(request.headers), request.client.host if request.client else None)
+    country_code = resolve_country_code(client_ip)
+    _enforce_geofence_or_403(link, country_code)
     user_agent = request.headers.get("user-agent")
+
+    if getattr(link, "nda_required", False):
+        identity_key = _nda_identity_key(fingerprint=body.fingerprint, guest_email=body.guest_email)
+        accepted = (
+            db.query(NDAAcceptance)
+            .filter(
+                NDAAcceptance.review_link_id == link.id,
+                NDAAcceptance.identity_key == identity_key,
+                NDAAcceptance.nda_document_id == getattr(link, "nda_document_id", None),
+            )
+            .first()
+        )
+        if not accepted:
+            return PublicReviewAuthResponse(ok=False, error="NDA acceptance required")
 
     if session:
         session.view_count = (session.view_count or 0) + 1
@@ -860,11 +1108,13 @@ def start_session(
             guest_email=body.guest_email,
             guest_avatar_url=body.guest_avatar_url,
             ip_address=client_ip,
+            country_code=country_code,
             user_agent=user_agent,
             view_count=1,
         )
         db.add(session)
 
+    session.country_code = country_code
     db.commit()
     db.refresh(session)
 
@@ -873,15 +1123,129 @@ def start_session(
     if link.watermark_enabled:
         who = body.guest_name or body.guest_email or (client_ip or "guest")
         watermark = f"{who} • {now.strftime('%Y-%m-%d %H:%M UTC')}"
+    session.watermark_payload = {
+        "guest_name": body.guest_name,
+        "guest_email": body.guest_email,
+        "ip_address": client_ip,
+        "country_code": country_code,
+        "timestamp_utc": now.isoformat(),
+    }
+    forensic_fp = build_forensic_fingerprint(link, session, country_code)
+    forensic_asset = upsert_forensic_asset(
+        db,
+        link=link,
+        session=session,
+        fingerprint=forensic_fp,
+        playback_manifest_url=None,
+    )
+    if getattr(link, "watermark_mode", "visible_overlay") == "forensic":
+        queued = enqueue_review_forensic_package_job(forensic_asset.id)
+        if not queued:
+            api_base = _api_base(request)
+            forensic_asset.playback_manifest_url = build_review_media_url(
+                api_base=api_base,
+                token=link.token,
+                session_id=session.id,
+                purpose="playback",
+            )
+            forensic_asset.package_status = "ready"
+    db.flush()
+    log_security_audit_event(
+        db,
+        action="review_link.session_start",
+        resource_type="review_session",
+        resource_id=str(session.id),
+        actor_type="guest",
+        review_link_id=link.id,
+        session_id=session.id,
+        video_id=link.video_id,
+        ip_address=client_ip,
+        country_code=country_code,
+        user_agent=user_agent,
+        metadata={"forensic_asset_id": forensic_asset.id, "recording_detection_mode": getattr(link, "recording_detection_mode", "monitor")},
+    )
+    db.commit()
+
+    video_payload = _public_video_streaming(video, request, link.token, session.id) if video else None
+    if (
+        video_payload is not None
+        and getattr(link, "watermark_mode", "visible_overlay") == "forensic"
+        and forensic_asset.playback_manifest_url
+    ):
+        video_payload.file_path = forensic_asset.playback_manifest_url
 
     return PublicReviewAuthResponse(
         ok=True,
         session_id=session.id,
-        video=_public_video_streaming(video, request, link.token, session.id)
-        if video
-        else None,
+        video=video_payload,
         watermark_text=watermark,
+        forensic_fingerprint=forensic_fp,
     )
+
+
+@public_router.post("/{token}/nda/accept", response_model=PublicReviewNDAAcceptResponse)
+def accept_nda(
+    token: str,
+    body: PublicReviewNDAAcceptRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    if not getattr(link, "nda_required", False):
+        raise HTTPException(status_code=400, detail="NDA is not required for this link")
+    nda_doc_id = getattr(link, "nda_document_id", None)
+    if not nda_doc_id:
+        raise HTTPException(status_code=400, detail="NDA document is not configured")
+    doc = db.query(NDADocument).filter(NDADocument.id == nda_doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="NDA document not found")
+
+    identity_key = _nda_identity_key(fingerprint=body.fingerprint, guest_email=body.guest_email)
+    if not identity_key:
+        raise HTTPException(status_code=400, detail="Missing NDA identity")
+    client_ip = extract_client_ip(dict(request.headers), request.client.host if request.client else None)
+    user_agent = request.headers.get("user-agent")
+    row = (
+        db.query(NDAAcceptance)
+        .filter(
+            NDAAcceptance.review_link_id == link.id,
+            NDAAcceptance.identity_key == identity_key,
+            NDAAcceptance.nda_document_id == nda_doc_id,
+        )
+        .first()
+    )
+    if not row:
+        row = NDAAcceptance(
+            review_link_id=link.id,
+            nda_document_id=nda_doc_id,
+            identity_key=identity_key,
+            guest_name=body.guest_name,
+            guest_email=body.guest_email,
+            ip_address=client_ip,
+            user_agent=user_agent,
+        )
+        db.add(row)
+    else:
+        row.guest_name = body.guest_name or row.guest_name
+        row.guest_email = body.guest_email or row.guest_email
+        row.ip_address = client_ip or row.ip_address
+        row.user_agent = user_agent or row.user_agent
+    log_security_audit_event(
+        db,
+        action="review_link.nda_accept",
+        resource_type="nda_acceptance",
+        resource_id=identity_key,
+        actor_type="guest",
+        review_link_id=link.id,
+        video_id=link.video_id,
+        ip_address=client_ip,
+        user_agent=user_agent,
+        metadata={"nda_document_id": nda_doc_id, "fingerprint": body.fingerprint},
+    )
+    db.commit()
+    db.refresh(row)
+    return PublicReviewNDAAcceptResponse(ok=True, accepted_at=row.accepted_at)
 
 
 def _get_session_or_404(
@@ -914,6 +1278,8 @@ def record_event(
         session_id=session.id,
         event_type=body.event_type,
         position=max(0, int(body.position)),
+        seq=body.seq,
+        meta_info=getattr(body, "meta_info", None),
         range_end=(
             max(int(body.position), int(body.range_end))
             if body.range_end is not None
@@ -933,6 +1299,21 @@ def record_event(
     if body.event_type == "ended":
         session.reached_end = True
 
+    if body.event_type in {"download_attempt", "recording_signal", "permission_change"}:
+        log_security_audit_event(
+            db,
+            action=f"review_link.event.{body.event_type}",
+            resource_type="review_event",
+            resource_id=str(session.id),
+            actor_type="guest",
+            review_link_id=link.id,
+            session_id=session.id,
+            video_id=link.video_id,
+            ip_address=session.ip_address,
+            country_code=getattr(session, "country_code", None),
+            user_agent=session.user_agent,
+            metadata=getattr(body, "meta_info", None) or {},
+        )
     db.commit()
     return {"ok": True}
 
@@ -966,9 +1347,38 @@ def _public_comment_user(c: Comment) -> PublicReviewCommentUser:
     )
 
 
+def _public_anchor_state(db: Session, c: Comment) -> tuple[bool, str | None, int | None]:
+    seg_idx = getattr(c, "transcript_segment_index", None)
+    anchor_text = (getattr(c, "anchor_text", None) or "").strip().lower()
+    if seg_idx is None:
+        return True, None, None
+    tr = db.query(VideoTranscription).filter(VideoTranscription.video_id == c.video_id).first()
+    segments = (tr.segments if tr and isinstance(tr.segments, list) else []) if tr else []
+    if seg_idx < 0 or seg_idx >= len(segments):
+        if anchor_text:
+            for seg in segments:
+                seg_text = str((seg or {}).get("text", "")).lower()
+                if anchor_text in seg_text:
+                    return False, "anchor_remapped", int((seg or {}).get("start", 0))
+        return False, "segment_out_of_range", None
+    if not anchor_text:
+        return True, None, None
+    seg_text = str((segments[seg_idx] or {}).get("text", "")).lower()
+    if anchor_text not in seg_text:
+        for seg in segments:
+            candidate = str((seg or {}).get("text", "")).lower()
+            if anchor_text in candidate:
+                return False, "anchor_remapped", int((seg or {}).get("start", 0))
+        return False, "anchor_text_mismatch", None
+    return True, None, None
+
+
 def _serialize_public_comment(
-    c: Comment, replies: List[Comment] | None = None
+    c: Comment, replies: List[Comment] | None = None, db: Session | None = None
 ) -> PublicReviewCommentResponse:
+    anchor_ok, anchor_reason, anchor_remap_timecode = (True, None, None)
+    if db is not None:
+        anchor_ok, anchor_reason, anchor_remap_timecode = _public_anchor_state(db, c)
     return PublicReviewCommentResponse(
         id=c.id,
         video_id=c.video_id,
@@ -977,6 +1387,13 @@ def _serialize_public_comment(
         timecode=c.timecode,
         end_timecode=c.end_timecode,
         drawing_data=c.drawing_data,
+        transcript_segment_index=getattr(c, "transcript_segment_index", None),
+        word_start_index=getattr(c, "word_start_index", None),
+        word_end_index=getattr(c, "word_end_index", None),
+        anchor_text=getattr(c, "anchor_text", None),
+        transcript_anchor_resolved=anchor_ok,
+        transcript_anchor_reason=anchor_reason,
+        transcript_anchor_remap_timecode=anchor_remap_timecode,
         is_resolved=c.is_resolved,
         kind=getattr(c, "kind", None) or COMMENT_KIND_COMMENT,
         status=getattr(c, "status", None) or "open",
@@ -985,7 +1402,7 @@ def _serialize_public_comment(
         replies_count=len(replies) if replies is not None else (len(c.replies) if c.replies else 0),
         created_at=c.created_at,
         updated_at=c.updated_at,
-        replies=[_serialize_public_comment(r) for r in (replies or [])],
+        replies=[_serialize_public_comment(r, db=db) for r in (replies or [])],
     )
 
 
@@ -993,7 +1410,9 @@ def _public_comment_visible(c: Comment) -> bool:
     return is_client_visible(getattr(c, "visibility", None), c.is_private)
 
 
-def _build_public_comment_tree(rows: List[Comment]) -> List[PublicReviewCommentResponse]:
+def _build_public_comment_tree(
+    rows: List[Comment], db: Session
+) -> List[PublicReviewCommentResponse]:
     by_parent: dict[int | None, List[Comment]] = defaultdict(list)
     for c in rows:
         by_parent[c.parent_id].append(c)
@@ -1007,6 +1426,7 @@ def _build_public_comment_tree(rows: List[Comment]) -> List[PublicReviewCommentR
         for c in children:
             if not _public_comment_visible(c):
                 continue
+            anchor_ok, anchor_reason, anchor_remap_timecode = _public_anchor_state(db, c)
             nested = build(c.id)
             item = PublicReviewCommentResponse(
                 id=c.id,
@@ -1016,6 +1436,13 @@ def _build_public_comment_tree(rows: List[Comment]) -> List[PublicReviewCommentR
                 timecode=c.timecode,
                 end_timecode=c.end_timecode,
                 drawing_data=c.drawing_data,
+                transcript_segment_index=getattr(c, "transcript_segment_index", None),
+                word_start_index=getattr(c, "word_start_index", None),
+                word_end_index=getattr(c, "word_end_index", None),
+                anchor_text=getattr(c, "anchor_text", None),
+                transcript_anchor_resolved=anchor_ok,
+                transcript_anchor_reason=anchor_reason,
+                transcript_anchor_remap_timecode=anchor_remap_timecode,
                 is_resolved=c.is_resolved,
                 kind=getattr(c, "kind", None) or COMMENT_KIND_COMMENT,
                 status=getattr(c, "status", None) or "open",
@@ -1045,7 +1472,7 @@ def list_public_comments(token: str, db: Session = Depends(get_db)):
         .order_by(Comment.created_at.asc())
         .all()
     )
-    return _build_public_comment_tree(rows)
+    return _build_public_comment_tree(rows, db)
 
 
 @public_router.get(
@@ -1164,6 +1591,10 @@ async def create_public_comment(
         timecode=body.timecode,
         end_timecode=body.end_timecode,
         drawing_data=body.drawing_data,
+        transcript_segment_index=body.transcript_segment_index,
+        word_start_index=body.word_start_index,
+        word_end_index=body.word_end_index,
+        anchor_text=body.anchor_text,
         guest_name=session.guest_name or "Guest",
         guest_email=session.guest_email,
         guest_avatar_url=session.guest_avatar_url,
@@ -1234,6 +1665,7 @@ async def create_public_comment(
 
             db.commit()
             for notification in created_notifications:
+                enqueue_push_notification_job(notification.user_id, notification.id)
                 await notifications_ws_manager.send_to_user(
                     notification.user_id,
                     {
@@ -1260,7 +1692,7 @@ async def create_public_comment(
         .order_by(Comment.created_at.asc())
         .all()
     )
-    return _serialize_public_comment(comment, reply_rows)
+    return _serialize_public_comment(comment, reply_rows, db=db)
 
 
 @public_router.get("/{token}/comments/grouped", response_model=List[ReviewSceneGroup])
@@ -1458,6 +1890,22 @@ def approve(
     session.approved_at = (
         datetime.now(timezone.utc) if body.approved else None
     )
+    if body.approved:
+        video = db.query(Video).filter(Video.id == link.video_id).first()
+        project = db.query(Project).filter(Project.id == video.project_id).first() if video else None
+        owner_id = project.creator_id if project else None
+        if owner_id:
+            approval_notification = Notification(
+                user_id=owner_id,
+                type="approval",
+                project_id=project.id if project else None,
+                video_id=link.video_id,
+                comment_id=None,
+                read=False,
+            )
+            db.add(approval_notification)
+            db.flush()
+            enqueue_push_notification_job(owner_id, approval_notification.id)
     db.commit()
     return {"ok": True, "approved_at": session.approved_at}
 
@@ -1523,6 +1971,192 @@ def signoff(
         declaration_text=record.declaration_text,
         pdf_url=record.pdf_url,
     )
+
+
+@public_router.get(
+    "/{token}/room/messages", response_model=List[PublicReviewRoomMessageResponse]
+)
+def list_room_messages(token: str, db: Session = Depends(get_db)):
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    rows = (
+        db.query(ReviewRoomMessage, ReviewSession)
+        .join(ReviewSession, ReviewSession.id == ReviewRoomMessage.session_id)
+        .filter(ReviewRoomMessage.review_link_id == link.id)
+        .order_by(ReviewRoomMessage.created_at.asc())
+        .limit(500)
+        .all()
+    )
+    return [
+        PublicReviewRoomMessageResponse(
+            id=msg.id,
+            session_id=msg.session_id,
+            guest_name=sess.guest_name if sess else None,
+            guest_avatar_url=sess.guest_avatar_url if sess else None,
+            body=msg.body,
+            created_at=msg.created_at,
+        )
+        for msg, sess in rows
+    ]
+
+
+@public_router.post(
+    "/{token}/room/messages", response_model=PublicReviewRoomMessageResponse
+)
+def create_room_message(
+    token: str,
+    body: PublicReviewRoomMessageCreate,
+    db: Session = Depends(get_db),
+):
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    session = _get_session_or_404(link, body.session_id, db)
+    text = (body.body or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Message body required")
+    row = ReviewRoomMessage(
+        review_link_id=link.id,
+        session_id=session.id,
+        body=text[:5000],
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return PublicReviewRoomMessageResponse(
+        id=row.id,
+        session_id=session.id,
+        guest_name=session.guest_name,
+        guest_avatar_url=session.guest_avatar_url,
+        body=row.body,
+        created_at=row.created_at,
+    )
+
+
+@public_router.post(
+    "/{token}/recordings", response_model=PublicReviewRecordingResponse
+)
+def create_recording_session(
+    token: str,
+    body: PublicReviewRecordingCreate,
+    db: Session = Depends(get_db),
+):
+    if os.getenv("FEATURE_REVIEW_RECORDING", "1").strip() in ("0", "false", "False"):
+        raise HTTPException(status_code=404, detail="Recording is disabled")
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    session = _get_session_or_404(link, body.session_id, db)
+    row = ReviewRecordingSession(
+        review_link_id=link.id,
+        session_id=session.id,
+        consent_snapshot=body.consent_snapshot,
+        started_at=body.started_at,
+        ended_at=body.ended_at,
+        status="processing",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return PublicReviewRecordingResponse(
+        id=row.id,
+        session_id=row.session_id,
+        status=row.status,
+        file_url=row.file_url,
+        mime_type=row.mime_type,
+        bytes_size=row.bytes_size,
+        started_at=row.started_at,
+        ended_at=row.ended_at,
+        archived_at=row.archived_at,
+        deleted_at=row.deleted_at,
+        retention_days=row.retention_days,
+        created_at=row.created_at,
+    )
+
+
+@public_router.post(
+    "/{token}/recordings/{recording_id}/upload", response_model=PublicReviewRecordingResponse
+)
+def upload_recording_media(
+    token: str,
+    recording_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    if os.getenv("FEATURE_REVIEW_RECORDING", "1").strip() in ("0", "false", "False"):
+        raise HTTPException(status_code=404, detail="Recording is disabled")
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    row = (
+        db.query(ReviewRecordingSession)
+        .filter(
+            ReviewRecordingSession.id == recording_id,
+            ReviewRecordingSession.review_link_id == link.id,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    url = upload_file_to_cloudinary(file, resource_type="video")
+    row.file_url = url
+    row.storage_key = url
+    row.status = "ready"
+    row.mime_type = file.content_type
+    try:
+        data = file.file.read()
+        row.bytes_size = len(data)
+    except Exception:
+        row.bytes_size = row.bytes_size
+    db.commit()
+    db.refresh(row)
+    return PublicReviewRecordingResponse(
+        id=row.id,
+        session_id=row.session_id,
+        status=row.status,
+        file_url=row.file_url,
+        mime_type=row.mime_type,
+        bytes_size=row.bytes_size,
+        started_at=row.started_at,
+        ended_at=row.ended_at,
+        archived_at=row.archived_at,
+        deleted_at=row.deleted_at,
+        retention_days=row.retention_days,
+        created_at=row.created_at,
+    )
+
+
+@public_router.get(
+    "/{token}/recordings", response_model=List[PublicReviewRecordingResponse]
+)
+def list_recordings(token: str, db: Session = Depends(get_db)):
+    if os.getenv("FEATURE_REVIEW_RECORDING", "1").strip() in ("0", "false", "False"):
+        return []
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    rows = (
+        db.query(ReviewRecordingSession)
+        .filter(
+            ReviewRecordingSession.review_link_id == link.id,
+            ReviewRecordingSession.deleted_at.is_(None),
+        )
+        .order_by(ReviewRecordingSession.created_at.desc())
+        .all()
+    )
+    return [
+        PublicReviewRecordingResponse(
+            id=row.id,
+            session_id=row.session_id,
+            status=row.status,
+            file_url=row.file_url,
+            mime_type=row.mime_type,
+            bytes_size=row.bytes_size,
+            started_at=row.started_at,
+            ended_at=row.ended_at,
+            archived_at=row.archived_at,
+            deleted_at=row.deleted_at,
+            retention_days=row.retention_days,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
 
 
 @public_router.get("/{token}/signoff", response_model=List[PublicReviewSignoffResponse])

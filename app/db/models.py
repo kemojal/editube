@@ -17,15 +17,17 @@ class User(Base):
     avatar_url = Column(String, nullable=True)
     phone = Column(String, nullable=True)
     workflow_type = Column(String, nullable=True)  # "agency", "freelancer", "internal"
-    plan = Column(String, nullable=True)  # "basic", "pro", "elite"
+    plan = Column(String, nullable=True)  # "free", "pro", "scale", "enterprise"
     onboarding_completed = Column(Boolean, server_default="false", nullable=False)
     trial_start_date = Column(TIMESTAMP, nullable=True)
+    storage_grace_until = Column(TIMESTAMP, nullable=True)
     stripe_customer_id = Column(String, nullable=True)
     stripe_subscription_id = Column(String, nullable=True)
     subscription_status = Column(String, nullable=True)
     auth_provider = Column(String, nullable=True, server_default="local")
     google_sub = Column(String, unique=True, index=True, nullable=True)
     stripe_connect_account_id = Column(String, unique=True, index=True, nullable=True)
+    mfa_required = Column(Boolean, server_default="false", nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -103,7 +105,7 @@ class Subscription(Base):
     stripe_price_id = Column(String, nullable=True)
     customer_email = Column(String, nullable=True)  # snapshot from User at sync time
     status = Column(String, nullable=False)
-    plan = Column(String, nullable=True)  # basic | pro | elite (from metadata)
+    plan = Column(String, nullable=True)  # free | pro | scale | enterprise (from metadata)
     trial_start = Column(TIMESTAMP, nullable=True)
     current_period_start = Column(TIMESTAMP, nullable=True)
     current_period_end = Column(TIMESTAMP, nullable=True)
@@ -113,6 +115,46 @@ class Subscription(Base):
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
     user = relationship("User", back_populates="subscriptions")
+
+
+class StripeProduct(Base):
+    """Mirror of Stripe Product objects; kept in sync via webhooks or catalog sync."""
+
+    __tablename__ = "stripe_products"
+
+    id = Column(Integer, primary_key=True, index=True)
+    stripe_product_id = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, nullable=True)
+    description = Column(Text, nullable=True)
+    active = Column(Boolean, server_default="true", nullable=False)
+    metadata_json = Column("metadata", JSONB, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class StripePrice(Base):
+    """Mirror of Stripe Price objects; checkout resolves stripe_price_id from editube_plan + interval."""
+
+    __tablename__ = "stripe_prices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    stripe_price_id = Column(String, unique=True, index=True, nullable=False)
+    stripe_product_id = Column(
+        String,
+        ForeignKey("stripe_products.stripe_product_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    currency = Column(String, nullable=True)
+    unit_amount = Column(Integer, nullable=True)
+    nickname = Column(String, nullable=True)
+    recurring_interval = Column(String, nullable=True)  # month | year | null (one_time)
+    active = Column(Boolean, server_default="true", nullable=False)
+    metadata_json = Column("metadata", JSONB, nullable=True)
+    editube_plan = Column(String, nullable=True, index=True)
+    editube_interval = Column(String, nullable=True, index=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
 class Workspace(Base):
@@ -365,6 +407,7 @@ class Video(Base):
     thumbnail_url = Column(String, nullable=True)
     status = Column(String, server_default="in_progress", nullable=False)  # in_progress, in_review, approved, needs_changes
     duration = Column(Integer, nullable=True)  # duration in seconds
+    size_bytes = Column(Integer, server_default="0", nullable=False)
     uploader_id = Column(Integer, ForeignKey("users.id"))
     uploader = relationship("User")
     project = relationship("Project", back_populates="videos")
@@ -447,6 +490,10 @@ class Comment(Base):
     text = Column(Text)
     timecode = Column(Integer)
     end_timecode = Column(Integer, nullable=True)  # null means point comment, set means range comment
+    transcript_segment_index = Column(Integer, nullable=True)
+    word_start_index = Column(Integer, nullable=True)
+    word_end_index = Column(Integer, nullable=True)
+    anchor_text = Column(Text, nullable=True)
     drawing_data = Column(JSONB, nullable=True)  # FabricJS canvas objects drawn with the comment
     is_resolved = Column(Boolean, server_default="false", nullable=False)
     is_private = Column(Boolean, server_default="false", nullable=False)
@@ -466,6 +513,8 @@ class Comment(Base):
     review_link_id = Column(
         Integer, ForeignKey("review_links.id", ondelete="SET NULL"), nullable=True
     )
+    client_mutation_id = Column(String, nullable=True, index=True)
+    revision = Column(Integer, server_default="1", nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -476,6 +525,11 @@ class Comment(Base):
     replies = relationship("Comment", back_populates="parent", cascade="all, delete-orphan")
     likes = relationship("CommentLike", back_populates="comment", cascade="all, delete-orphan")
     review_link = relationship("ReviewLink")
+    attachments = relationship(
+        "CommentAttachment",
+        back_populates="comment",
+        cascade="all, delete-orphan",
+    )
 
 
 class ReviewLink(Base):
@@ -501,10 +555,18 @@ class ReviewLink(Base):
     )
     allow_comments = Column(Boolean, server_default="true", nullable=False)
     watermark_enabled = Column(Boolean, server_default="true", nullable=False)
+    watermark_mode = Column(String, server_default="visible_overlay", nullable=False)
     require_email = Column(Boolean, server_default="false", nullable=False)
+    nda_required = Column(Boolean, server_default="false", nullable=False)
+    nda_document_id = Column(Integer, ForeignKey("nda_documents.id", ondelete="SET NULL"), nullable=True)
+    geofence_mode = Column(String, server_default="off", nullable=False)
+    geo_allow_countries = Column(ARRAY(String), nullable=True)
+    geo_block_countries = Column(ARRAY(String), nullable=True)
+    recording_detection_mode = Column(String, server_default="monitor", nullable=False)
     version_group_id = Column(String, nullable=True, index=True)
     version_label = Column(String, nullable=True)
     revoked_at = Column(TIMESTAMP, nullable=True)
+    revocation_reason = Column(String, nullable=True)
     allow_export = Column(Boolean, server_default="false", nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(
@@ -549,6 +611,8 @@ class ReviewSession(Base):
     first_viewed_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     last_viewed_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     approved_at = Column(TIMESTAMP, nullable=True)
+    country_code = Column(String, nullable=True)
+    watermark_payload = Column(JSONB, nullable=True)
 
     review_link = relationship("ReviewLink", back_populates="sessions")
     events = relationship(
@@ -575,6 +639,8 @@ class ReviewEvent(Base):
     position = Column(Integer, nullable=False)  # seconds
     # For progress events: range end (exclusive); lets us build heatmaps cheaply
     range_end = Column(Integer, nullable=True)
+    seq = Column(Integer, nullable=True)
+    meta_info = Column(JSONB, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
     session = relationship("ReviewSession", back_populates="events")
@@ -636,6 +702,64 @@ class ReviewSignoff(Base):
     review_link = relationship("ReviewLink")
     session = relationship("ReviewSession", back_populates="signoffs")
 
+
+class ReviewRoomMessage(Base):
+    __tablename__ = "review_room_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    review_link_id = Column(
+        Integer,
+        ForeignKey("review_links.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    session_id = Column(
+        Integer,
+        ForeignKey("review_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    body = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    review_link = relationship("ReviewLink")
+    session = relationship("ReviewSession")
+
+
+class ReviewRecordingSession(Base):
+    __tablename__ = "review_recording_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    review_link_id = Column(
+        Integer,
+        ForeignKey("review_links.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    session_id = Column(
+        Integer,
+        ForeignKey("review_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    status = Column(String, server_default="processing", nullable=False)
+    file_url = Column(Text, nullable=True)
+    storage_key = Column(Text, nullable=True)
+    mime_type = Column(String, nullable=True)
+    bytes_size = Column(Integer, nullable=True)
+    consent_snapshot = Column(JSONB, nullable=True)
+    started_at = Column(TIMESTAMP, nullable=True)
+    ended_at = Column(TIMESTAMP, nullable=True)
+    archived_at = Column(TIMESTAMP, nullable=True)
+    deleted_at = Column(TIMESTAMP, nullable=True)
+    retention_days = Column(Integer, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    review_link = relationship("ReviewLink")
+    session = relationship("ReviewSession")
+    creator = relationship("User")
 
 class ReviewWorkflowTemplate(Base):
     """Ordered approval stages for a project (Editor → Producer → …)."""
@@ -816,6 +940,10 @@ class Notification(Base):
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
     video_id = Column(Integer, ForeignKey("videos.id"), nullable=True)
     comment_id = Column(Integer, ForeignKey("comments.id"), nullable=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=True)
+    workspace_invite_id = Column(Integer, ForeignKey("workspace_invites.id", ondelete="SET NULL"), nullable=True)
+    invite_token = Column(String, nullable=True)
+    message = Column(Text, nullable=True)
     read = Column(Boolean, default=False)
     created_at = Column(TIMESTAMP, server_default=func.now())
 
@@ -823,6 +951,44 @@ class Notification(Base):
     project = relationship("Project")
     video = relationship("Video")
     comment = relationship("Comment")
+    workspace = relationship("Workspace")
+    workspace_invite = relationship("WorkspaceInvite")
+
+
+class DevicePushToken(Base):
+    __tablename__ = "device_push_tokens"
+    __table_args__ = (
+        UniqueConstraint("token", name="uq_device_push_token_token"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token = Column(String, nullable=False, index=True)
+    platform = Column(String, nullable=False)  # ios | android | web
+    device_name = Column(String, nullable=True)
+    app_version = Column(String, nullable=True)
+    enabled = Column(Boolean, server_default="true", nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User")
+
+
+class CommentAttachment(Base):
+    __tablename__ = "comment_attachments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    comment_id = Column(Integer, ForeignKey("comments.id", ondelete="CASCADE"), nullable=False, index=True)
+    attachment_type = Column(String, nullable=False, index=True)  # voice_note | image | file
+    file_url = Column(Text, nullable=False)
+    mime_type = Column(String, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    bytes_size = Column(Integer, nullable=True)
+    waveform = Column(JSONB, nullable=True)
+    transcript = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    comment = relationship("Comment", back_populates="attachments")
 
 class ActivityFeed(Base):
     __tablename__ = "activity_feed"
@@ -835,6 +1001,163 @@ class ActivityFeed(Base):
 
     project = relationship("Project")
     user = relationship("User")
+
+
+class SecurityAuditLog(Base):
+    __tablename__ = "security_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="SET NULL"), nullable=True, index=True)
+    review_link_id = Column(Integer, ForeignKey("review_links.id", ondelete="SET NULL"), nullable=True, index=True)
+    session_id = Column(Integer, ForeignKey("review_sessions.id", ondelete="SET NULL"), nullable=True, index=True)
+    actor_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    actor_type = Column(String, nullable=False, server_default="system")
+    action = Column(String, nullable=False, index=True)
+    resource_type = Column(String, nullable=False)
+    resource_id = Column(String, nullable=True)
+    outcome = Column(String, nullable=False, server_default="success")
+    ip_address = Column(String, nullable=True)
+    country_code = Column(String, nullable=True, index=True)
+    user_agent = Column(Text, nullable=True)
+    meta_info = Column("metadata", JSONB, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False, index=True)
+
+    workspace = relationship("Workspace")
+    project = relationship("Project")
+    video = relationship("Video")
+    review_link = relationship("ReviewLink")
+    session = relationship("ReviewSession")
+    actor = relationship("User")
+
+
+class NDADocument(Base):
+    __tablename__ = "nda_documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    version = Column(String, nullable=False)
+    body_markdown = Column(Text, nullable=False)
+    content_sha256 = Column(String, nullable=False, index=True)
+    is_active = Column(Boolean, server_default="true", nullable=False)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    workspace = relationship("Workspace")
+    created_by = relationship("User")
+
+
+class NDAAcceptance(Base):
+    __tablename__ = "nda_acceptances"
+    __table_args__ = (
+        UniqueConstraint(
+            "review_link_id",
+            "identity_key",
+            "nda_document_id",
+            name="uq_nda_acceptance_link_identity_doc",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    review_link_id = Column(Integer, ForeignKey("review_links.id", ondelete="CASCADE"), nullable=False, index=True)
+    nda_document_id = Column(Integer, ForeignKey("nda_documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    identity_key = Column(String, nullable=False, index=True)
+    guest_name = Column(String, nullable=True)
+    guest_email = Column(String, nullable=True, index=True)
+    ip_address = Column(String, nullable=True)
+    user_agent = Column(Text, nullable=True)
+    accepted_at = Column(TIMESTAMP, server_default=func.now(), nullable=False, index=True)
+
+    review_link = relationship("ReviewLink")
+    nda_document = relationship("NDADocument")
+
+
+class UserMFAMethod(Base):
+    __tablename__ = "user_mfa_methods"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    method_type = Column(String, nullable=False, server_default="totp")
+    label = Column(String, nullable=True)
+    secret_encrypted = Column(Text, nullable=False)
+    is_primary = Column(Boolean, server_default="true", nullable=False)
+    verified_at = Column(TIMESTAMP, nullable=True)
+    disabled_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User")
+
+
+class UserMFARecoveryCode(Base):
+    __tablename__ = "user_mfa_recovery_codes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    code_hash = Column(String, nullable=False, unique=True, index=True)
+    used_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    user = relationship("User")
+
+
+class WorkspaceSSOProvider(Base):
+    __tablename__ = "workspace_sso_providers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    provider = Column(String, nullable=False)  # google | okta | azure_ad
+    issuer = Column(String, nullable=False)
+    client_id = Column(String, nullable=False)
+    client_secret_encrypted = Column(Text, nullable=False)
+    authorization_endpoint = Column(String, nullable=True)
+    token_endpoint = Column(String, nullable=True)
+    userinfo_endpoint = Column(String, nullable=True)
+    jwks_uri = Column(String, nullable=True)
+    scope = Column(String, server_default="openid profile email", nullable=False)
+    domain_hint = Column(String, nullable=True, index=True)
+    enabled = Column(Boolean, server_default="true", nullable=False)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    workspace = relationship("Workspace")
+    created_by = relationship("User")
+
+
+class WorkspaceAuthPolicy(Base):
+    __tablename__ = "workspace_auth_policies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    enforce_sso = Column(Boolean, server_default="false", nullable=False)
+    allowed_login_methods = Column(ARRAY(String), nullable=True)
+    mfa_required = Column(Boolean, server_default="false", nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    workspace = relationship("Workspace")
+
+
+class ReviewForensicAsset(Base):
+    __tablename__ = "review_forensic_assets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    review_link_id = Column(Integer, ForeignKey("review_links.id", ondelete="CASCADE"), nullable=False, index=True)
+    review_session_id = Column(Integer, ForeignKey("review_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    watermark_fingerprint = Column(String, nullable=False, index=True)
+    playback_manifest_url = Column(Text, nullable=True)
+    package_status = Column(String, nullable=False, server_default="pending")
+    package_metadata = Column(JSONB, nullable=True)
+    expires_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    review_link = relationship("ReviewLink")
+    review_session = relationship("ReviewSession")
 
 
 # =====================================================================
@@ -951,6 +1274,135 @@ class ThumbnailVariant(Base):
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
     video = relationship("Video")
+
+
+class DeliveryExport(Base):
+    __tablename__ = "delivery_exports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    profile_key = Column(String, nullable=False, index=True)  # 4k_master | yt_1080p | social_720p
+    status = Column(String, server_default="pending", nullable=False)  # pending|queued|processing|completed|failed
+    output_path = Column(String, nullable=True)
+    mime_type = Column(String, nullable=True)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    video = relationship("Video")
+    creator = relationship("User")
+
+
+class DeliveryPackage(Base):
+    __tablename__ = "delivery_packages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String, server_default="pending", nullable=False)  # pending|queued|processing|completed|failed
+    requested_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    approved_version_id = Column(Integer, ForeignKey("videos.id", ondelete="SET NULL"), nullable=True)
+    zip_url = Column(String, nullable=True)
+    zip_size_bytes = Column(Integer, nullable=True)
+    checksum_sha256 = Column(String, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    completed_at = Column(TIMESTAMP, nullable=True)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    project = relationship("Project")
+    video = relationship("Video", foreign_keys=[video_id])
+    approved_version = relationship("Video", foreign_keys=[approved_version_id])
+    requested_by = relationship("User")
+    assets = relationship("DeliveryAsset", back_populates="delivery_package", cascade="all, delete-orphan")
+    links = relationship("DeliveryLink", back_populates="delivery_package", cascade="all, delete-orphan")
+
+
+class DeliveryAsset(Base):
+    __tablename__ = "delivery_assets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    delivery_package_id = Column(
+        Integer, ForeignKey("delivery_packages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    asset_type = Column(String, nullable=False, index=True)
+    file_url = Column(String, nullable=False)
+    filename = Column(String, nullable=False)
+    mime_type = Column(String, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    checksum_sha256 = Column(String, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    delivery_package = relationship("DeliveryPackage", back_populates="assets")
+    receipts = relationship("DeliveryReceipt", back_populates="delivery_asset", cascade="all, delete-orphan")
+
+
+class DeliveryLink(Base):
+    __tablename__ = "delivery_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    delivery_package_id = Column(
+        Integer, ForeignKey("delivery_packages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token = Column(String, unique=True, index=True, nullable=False)
+    expires_at = Column(TIMESTAMP, nullable=False, index=True)
+    renew_count = Column(Integer, server_default="0", nullable=False)
+    is_revoked = Column(Boolean, server_default="false", nullable=False)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    last_renewed_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    delivery_package = relationship("DeliveryPackage", back_populates="links")
+    created_by = relationship("User")
+    receipts = relationship("DeliveryReceipt", back_populates="delivery_link", cascade="all, delete-orphan")
+
+
+class DeliveryReceipt(Base):
+    __tablename__ = "delivery_receipts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    delivery_link_id = Column(Integer, ForeignKey("delivery_links.id", ondelete="CASCADE"), nullable=False, index=True)
+    delivery_asset_id = Column(Integer, ForeignKey("delivery_assets.id", ondelete="CASCADE"), nullable=True, index=True)
+    downloaded_at = Column(TIMESTAMP, server_default=func.now(), nullable=False, index=True)
+    session_id = Column(String, nullable=True)
+    guest_name = Column(String, nullable=True)
+    guest_email = Column(String, nullable=True)
+    ip_address = Column(String, nullable=True)
+    user_agent = Column(Text, nullable=True)
+
+    delivery_link = relationship("DeliveryLink", back_populates="receipts")
+    delivery_asset = relationship("DeliveryAsset", back_populates="receipts")
+
+
+class ProjectRetentionPolicy(Base):
+    __tablename__ = "project_retention_policies"
+
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True)
+    auto_archive_enabled = Column(Boolean, server_default="true", nullable=False)
+    archive_after_days = Column(Integer, server_default="90", nullable=False)
+    cold_tier_provider = Column(String, nullable=True)
+    last_archive_run_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    project = relationship("Project")
+
+
+class ProjectArchiveState(Base):
+    __tablename__ = "project_archive_states"
+
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True)
+    state = Column(String, server_default="active", nullable=False)  # active|archived|cold_storage
+    archived_at = Column(TIMESTAMP, nullable=True)
+    cold_moved_at = Column(TIMESTAMP, nullable=True)
+    storage_location_meta = Column(JSONB, nullable=True)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    project = relationship("Project")
 
 
 class UserYoutubeConnection(Base):

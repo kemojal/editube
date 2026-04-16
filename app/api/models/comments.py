@@ -8,6 +8,10 @@ class CommentBase(BaseModel):
     timecode: int
     end_timecode: Optional[int] = None
     drawing_data: Optional[Any] = None  # serialized FabricJS objects or pin data
+    transcript_segment_index: Optional[int] = None
+    word_start_index: Optional[int] = None
+    word_end_index: Optional[int] = None
+    anchor_text: Optional[str] = None
 
 
 class CommentCreate(CommentBase):
@@ -16,6 +20,7 @@ class CommentCreate(CommentBase):
     visibility: Optional[Literal["public", "team", "author_only"]] = None
     due_at: Optional[datetime] = None
     kind: Literal["comment", "change_request"] = "comment"
+    client_mutation_id: Optional[str] = None
 
 
 class CommentUpdate(BaseModel):
@@ -27,6 +32,7 @@ class CommentUpdate(BaseModel):
     assignee_user_id: Optional[int] = None
     due_at: Optional[datetime] = None
     visibility: Optional[Literal["public", "team", "author_only"]] = None
+    revision: Optional[int] = None
 
 
 class CommentUserResponse(BaseModel):
@@ -47,6 +53,13 @@ class CommentResponse(BaseModel):
     timecode: int
     end_timecode: int | None = None
     drawing_data: Any | None = None
+    transcript_segment_index: int | None = None
+    word_start_index: int | None = None
+    word_end_index: int | None = None
+    anchor_text: str | None = None
+    transcript_anchor_resolved: bool = True
+    transcript_anchor_reason: str | None = None
+    transcript_anchor_remap_timecode: int | None = None
     is_resolved: bool = False
     is_private: bool = False
     visibility: str = "public"
@@ -59,6 +72,9 @@ class CommentResponse(BaseModel):
     guest_email: Optional[str] = None
     guest_avatar_url: Optional[str] = None
     review_link_id: Optional[int] = None
+    client_mutation_id: Optional[str] = None
+    revision: int = 1
+    attachments: List[dict] = Field(default_factory=list)
     likes_count: int = 0
     liked_by_me: bool = False
     replies_count: int = 0
@@ -82,3 +98,35 @@ class CommentBulkAction(BaseModel):
     only_kind: Optional[Literal["comment", "change_request"]] = None
     only_top_level: bool = True
     max_rows: int = Field(default=500, le=2000)
+
+
+class CommentAttachmentCreate(BaseModel):
+    attachment_type: Literal["voice_note", "image", "file"] = "voice_note"
+    file_url: str
+    mime_type: Optional[str] = None
+    duration_ms: Optional[int] = None
+    bytes_size: Optional[int] = None
+    waveform: Optional[Any] = None
+    transcript: Optional[str] = None
+
+
+class CommentSyncOperation(BaseModel):
+    operation_id: str
+    action: Literal["create", "update", "delete"]
+    comment_id: Optional[int] = None
+    payload: Optional[dict] = None
+
+
+class CommentSyncRequest(BaseModel):
+    operations: List[CommentSyncOperation] = Field(default_factory=list)
+
+
+class CommentSyncResult(BaseModel):
+    operation_id: str
+    ok: bool
+    comment_id: Optional[int] = None
+    error: Optional[str] = None
+
+
+class CommentSyncResponse(BaseModel):
+    results: List[CommentSyncResult] = Field(default_factory=list)

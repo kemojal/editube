@@ -79,6 +79,28 @@ class AspectExportResponse(BaseModel):
         orm_mode = True
 
 
+class DeliveryExportCreate(BaseModel):
+    profile_keys: Optional[List[str]] = None
+
+
+class DeliveryExportResponse(BaseModel):
+    id: int
+    video_id: int
+    profile_key: str
+    status: str
+    output_path: Optional[str] = None
+    mime_type: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    size_bytes: Optional[int] = None
+    error_message: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
 # --- Chapters ---
 
 class ChapterCreate(BaseModel):

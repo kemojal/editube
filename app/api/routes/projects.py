@@ -23,10 +23,13 @@ from app.db.models import (
     ProjectCollaborator,
     ProjectTemplate,
     ProjectWorkspaceAssetLink,
+    ProjectArchiveState,
+    ProjectRetentionPolicy,
     User,
     WorkspaceAsset,
     WorkspaceMember,
 )
+from app.jobs.queue import enqueue_archive_cold_storage_job
 from app.services.project_access import (
     assert_write_project_content,
     can_access_project,
@@ -217,6 +220,141 @@ def delete_project(project_id: int, db: Session = Depends(get_db), current_user:
     db.delete(db_project)
     db.commit()
     return {"message": "Project deleted successfully"}
+
+
+@router.post("/{project_id}/restore-from-cold")
+def restore_from_cold(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    db_project = db.query(Project).filter(Project.id == project_id).first()
+    if not db_project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not can_manage_project_settings(db, current_user.id, db_project):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    state = db.query(ProjectArchiveState).filter(ProjectArchiveState.project_id == project_id).first()
+    if not state:
+        state = ProjectArchiveState(project_id=project_id, state="active")
+    state.state = "active"
+    state.archived_at = None
+    state.cold_moved_at = None
+    db.add(state)
+    db.commit()
+    return {"ok": True, "state": state.state}
+
+
+@router.post("/{project_id}/archive-to-cold")
+def archive_to_cold(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    db_project = db.query(Project).filter(Project.id == project_id).first()
+    if not db_project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not can_manage_project_settings(db, current_user.id, db_project):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    policy = db.query(ProjectRetentionPolicy).filter(ProjectRetentionPolicy.project_id == project_id).first()
+    if not policy:
+        policy = ProjectRetentionPolicy(project_id=project_id, auto_archive_enabled=True, archive_after_days=90)
+    db.add(policy)
+    db.commit()
+    queued = enqueue_archive_cold_storage_job(project_id)
+    return {"ok": True, "enqueued": queued}
+
+
+@router.get("/{project_id}/retention-state")
+def get_retention_state(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    db_project = db.query(Project).filter(Project.id == project_id).first()
+    if not db_project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not can_manage_project_settings(db, current_user.id, db_project):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    policy = db.query(ProjectRetentionPolicy).filter(ProjectRetentionPolicy.project_id == project_id).first()
+    if not policy:
+        policy = ProjectRetentionPolicy(
+            project_id=project_id,
+            auto_archive_enabled=True,
+            archive_after_days=90,
+        )
+        db.add(policy)
+        db.commit()
+        db.refresh(policy)
+
+    state = db.query(ProjectArchiveState).filter(ProjectArchiveState.project_id == project_id).first()
+    if not state:
+        state = ProjectArchiveState(project_id=project_id, state="active")
+        db.add(state)
+        db.commit()
+        db.refresh(state)
+
+    return {
+        "ok": True,
+        "policy": {
+            "project_id": policy.project_id,
+            "auto_archive_enabled": bool(policy.auto_archive_enabled),
+            "archive_after_days": int(policy.archive_after_days or 90),
+            "cold_tier_provider": policy.cold_tier_provider,
+            "last_archive_run_at": policy.last_archive_run_at,
+        },
+        "state": {
+            "project_id": state.project_id,
+            "state": state.state,
+            "archived_at": state.archived_at,
+            "cold_moved_at": state.cold_moved_at,
+            "storage_location_meta": state.storage_location_meta,
+        },
+    }
+
+
+@router.patch("/{project_id}/retention-policy")
+def update_retention_policy(
+    project_id: int,
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    db_project = db.query(Project).filter(Project.id == project_id).first()
+    if not db_project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not can_manage_project_settings(db, current_user.id, db_project):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    policy = db.query(ProjectRetentionPolicy).filter(ProjectRetentionPolicy.project_id == project_id).first()
+    if not policy:
+        policy = ProjectRetentionPolicy(project_id=project_id, auto_archive_enabled=True, archive_after_days=90)
+
+    if "auto_archive_enabled" in body:
+        policy.auto_archive_enabled = bool(body.get("auto_archive_enabled"))
+    if "archive_after_days" in body:
+        try:
+            days = int(body.get("archive_after_days"))
+            policy.archive_after_days = max(1, min(3650, days))
+        except Exception:
+            raise HTTPException(status_code=400, detail="archive_after_days must be an integer")
+    if "cold_tier_provider" in body:
+        v = body.get("cold_tier_provider")
+        policy.cold_tier_provider = str(v).strip() if v else None
+
+    db.add(policy)
+    db.commit()
+    db.refresh(policy)
+    return {
+        "ok": True,
+        "policy": {
+            "project_id": policy.project_id,
+            "auto_archive_enabled": bool(policy.auto_archive_enabled),
+            "archive_after_days": int(policy.archive_after_days or 90),
+            "cold_tier_provider": policy.cold_tier_provider,
+            "last_archive_run_at": policy.last_archive_run_at,
+        },
+    }
 
 
 @router.post("/{project_id}/collaborators")

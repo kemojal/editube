@@ -1,15 +1,17 @@
 import json
 import os
+from datetime import datetime, timedelta
 from urllib import parse, request
 from urllib.error import HTTPError, URLError
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
+from jose import ExpiredSignatureError, JWTError, jwt
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.db.models import User
-from app.utils.security import create_access_token, create_refresh_token, create_user_session
+from app.utils.security import ALGORITHM, SECRET_KEY, create_access_token, create_refresh_token, create_user_session
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -23,7 +25,7 @@ def _require_google_env() -> tuple[str, str]:
 
 
 def _frontend_callback_url() -> str:
-    return os.getenv("FRONTEND_GOOGLE_CALLBACK_URL", "http://localhost:3000/google/callback")
+    return os.getenv("FRONTEND_GOOGLE_CALLBACK_URL", "http://localhost:3002/google/callback")
 
 
 def _build_backend_callback_url(req: Request) -> str:
@@ -63,10 +65,47 @@ def _google_userinfo(access_token: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _safe_internal_next(raw: str | None) -> str | None:
+    """Same-origin path only (open-redirect safe), aligned with frontend getSafeInternalRedirect."""
+    if raw is None:
+        return None
+    s = raw.strip()
+    if not s.startswith("/") or s.startswith("//") or "://" in s:
+        return None
+    return s
+
+
+def _encode_google_oauth_state(next_path: str | None) -> str:
+    payload: dict = {
+        "purpose": "google_oauth_next",
+        "exp": datetime.utcnow() + timedelta(minutes=15),
+    }
+    if next_path:
+        payload["next"] = next_path
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def _decode_google_oauth_state(state: str | None) -> str | None:
+    if not state or not state.strip():
+        return None
+    try:
+        payload = jwt.decode(state.strip(), SECRET_KEY, algorithms=[ALGORITHM])
+    except (JWTError, ExpiredSignatureError):
+        return None
+    if payload.get("purpose") != "google_oauth_next":
+        return None
+    return _safe_internal_next(payload.get("next"))
+
+
 @router.get("/google/login")
-def google_oauth_login(req: Request):
+def google_oauth_login(
+    req: Request,
+    next_path: str | None = Query(default=None, alias="next"),
+):
     client_id, _ = _require_google_env()
     redirect_uri = _build_backend_callback_url(req)
+    safe_next = _safe_internal_next(next_path)
+    oauth_state = _encode_google_oauth_state(safe_next)
     params = parse.urlencode(
         {
             "client_id": client_id,
@@ -75,14 +114,22 @@ def google_oauth_login(req: Request):
             "scope": "openid email profile",
             "access_type": "offline",
             "prompt": "consent",
+            "state": oauth_state,
         }
     )
     return RedirectResponse(url=f"https://accounts.google.com/o/oauth2/v2/auth?{params}", status_code=302)
 
 
 @router.get("/google/callback", name="google_oauth_callback")
-def google_oauth_callback(req: Request, code: str | None = None, error: str | None = None, db: Session = Depends(get_db)):
+def google_oauth_callback(
+    req: Request,
+    code: str | None = None,
+    error: str | None = None,
+    state: str | None = None,
+    db: Session = Depends(get_db),
+):
     frontend_callback = _frontend_callback_url()
+    return_next = _decode_google_oauth_state(state)
 
     if error:
         redirect_url = f"{frontend_callback}?error={parse.quote(error)}"
@@ -145,4 +192,6 @@ def google_oauth_callback(req: Request, code: str | None = None, error: str | No
         f"&refresh_token={parse.quote(app_refresh_token)}"
         f"&onboarding_completed={'true' if user.onboarding_completed else 'false'}"
     )
+    if return_next:
+        redirect_url += f"&next={parse.quote(return_next, safe='')}"
     return RedirectResponse(url=redirect_url, status_code=302)

@@ -98,7 +98,14 @@ def send_invitation_email(db: Session, email: str, project_id: int) -> bool:
 def _plan_label(plan: str | None) -> str:
     if not plan:
         return "your plan"
-    return {"basic": "Basic", "pro": "Pro", "elite": "Elite"}.get(plan.lower(), plan)
+    return {
+        "free": "Free",
+        "pro": "Pro",
+        "scale": "Scale",
+        "enterprise": "Enterprise",
+        "basic": "Free",
+        "elite": "Scale",
+    }.get(plan.lower(), plan)
 
 
 def send_subscription_welcome_email(user: User, sub: stripe.Subscription) -> None:
@@ -137,7 +144,13 @@ def _subscription_plan_from_stripe(sub: stripe.Subscription) -> str | None:
         return None
     try:
         p = meta.get("plan") if hasattr(meta, "get") else None
-        return p if p in ("basic", "pro", "elite") else None
+        if p in ("free", "pro", "scale", "enterprise"):
+            return p
+        if p == "basic":
+            return "free"
+        if p == "elite":
+            return "scale"
+        return None
     except (AttributeError, TypeError):
         return None
 

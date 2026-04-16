@@ -4,13 +4,23 @@ import os
 from collections import defaultdict
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 from typing import List
 
 from app.db.database import get_db
-from app.db.models import Project, Video, Comment, CommentLike, Notification, User, UserSettings
+from app.db.models import (
+    Project,
+    Video,
+    Comment,
+    CommentLike,
+    CommentAttachment,
+    Notification,
+    User,
+    UserSettings,
+    VideoTranscription,
+)
 from app.services.project_access import (
     assert_write_project_content,
     can_access_project,
@@ -28,10 +38,14 @@ from app.api.models.comments import (
     CommentCreate,
     CommentUpdate,
     CommentResponse,
+    CommentAttachmentCreate,
+    CommentSyncRequest,
+    CommentSyncResponse,
+    CommentSyncResult,
     CommentWithRepliesResponse,
     CommentUserResponse,
 )
-from app.jobs.queue import enqueue_mention_email_job
+from app.jobs.queue import enqueue_mention_email_job, enqueue_push_notification_job
 from app.services.mentions import extract_mention_handles, resolve_mentioned_users
 from app.services.comment_export import export_comments
 from app.services.comment_workflow import (
@@ -131,12 +145,13 @@ def _assignee_payload(comment: Comment) -> dict | None:
     ).dict()
 
 
-def _comment_response(comment: Comment, current_user_id: int) -> dict:
+def _comment_response(comment: Comment, current_user_id: int, db: Session) -> dict:
     likes_count = len(comment.likes) if comment.likes else 0
     liked_by_me = any(like.user_id == current_user_id for like in (comment.likes or []))
     replies_count = len(comment.replies) if comment.replies else 0
     kind = getattr(comment, "kind", None) or COMMENT_KIND_COMMENT
     status = getattr(comment, "status", None) or "open"
+    anchor_ok, anchor_reason, anchor_remap_timecode = _anchor_state(db, comment)
     return {
         "id": comment.id,
         "video_id": comment.video_id,
@@ -145,6 +160,13 @@ def _comment_response(comment: Comment, current_user_id: int) -> dict:
         "timecode": comment.timecode,
         "end_timecode": comment.end_timecode,
         "drawing_data": comment.drawing_data,
+        "transcript_segment_index": getattr(comment, "transcript_segment_index", None),
+        "word_start_index": getattr(comment, "word_start_index", None),
+        "word_end_index": getattr(comment, "word_end_index", None),
+        "anchor_text": getattr(comment, "anchor_text", None),
+        "transcript_anchor_resolved": anchor_ok,
+        "transcript_anchor_reason": anchor_reason,
+        "transcript_anchor_remap_timecode": anchor_remap_timecode,
         "is_resolved": comment.is_resolved,
         "is_private": comment.is_private,
         "visibility": normalize_visibility(getattr(comment, "visibility", None), comment.is_private),
@@ -157,12 +179,54 @@ def _comment_response(comment: Comment, current_user_id: int) -> dict:
         "guest_email": comment.guest_email,
         "guest_avatar_url": getattr(comment, "guest_avatar_url", None),
         "review_link_id": comment.review_link_id,
+        "client_mutation_id": getattr(comment, "client_mutation_id", None),
+        "revision": getattr(comment, "revision", 1) or 1,
+        "attachments": [
+            {
+                "id": att.id,
+                "attachment_type": att.attachment_type,
+                "file_url": att.file_url,
+                "mime_type": att.mime_type,
+                "duration_ms": att.duration_ms,
+                "bytes_size": att.bytes_size,
+                "waveform": att.waveform,
+                "transcript": att.transcript,
+                "created_at": att.created_at,
+            }
+            for att in (getattr(comment, "attachments", None) or [])
+        ],
         "likes_count": likes_count,
         "liked_by_me": liked_by_me,
         "replies_count": replies_count,
         "created_at": comment.created_at,
         "updated_at": comment.updated_at,
     }
+
+
+def _anchor_state(db: Session, comment: Comment) -> tuple[bool, str | None, int | None]:
+    seg_idx = getattr(comment, "transcript_segment_index", None)
+    anchor_text = (getattr(comment, "anchor_text", None) or "").strip().lower()
+    if seg_idx is None:
+        return True, None, None
+    tr = db.query(VideoTranscription).filter(VideoTranscription.video_id == comment.video_id).first()
+    segments = (tr.segments if tr and isinstance(tr.segments, list) else []) if tr else []
+    if seg_idx < 0 or seg_idx >= len(segments):
+        if anchor_text:
+            for seg in segments:
+                seg_text = str((seg or {}).get("text", "")).lower()
+                if anchor_text in seg_text:
+                    return False, "anchor_remapped", int((seg or {}).get("start", 0))
+        return False, "segment_out_of_range", None
+    if not anchor_text:
+        return True, None, None
+    seg_text = str((segments[seg_idx] or {}).get("text", "")).lower()
+    if anchor_text not in seg_text:
+        for seg in segments:
+            candidate = str((seg or {}).get("text", "")).lower()
+            if anchor_text in candidate:
+                return False, "anchor_remapped", int((seg or {}).get("start", 0))
+        return False, "anchor_text_mismatch", None
+    return True, None, None
 
 
 def _build_comment_tree(
@@ -190,7 +254,7 @@ def _build_comment_tree(
                 ok = _reply_visible_to_viewer(c, parent_comment, current_user.id, is_team)
             if not ok:
                 continue
-            item = _comment_response(c, current_user.id)
+            item = _comment_response(c, current_user.id, db)
             nested = build(c.id, c)
             item["replies"] = nested
             item["replies_count"] = len(nested)
@@ -205,6 +269,7 @@ async def add_comment(
     project_id: int,
     video_id: int,
     comment: CommentCreate,
+    x_idempotency_key: str | None = Header(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -225,6 +290,26 @@ async def add_comment(
     if v in (COMMENT_VISIBILITY_TEAM, COMMENT_VISIBILITY_AUTHOR_ONLY) and not is_team:
         raise HTTPException(status_code=403, detail="Only team members can create internal comments")
     is_priv = v != COMMENT_VISIBILITY_PUBLIC
+    mutation_key = (comment.client_mutation_id or x_idempotency_key or "").strip() or None
+    if mutation_key:
+        existing = (
+            db.query(Comment)
+            .filter(
+                Comment.video_id == video_id,
+                Comment.user_id == current_user.id,
+                Comment.client_mutation_id == mutation_key,
+            )
+            .options(
+                joinedload(Comment.likes),
+                joinedload(Comment.user),
+                joinedload(Comment.assignee),
+                joinedload(Comment.attachments),
+            )
+            .first()
+        )
+        if existing:
+            return _comment_response(existing, current_user.id, db)
+
     db_comment = Comment(
         video_id=video_id,
         user_id=current_user.id,
@@ -233,11 +318,16 @@ async def add_comment(
         timecode=comment.timecode,
         end_timecode=comment.end_timecode,
         drawing_data=comment.drawing_data,
+        transcript_segment_index=comment.transcript_segment_index,
+        word_start_index=comment.word_start_index,
+        word_end_index=comment.word_end_index,
+        anchor_text=comment.anchor_text,
         is_private=is_priv,
         visibility=v,
         due_at=getattr(comment, "due_at", None),
         kind=kind,
         status="open",
+        client_mutation_id=mutation_key,
     )
     sync_is_resolved_from_status(db_comment)
     db.add(db_comment)
@@ -246,7 +336,7 @@ async def add_comment(
     db_comment = (
         db.query(Comment)
         .filter(Comment.id == db_comment.id)
-        .options(joinedload(Comment.likes), joinedload(Comment.user), joinedload(Comment.assignee))
+        .options(joinedload(Comment.likes), joinedload(Comment.user), joinedload(Comment.assignee), joinedload(Comment.attachments))
         .first()
     )
 
@@ -294,6 +384,7 @@ async def add_comment(
 
         db.commit()
         for notification in created_notifications:
+            enqueue_push_notification_job(notification.user_id, notification.id)
             await notifications_ws_manager.send_to_user(
                 notification.user_id,
                 {
@@ -310,7 +401,7 @@ async def add_comment(
                 },
             )
 
-    return _comment_response(db_comment, current_user.id)
+    return _comment_response(db_comment, current_user.id, db)
 
 
 @router.get("/export")
@@ -325,7 +416,7 @@ def export_comments_file(
     rows = (
         db.query(Comment)
         .filter(Comment.video_id == video_id)
-        .options(joinedload(Comment.user), joinedload(Comment.assignee))
+        .options(joinedload(Comment.user), joinedload(Comment.assignee), joinedload(Comment.attachments))
         .order_by(Comment.timecode.asc(), Comment.created_at.asc())
         .all()
     )
@@ -376,7 +467,7 @@ def update_comment(
     db_comment = (
         db.query(Comment)
         .filter(Comment.id == comment_id, Comment.video_id == video_id)
-        .options(joinedload(Comment.likes), joinedload(Comment.user), joinedload(Comment.assignee))
+        .options(joinedload(Comment.likes), joinedload(Comment.user), joinedload(Comment.assignee), joinedload(Comment.attachments))
         .first()
     )
     if not db_comment or not _comment_or_reply_visible(
@@ -390,6 +481,10 @@ def update_comment(
         raise HTTPException(status_code=403, detail="Not authorized to edit this comment")
 
     update_data = comment.dict(exclude_unset=True)
+    if "revision" in update_data and update_data["revision"] is not None:
+        current_revision = int(getattr(db_comment, "revision", 1) or 1)
+        if int(update_data["revision"]) != current_revision:
+            raise HTTPException(status_code=409, detail="Comment revision mismatch")
     if "text" in update_data:
         db_comment.text = update_data["text"]
 
@@ -422,15 +517,17 @@ def update_comment(
         db_comment.visibility = nv
         db_comment.is_private = nv != COMMENT_VISIBILITY_PUBLIC
 
+    db_comment.revision = int(getattr(db_comment, "revision", 1) or 1) + 1
+
     db.commit()
     db.refresh(db_comment)
     db_comment = (
         db.query(Comment)
         .filter(Comment.id == db_comment.id)
-        .options(joinedload(Comment.likes), joinedload(Comment.user), joinedload(Comment.assignee))
+        .options(joinedload(Comment.likes), joinedload(Comment.user), joinedload(Comment.assignee), joinedload(Comment.attachments))
         .first()
     )
-    return _comment_response(db_comment, current_user.id)
+    return _comment_response(db_comment, current_user.id, db)
 
 
 @router.post("/bulk", response_model=dict)
@@ -469,6 +566,139 @@ def bulk_comment_action(
     return {"ok": True, "updated": updated}
 
 
+@router.post("/{comment_id}/attachments", response_model=CommentResponse)
+def add_comment_attachment(
+    project_id: int,
+    video_id: int,
+    comment_id: int,
+    body: CommentAttachmentCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _, db_project = _check_video_access(project_id, video_id, db, current_user)
+    db_comment = (
+        db.query(Comment)
+        .filter(Comment.id == comment_id, Comment.video_id == video_id)
+        .options(joinedload(Comment.likes), joinedload(Comment.user), joinedload(Comment.assignee), joinedload(Comment.attachments))
+        .first()
+    )
+    if not db_comment or not _comment_or_reply_visible(db, db_project, db_comment, current_user.id):
+        raise HTTPException(status_code=404, detail="Comment not found")
+    if db_comment.user_id != current_user.id and not _is_team_member(db, db_project, current_user.id):
+        raise HTTPException(status_code=403, detail="Not authorized to attach files to this comment")
+
+    db.add(
+        CommentAttachment(
+            comment_id=db_comment.id,
+            attachment_type=body.attachment_type,
+            file_url=body.file_url,
+            mime_type=body.mime_type,
+            duration_ms=body.duration_ms,
+            bytes_size=body.bytes_size,
+            waveform=body.waveform,
+            transcript=body.transcript,
+        )
+    )
+    db_comment.revision = int(getattr(db_comment, "revision", 1) or 1) + 1
+    db.commit()
+    db.refresh(db_comment)
+    db_comment = (
+        db.query(Comment)
+        .filter(Comment.id == db_comment.id)
+        .options(joinedload(Comment.likes), joinedload(Comment.user), joinedload(Comment.assignee), joinedload(Comment.attachments))
+        .first()
+    )
+    return _comment_response(db_comment, current_user.id, db)
+
+
+@router.post("/sync", response_model=CommentSyncResponse)
+def sync_comments(
+    project_id: int,
+    video_id: int,
+    body: CommentSyncRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(project_id, video_id, db, current_user)
+    results: list[CommentSyncResult] = []
+    for op in body.operations:
+        try:
+            payload = op.payload or {}
+            if op.action == "create":
+                create_body = CommentCreate(**payload)
+                mutation_key = (create_body.client_mutation_id or op.operation_id).strip()
+                existing = (
+                    db.query(Comment)
+                    .filter(
+                        Comment.video_id == video_id,
+                        Comment.user_id == current_user.id,
+                        Comment.client_mutation_id == mutation_key,
+                    )
+                    .first()
+                )
+                if existing:
+                    results.append(CommentSyncResult(operation_id=op.operation_id, ok=True, comment_id=existing.id))
+                    continue
+                c = Comment(
+                    video_id=video_id,
+                    user_id=current_user.id,
+                    parent_id=create_body.parent_id,
+                    text=create_body.text,
+                    timecode=create_body.timecode,
+                    end_timecode=create_body.end_timecode,
+                    drawing_data=create_body.drawing_data,
+                    transcript_segment_index=create_body.transcript_segment_index,
+                    word_start_index=create_body.word_start_index,
+                    word_end_index=create_body.word_end_index,
+                    anchor_text=create_body.anchor_text,
+                    client_mutation_id=mutation_key,
+                )
+                db.add(c)
+                db.flush()
+                results.append(CommentSyncResult(operation_id=op.operation_id, ok=True, comment_id=c.id))
+            elif op.action == "update":
+                if not op.comment_id:
+                    raise HTTPException(status_code=400, detail="comment_id is required for update")
+                c = db.query(Comment).filter(Comment.id == op.comment_id, Comment.video_id == video_id).first()
+                if not c:
+                    raise HTTPException(status_code=404, detail="Comment not found")
+                if c.user_id != current_user.id:
+                    raise HTTPException(status_code=403, detail="Not authorized")
+                upd = CommentUpdate(**payload).dict(exclude_unset=True)
+                if "revision" in upd and upd["revision"] is not None and int(upd["revision"]) != int(getattr(c, "revision", 1) or 1):
+                    raise HTTPException(status_code=409, detail="Comment revision mismatch")
+                for k, v in upd.items():
+                    if hasattr(c, k) and k != "revision":
+                        setattr(c, k, v)
+                c.revision = int(getattr(c, "revision", 1) or 1) + 1
+                results.append(CommentSyncResult(operation_id=op.operation_id, ok=True, comment_id=c.id))
+            elif op.action == "delete":
+                if not op.comment_id:
+                    raise HTTPException(status_code=400, detail="comment_id is required for delete")
+                c = db.query(Comment).filter(Comment.id == op.comment_id, Comment.video_id == video_id).first()
+                if not c:
+                    results.append(CommentSyncResult(operation_id=op.operation_id, ok=True, comment_id=op.comment_id))
+                    continue
+                if c.user_id != current_user.id:
+                    raise HTTPException(status_code=403, detail="Not authorized")
+                db.delete(c)
+                results.append(CommentSyncResult(operation_id=op.operation_id, ok=True, comment_id=op.comment_id))
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported action: {op.action}")
+        except HTTPException as exc:
+            results.append(
+                CommentSyncResult(
+                    operation_id=op.operation_id,
+                    ok=False,
+                    comment_id=op.comment_id,
+                    error=exc.detail if isinstance(exc.detail, str) else "sync_error",
+                )
+            )
+
+    db.commit()
+    return CommentSyncResponse(results=results)
+
+
 @router.delete("/{comment_id}")
 def delete_comment(
     project_id: int,
@@ -504,7 +734,7 @@ def toggle_like(
     db_comment = (
         db.query(Comment)
         .filter(Comment.id == comment_id, Comment.video_id == video_id)
-        .options(joinedload(Comment.likes), joinedload(Comment.user), joinedload(Comment.assignee))
+        .options(joinedload(Comment.likes), joinedload(Comment.user), joinedload(Comment.assignee), joinedload(Comment.attachments))
         .first()
     )
     if not db_comment or not _comment_or_reply_visible(
@@ -524,4 +754,4 @@ def toggle_like(
 
     db.commit()
     db.refresh(db_comment)
-    return _comment_response(db_comment, current_user.id)
+    return _comment_response(db_comment, current_user.id, db)

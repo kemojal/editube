@@ -20,6 +20,8 @@ from sqlalchemy.orm import Session
 from app.api.models.creator import (
     AspectExportCreate,
     AspectExportResponse,
+    DeliveryExportCreate,
+    DeliveryExportResponse,
     BrandDealCreate,
     BrandDealResponse,
     BrandDealUpdate,
@@ -39,6 +41,7 @@ from app.api.models.creator import (
 from app.db.database import get_db
 from app.db.models import (
     BrandDeal,
+    DeliveryExport,
     Project,
     ThumbnailVariant,
     User,
@@ -49,7 +52,11 @@ from app.db.models import (
     VideoEndScreen,
     VideoPublication,
 )
-from app.jobs.queue import enqueue_aspect_export_job, enqueue_chapter_synthesis_job
+from app.jobs.queue import (
+    enqueue_aspect_export_job,
+    enqueue_chapter_synthesis_job,
+    enqueue_multi_format_export_job,
+)
 from app.publishers import get_publisher
 from app.services.youtube_chapters import youtube_description_block
 from app.utils.security import get_current_user
@@ -231,6 +238,58 @@ def delete_aspect_export(export_id: int, db: Session = Depends(get_db), current_
     db.delete(exp)
     db.commit()
     return {"ok": True}
+
+
+@router.get("/videos/{video_id}/delivery-exports", response_model=List[DeliveryExportResponse])
+def list_delivery_exports(video_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    _get_owned_video(db, video_id, current_user)
+    return (
+        db.query(DeliveryExport)
+        .filter(DeliveryExport.video_id == video_id)
+        .order_by(DeliveryExport.created_at.desc())
+        .all()
+    )
+
+
+@router.post("/videos/{video_id}/delivery-exports", response_model=List[DeliveryExportResponse])
+def create_delivery_exports(
+    video_id: int,
+    body: DeliveryExportCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _get_owned_video(db, video_id, current_user)
+    keys = body.profile_keys or ["4k_master", "yt_1080p", "social_720p"]
+    rows: list[DeliveryExport] = []
+    for key in keys:
+        row = DeliveryExport(
+            video_id=video_id,
+            profile_key=key,
+            status="queued",
+            created_by=current_user.id,
+        )
+        db.add(row)
+        rows.append(row)
+    db.commit()
+    for row in rows:
+        db.refresh(row)
+        if not enqueue_multi_format_export_job(row.id):
+            row.status = "failed"
+            row.error_message = "Could not queue export (set REDIS_URL and run an RQ worker)."
+            db.add(row)
+    db.commit()
+    for row in rows:
+        db.refresh(row)
+    return rows
+
+
+@router.get("/delivery-exports/{export_id}", response_model=DeliveryExportResponse)
+def get_delivery_export(export_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    row = db.query(DeliveryExport).filter(DeliveryExport.id == export_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Delivery export not found")
+    _get_owned_video(db, row.video_id, current_user)
+    return row
 
 
 # =====================================================================

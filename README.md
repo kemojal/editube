@@ -17,6 +17,8 @@ From this directory (`editube/`):
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt   # pip = p-i-p, not "ip"
+# Optional ML/AI stack (transcription + whisperx + google-genai):
+# .venv/bin/python -m pip install -r requirements-ml.txt
 .venv/bin/python -m pip install email-validator
 .venv/bin/python -m alembic upgrade head
 .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
@@ -71,7 +73,8 @@ Transactional email (invitations, subscription welcome/cancel) uses SMTP when co
 
 ### Dependencies
 
-Declared in `requirements.txt`: `httpx`, `redis`, `rq`, `faster-whisper` (plus transitive deps such as `ctranslate2`).
+Core API/worker deps are in `requirements.txt` (`httpx`, `redis`, `rq`, etc.).  
+Transcription/ML extras are in `requirements-ml.txt` (`faster-whisper`, `whisperx`, `google-genai`) because they can conflict or require platform-specific wheels on newer Python versions.
 
 ### Transcription-related env vars
 

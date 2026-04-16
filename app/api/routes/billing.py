@@ -3,12 +3,22 @@ import os
 from datetime import datetime, timezone
 
 import stripe
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.db.models import Subscription, User
+from app.db.models import StripePrice, Subscription, User, WorkspaceMember
+from app.services.pricing import PLAN_SPECS, get_plan_spec, normalize_plan_key
+from app.services.storage_policy import workspace_usage_payload
+from app.services.stripe_catalog_sync import (
+    mark_stripe_price_inactive,
+    mark_stripe_product_inactive,
+    resolve_checkout_price_id,
+    sync_catalog_from_stripe_api,
+    upsert_stripe_price_from_object,
+    upsert_stripe_product_from_object,
+)
 from app.utils.email import send_subscription_canceled_email, send_subscription_welcome_email
 from app.utils.security import get_current_user
 
@@ -26,21 +36,49 @@ def _frontend_base() -> str:
     return base
 
 
-def _price_id(plan: str, interval: str) -> str:
-    """interval: month | year (maps to MONTHLY / ANNUAL env suffixes)."""
-    if plan not in ("basic", "pro", "elite"):
+def _legacy_env_price_id(plan: str, interval: str) -> str:
+    """interval: month | year (maps to MONTHLY / ANNUAL env suffixes). Legacy env fallback only."""
+    canonical = normalize_plan_key(plan)
+    if canonical not in ("pro", "scale"):
         raise HTTPException(status_code=400, detail="Invalid plan")
     if interval not in ("month", "year"):
         raise HTTPException(status_code=400, detail="Invalid interval; use month or year")
     suffix = "MONTHLY" if interval == "month" else "ANNUAL"
-    key = f"STRIPE_PRICE_{plan.upper()}_{suffix}"
-    price_id = os.getenv(key)
+    preferred_key = f"STRIPE_PRICE_{canonical.upper()}_{suffix}"
+    legacy_source = "BASIC" if canonical == "free" else "ELITE" if canonical == "scale" else canonical.upper()
+    legacy_key = f"STRIPE_PRICE_{legacy_source}_{suffix}"
+    price_id = os.getenv(preferred_key) or os.getenv(legacy_key)
     if not price_id:
         raise HTTPException(
             status_code=500,
-            detail=f"Missing Stripe price configuration: {key}",
+            detail=f"Missing Stripe price configuration: {preferred_key}",
         )
     return price_id
+
+
+def _resolve_price_id_for_checkout(db: Session, plan: str, interval: str) -> str:
+    """Resolve Stripe Price id from DB catalog; optional env fallback when STRIPE_PRICE_FALLBACK is set."""
+    canonical = normalize_plan_key(plan)
+    if canonical not in ("pro", "scale"):
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    if interval not in ("month", "year"):
+        raise HTTPException(status_code=400, detail="Invalid interval; use month or year")
+
+    rid = resolve_checkout_price_id(db, plan=canonical, interval=interval)
+    if rid:
+        return rid
+
+    if os.getenv("STRIPE_PRICE_FALLBACK", "").lower() in ("1", "true", "yes"):
+        return _legacy_env_price_id(canonical, interval)
+
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Stripe catalog is not synced yet. Configure Price metadata (editube_plan, editube_interval) "
+            "or lookup_key, send product/price webhooks, or run POST /billing/sync-catalog with "
+            "STRIPE_CATALOG_SYNC_SECRET. Temporary fallback: set STRIPE_PRICE_FALLBACK=1 and legacy STRIPE_PRICE_* env vars."
+        ),
+    )
 
 
 class CheckoutBody(BaseModel):
@@ -57,7 +95,10 @@ def create_checkout_session(
     if not stripe.api_key:
         raise HTTPException(status_code=500, detail="Stripe is not configured")
 
-    price_id = _price_id(body.plan, body.interval)
+    canonical_plan = normalize_plan_key(body.plan)
+    if canonical_plan not in ("pro", "scale"):
+        raise HTTPException(status_code=400, detail="Only Pro or Scale can be purchased online")
+    price_id = _resolve_price_id_for_checkout(db, canonical_plan, body.interval)
 
     if not current_user.stripe_customer_id:
         customer = stripe.Customer.create(
@@ -81,17 +122,98 @@ def create_checkout_session(
         client_reference_id=str(current_user.id),
         metadata={
             "user_id": str(current_user.id),
-            "plan": body.plan,
+            "plan": canonical_plan,
         },
         subscription_data={
             "metadata": {
                 "user_id": str(current_user.id),
-                "plan": body.plan,
+                "plan": canonical_plan,
             },
             "trial_period_days": TRIAL_DAYS,
         },
     )
     return {"url": session.url}
+
+
+@router.get("/catalog")
+def get_billing_catalog(db: Session = Depends(get_db)):
+    rows = (
+        db.query(StripePrice)
+        .filter(
+            StripePrice.active.is_(True),
+            StripePrice.editube_plan.isnot(None),
+            StripePrice.editube_interval.isnot(None),
+        )
+        .all()
+    )
+    by_plan_interval: dict[tuple[str, str], StripePrice] = {}
+    for r in rows:
+        if r.editube_plan and r.editube_interval:
+            by_plan_interval[(r.editube_plan, r.editube_interval)] = r
+
+    plans_out = []
+    for key, spec in PLAN_SPECS.items():
+        entry = {
+            "key": key,
+            "label": spec.label,
+            "seat_cap": spec.seat_cap,
+            "included_storage_bytes": spec.included_storage_bytes,
+            "storage_addon_tb_price_usd": spec.storage_addon_tb_price_usd,
+            "grace_days": spec.grace_days,
+            "stripe_prices": {},
+        }
+        for interval in ("month", "year"):
+            row = by_plan_interval.get((key, interval))
+            if row:
+                entry["stripe_prices"][interval] = {
+                    "stripe_price_id": row.stripe_price_id,
+                    "unit_amount": row.unit_amount,
+                    "currency": row.currency,
+                }
+        plans_out.append(entry)
+
+    currency = "USD"
+    for r in rows:
+        if r.currency:
+            currency = (r.currency or "").upper()
+            break
+
+    return {"currency": currency, "plans": plans_out}
+
+
+@router.post("/sync-catalog")
+def sync_billing_catalog(
+    db: Session = Depends(get_db),
+    x_stripe_catalog_sync_secret: str | None = Header(default=None, alias="X-Stripe-Catalog-Sync-Secret"),
+):
+    """Bootstrap or repair local Stripe catalog from the Stripe API (requires env STRIPE_CATALOG_SYNC_SECRET)."""
+    if not stripe.api_key:
+        raise HTTPException(status_code=500, detail="Stripe is not configured")
+    expected = os.getenv("STRIPE_CATALOG_SYNC_SECRET")
+    if not expected or (x_stripe_catalog_sync_secret or "") != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing catalog sync secret")
+
+    n = sync_catalog_from_stripe_api(db)
+    return {"synced_prices": n}
+
+
+@router.get("/usage")
+def get_billing_usage(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    member = (
+        db.query(WorkspaceMember)
+        .filter(WorkspaceMember.user_id == current_user.id)
+        .order_by(WorkspaceMember.id.asc())
+        .first()
+    )
+    if not member:
+        raise HTTPException(status_code=404, detail="Workspace not found for current user")
+    payload = workspace_usage_payload(db, user=current_user, workspace_id=member.workspace_id)
+    plan = get_plan_spec(current_user.plan)
+    payload["plan_label"] = plan.label
+    return payload
 
 
 @router.post("/portal")
@@ -135,6 +257,17 @@ def _price_id_from_subscription(sub: stripe.Subscription) -> str | None:
         return None
 
 
+def _plan_from_catalog_price_id(db: Session, sub: stripe.Subscription) -> str | None:
+    price_id = _price_id_from_subscription(sub)
+    if not price_id:
+        return None
+    row = db.query(StripePrice).filter(StripePrice.stripe_price_id == price_id).first()
+    if not row or not row.editube_plan:
+        return None
+    normalized = normalize_plan_key(row.editube_plan)
+    return normalized if normalized in ("free", "pro", "scale", "enterprise") else None
+
+
 def _subscription_metadata_plan(sub: stripe.Subscription) -> str | None:
     meta = getattr(sub, "metadata", None)
     if not meta:
@@ -143,7 +276,8 @@ def _subscription_metadata_plan(sub: stripe.Subscription) -> str | None:
         p = meta.get("plan") if hasattr(meta, "get") else meta["plan"]
     except (KeyError, TypeError, AttributeError):
         return None
-    return p if p in ("basic", "pro", "elite") else None
+    normalized = normalize_plan_key(p if isinstance(p, str) else None)
+    return normalized if normalized in ("free", "pro", "scale", "enterprise") else None
 
 
 def _upsert_subscription_row(
@@ -152,8 +286,10 @@ def _upsert_subscription_row(
     sub: stripe.Subscription,
     plan_hint: str | None,
 ) -> None:
-    plan = plan_hint if plan_hint in ("basic", "pro", "elite") else None
+    normalized_hint = normalize_plan_key(plan_hint)
+    plan = normalized_hint if normalized_hint in ("free", "pro", "scale", "enterprise") else None
     plan = plan or _subscription_metadata_plan(sub)
+    plan = plan or _plan_from_catalog_price_id(db, sub)
 
     cust = sub.customer
     if cust is not None and not isinstance(cust, str):
@@ -192,8 +328,12 @@ def _sync_user_from_subscription(
     plan_hint: str | None,
 ) -> None:
     meta = subscription.metadata or {}
-    plan = plan_hint or meta.get("plan")
-    if plan and plan in ("basic", "pro", "elite"):
+    plan = normalize_plan_key(plan_hint or meta.get("plan"))
+    if plan not in ("pro", "scale"):
+        from_catalog = _plan_from_catalog_price_id(db, subscription)
+        if from_catalog in ("pro", "scale"):
+            plan = from_catalog
+    if plan in ("pro", "scale"):
         user.plan = plan
 
     user.stripe_subscription_id = subscription.id
@@ -314,6 +454,46 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
                 send_subscription_canceled_email(cancel_to, cancel_name, cancel_plan)
             except Exception:
                 logger.exception("Cancellation email failed for sid=%s", sid)
+        return {"received": True}
+
+    if etype in ("product.created", "product.updated"):
+        try:
+            upsert_stripe_product_from_object(db, data)
+            db.commit()
+        except Exception:
+            logger.exception("Stripe catalog product upsert failed for event=%s", etype)
+            db.rollback()
+        return {"received": True}
+
+    if etype == "product.deleted":
+        pid = data.get("id")
+        if pid:
+            try:
+                mark_stripe_product_inactive(db, str(pid))
+                db.commit()
+            except Exception:
+                logger.exception("Stripe catalog product delete failed")
+                db.rollback()
+        return {"received": True}
+
+    if etype in ("price.created", "price.updated"):
+        try:
+            upsert_stripe_price_from_object(db, data)
+            db.commit()
+        except Exception:
+            logger.exception("Stripe catalog price upsert failed for event=%s", etype)
+            db.rollback()
+        return {"received": True}
+
+    if etype == "price.deleted":
+        pid = data.get("id")
+        if pid:
+            try:
+                mark_stripe_price_inactive(db, str(pid))
+                db.commit()
+            except Exception:
+                logger.exception("Stripe catalog price delete failed")
+                db.rollback()
         return {"received": True}
 
     return {"received": True}

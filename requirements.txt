@@ -7,9 +7,9 @@ psycopg2-binary>=2.9.9
 python-jose
 python-multipart
 alembic
-passlib
+passlib>=1.7.4
 cloudinary
-bcrypt
+bcrypt>=4.0.1,<5
 python-dotenv
 python-multipart
 stripe>=10.0.0
@@ -21,6 +21,3 @@ google-auth-httplib2>=0.2.0
 redis>=5.0.0
 rq>=1.16.0
 reportlab>=4.0.0
-faster-whisper>=1.0.0
-google-genai
-whisperx

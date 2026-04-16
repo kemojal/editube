@@ -1,11 +1,23 @@
-from fastapi import APIRouter, Depends, HTTPException, File, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query
+from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
+from datetime import datetime
+import os
+from urllib.parse import quote as url_quote
 
 from ..models.users import User as UserSchema, UserCreate, UserUpdate, UserRegisterSchema, UserLoginSchema, OnboardingProfileUpdate, OnboardingWorkflowUpdate, OnboardingPlanUpdate, UserSettingsResponse, UserSettingsUpdate
 from ...db.database import get_db
-from app.db.models import User, UserSettings
+from app.db.models import (
+    User,
+    UserSettings,
+    UserMFAMethod,
+    UserMFARecoveryCode,
+    WorkspaceSSOProvider,
+    WorkspaceMember,
+    WorkspaceAuthPolicy,
+)
 from app.api.models.users import UserResponse
 from ...utils.security import (
     get_password_hash,
@@ -20,6 +32,23 @@ from ...utils.security import (
     revoke_user_session,
 )
 from app.utils.cloudinary import upload_file_to_cloudinary
+from app.services.mfa_totp import (
+    generate_recovery_codes,
+    generate_totp_secret,
+    hash_recovery_codes,
+    verify_recovery_code,
+    verify_totp_code,
+)
+from app.services.security_audit import log_security_audit_event
+from app.services.oidc_sso import (
+    build_oidc_authorize_url,
+    build_signed_sso_state,
+    verify_signed_sso_state,
+    exchange_oidc_code,
+    fetch_oidc_userinfo,
+    validate_oidc_claims,
+)
+from app.services.pricing import normalize_plan_key
 
 router = APIRouter(
     prefix="/users",
@@ -119,6 +148,37 @@ def login_user(user_credentials: UserLoginSchema, db: Session = Depends(get_db))
     if not verify_password(user_credentials.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
+    mfa_method = (
+        db.query(UserMFAMethod)
+        .filter(
+            UserMFAMethod.user_id == user.id,
+            UserMFAMethod.disabled_at.is_(None),
+            UserMFAMethod.verified_at.isnot(None),
+        )
+        .first()
+    )
+    settings = get_or_create_user_settings(db, user.id)
+    if user.mfa_required or bool(getattr(settings, "two_factor", False)):
+        if not mfa_method:
+            raise HTTPException(status_code=400, detail="Two-factor is required but not configured")
+        challenge_token = create_access_token(
+            data={
+                "user_id": user.id,
+                "onboarding_completed": user.onboarding_completed,
+                "mfa_pending": True,
+            }
+        )
+        log_security_audit_event(
+            db,
+            action="auth.login.primary_passed_mfa_required",
+            resource_type="user",
+            resource_id=str(user.id),
+            actor_user_id=user.id,
+            actor_type="user",
+        )
+        db.commit()
+        return {"mfa_required": True, "challenge_token": challenge_token}
+
     session_id = create_user_session(db, user.id)
     access_token = create_access_token(
         data={
@@ -128,6 +188,145 @@ def login_user(user_credentials: UserLoginSchema, db: Session = Depends(get_db))
         }
     )
     refresh_token = create_refresh_token(data={"user_id": user.id, "sid": session_id})
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "refresh_token": refresh_token,
+        "onboarding_completed": user.onboarding_completed,
+    }
+
+
+@router.post("/mfa/enroll")
+def enroll_mfa(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    secret = generate_totp_secret()
+    method = (
+        db.query(UserMFAMethod)
+        .filter(UserMFAMethod.user_id == current_user.id, UserMFAMethod.disabled_at.is_(None))
+        .first()
+    )
+    if method:
+        method.secret_encrypted = secret
+        method.verified_at = None
+    else:
+        method = UserMFAMethod(user_id=current_user.id, method_type="totp", secret_encrypted=secret)
+        db.add(method)
+    raw_codes = generate_recovery_codes(10)
+    db.query(UserMFARecoveryCode).filter(UserMFARecoveryCode.user_id == current_user.id).delete(synchronize_session=False)
+    for hashed in hash_recovery_codes(raw_codes):
+        db.add(UserMFARecoveryCode(user_id=current_user.id, code_hash=hashed))
+    otpauth_url = (
+        f"otpauth://totp/Editube:{current_user.email}"
+        f"?secret={secret}&issuer=Editube&algorithm=SHA1&digits=6&period=30"
+    )
+    log_security_audit_event(
+        db,
+        action="auth.mfa.enroll_started",
+        resource_type="user",
+        resource_id=str(current_user.id),
+        actor_user_id=current_user.id,
+        actor_type="user",
+    )
+    db.commit()
+    return {"secret": secret, "otpauth_url": otpauth_url, "backup_codes": raw_codes}
+
+
+@router.post("/mfa/verify")
+def verify_mfa_setup(
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    code = (body.get("code") or "").strip()
+    method = (
+        db.query(UserMFAMethod)
+        .filter(UserMFAMethod.user_id == current_user.id, UserMFAMethod.disabled_at.is_(None))
+        .first()
+    )
+    if not method:
+        raise HTTPException(status_code=404, detail="No MFA method pending verification")
+    if not verify_totp_code(method.secret_encrypted, code):
+        raise HTTPException(status_code=400, detail="Invalid TOTP code")
+    method.verified_at = method.verified_at or datetime.utcnow()
+    current_user.mfa_required = True
+    settings = get_or_create_user_settings(db, current_user.id)
+    settings.two_factor = True
+    log_security_audit_event(
+        db,
+        action="auth.mfa.enabled",
+        resource_type="user",
+        resource_id=str(current_user.id),
+        actor_user_id=current_user.id,
+        actor_type="user",
+    )
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/mfa/challenge")
+def complete_mfa_challenge(body: dict, db: Session = Depends(get_db)):
+    challenge_token = body.get("challenge_token")
+    if not challenge_token:
+        raise HTTPException(status_code=400, detail="Missing challenge token")
+    payload = decode_access_token_payload(challenge_token)
+    if not payload.get("mfa_pending"):
+        raise HTTPException(status_code=400, detail="Invalid MFA challenge token")
+    user_id = int(payload.get("user_id"))
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    method = (
+        db.query(UserMFAMethod)
+        .filter(
+            UserMFAMethod.user_id == user.id,
+            UserMFAMethod.disabled_at.is_(None),
+            UserMFAMethod.verified_at.isnot(None),
+        )
+        .first()
+    )
+    if not method:
+        raise HTTPException(status_code=400, detail="No verified MFA method")
+    code = (body.get("code") or "").strip()
+    recovery_code = (body.get("recovery_code") or "").strip()
+    verified = False
+    if code:
+        verified = verify_totp_code(method.secret_encrypted, code)
+    elif recovery_code:
+        hashed_codes = [
+            row.code_hash
+            for row in db.query(UserMFARecoveryCode)
+            .filter(UserMFARecoveryCode.user_id == user.id, UserMFARecoveryCode.used_at.is_(None))
+            .all()
+        ]
+        matched_hash = verify_recovery_code(recovery_code, hashed_codes)
+        if matched_hash:
+            row = (
+                db.query(UserMFARecoveryCode)
+                .filter(UserMFARecoveryCode.user_id == user.id, UserMFARecoveryCode.code_hash == matched_hash)
+                .first()
+            )
+            if row:
+                row.used_at = datetime.utcnow()
+            verified = True
+    if not verified:
+        raise HTTPException(status_code=401, detail="Invalid MFA code")
+
+    session_id = create_user_session(db, user.id)
+    access_token = create_access_token(
+        data={"user_id": user.id, "onboarding_completed": user.onboarding_completed, "sid": session_id}
+    )
+    refresh_token = create_refresh_token(data={"user_id": user.id, "sid": session_id})
+    log_security_audit_event(
+        db,
+        action="auth.mfa.challenge_passed",
+        resource_type="user",
+        resource_id=str(user.id),
+        actor_user_id=user.id,
+        actor_type="user",
+    )
+    db.commit()
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -298,12 +497,275 @@ def onboarding_update_plan(
     current_user: User = Depends(get_current_user),
 ):
     """Persist selected plan before Checkout. Onboarding completes after Stripe webhook."""
-    if data.plan not in ("basic", "pro", "elite"):
+    normalized = normalize_plan_key(data.plan)
+    if normalized not in ("free", "pro", "scale", "enterprise"):
         raise HTTPException(status_code=400, detail="Invalid plan")
-    current_user.plan = data.plan
+    current_user.plan = normalized
     db.commit()
     db.refresh(current_user)
     return current_user
+
+
+@router.post("/onboarding/complete-free", response_model=UserResponse)
+def onboarding_complete_free(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    current_user.plan = "free"
+    current_user.onboarding_completed = True
+    if current_user.trial_start_date is None:
+        current_user.trial_start_date = datetime.utcnow()
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+
+@router.get("/sso/login")
+def sso_login_redirect(
+    email: str = Query(..., min_length=3),
+    return_path: str = Query(default="/"),
+    db: Session = Depends(get_db),
+):
+    domain = (email.split("@")[-1] if "@" in email else "").strip().lower()
+    if not domain:
+        raise HTTPException(status_code=400, detail="Invalid email")
+    provider = (
+        db.query(WorkspaceSSOProvider)
+        .filter(
+            WorkspaceSSOProvider.domain_hint == domain,
+            WorkspaceSSOProvider.enabled.is_(True),
+        )
+        .first()
+    )
+    if not provider:
+        raise HTTPException(status_code=404, detail="No SSO provider configured for this domain")
+    policy = (
+        db.query(WorkspaceAuthPolicy)
+        .filter(WorkspaceAuthPolicy.workspace_id == provider.workspace_id)
+        .first()
+    )
+    if policy and not policy.enforce_sso and provider.provider == "google":
+        raise HTTPException(status_code=400, detail="Workspace does not require SSO for this domain")
+    # Keep callback deterministic from env so providers can whitelist one URL.
+    callback = f"{os.getenv('BACKEND_BASE_URL', 'http://localhost:8000').rstrip('/')}/api/users/sso/callback"
+    _redirect_uri, _nonce_state = build_oidc_authorize_url(provider, redirect_uri=callback)
+    state = build_signed_sso_state(provider_id=provider.id, return_path=return_path)
+    endpoint = provider.authorization_endpoint or f"{provider.issuer.rstrip('/')}/v1/authorize"
+    from urllib import parse
+    params = parse.urlencode(
+        {
+            "client_id": provider.client_id,
+            "redirect_uri": callback,
+            "response_type": "code",
+            "scope": provider.scope or "openid profile email",
+            "state": state,
+        }
+    )
+    redirect_uri = f"{endpoint}?{params}"
+    log_security_audit_event(
+        db,
+        action="auth.sso.login_redirect",
+        resource_type="workspace_sso_provider",
+        resource_id=str(provider.id),
+        actor_type="anonymous",
+        workspace_id=provider.workspace_id,
+        metadata={"email_domain": domain, "return_path": return_path, "state": state},
+    )
+    db.commit()
+    return RedirectResponse(url=redirect_uri, status_code=302)
+
+
+@router.get("/sso/callback")
+def sso_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    db: Session = Depends(get_db),
+):
+    frontend_base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+    if error or not code:
+        reason = error or "missing_code"
+        return RedirectResponse(url=f"{frontend_base}/login?sso_error={reason}", status_code=302)
+    if not state:
+        return RedirectResponse(url=f"{frontend_base}/login?sso_error=missing_state", status_code=302)
+
+    try:
+        state_payload = verify_signed_sso_state(state)
+    except ValueError:
+        return RedirectResponse(url=f"{frontend_base}/login?sso_error=invalid_state", status_code=302)
+    provider_id = int(state_payload.get("provider_id"))
+    provider = (
+        db.query(WorkspaceSSOProvider)
+        .filter(
+            WorkspaceSSOProvider.id == provider_id,
+            WorkspaceSSOProvider.enabled.is_(True),
+        )
+        .first()
+    )
+    if not provider:
+        return RedirectResponse(url=f"{frontend_base}/login?sso_error=provider_not_found", status_code=302)
+    return_path = str(state_payload.get("return_path") or "/")
+    token_endpoint = provider.token_endpoint or f"{provider.issuer.rstrip('/')}/v1/token"
+    userinfo_endpoint = provider.userinfo_endpoint or f"{provider.issuer.rstrip('/')}/v1/userinfo"
+    callback = f"{os.getenv('BACKEND_BASE_URL', 'http://localhost:8000').rstrip('/')}/api/users/sso/callback"
+    try:
+        token_data = exchange_oidc_code(
+            token_endpoint=token_endpoint,
+            code=code,
+            client_id=provider.client_id,
+            client_secret=provider.client_secret_encrypted,
+            redirect_uri=callback,
+        )
+        access_token_upstream = token_data.get("access_token")
+        if not access_token_upstream:
+            raise HTTPException(status_code=400, detail="missing_access_token")
+        profile = fetch_oidc_userinfo(userinfo_endpoint=userinfo_endpoint, access_token=access_token_upstream)
+        claims = validate_oidc_claims(
+            provider=provider,
+            id_token=token_data.get("id_token"),
+            userinfo=profile,
+        )
+    except Exception:
+        return RedirectResponse(url=f"{frontend_base}/login?sso_error=exchange_failed", status_code=302)
+    email = (claims.get("email") or profile.get("email") or "").strip().lower()
+    name = (claims.get("name") or profile.get("name") or email.split("@")[0] or "SSO User").strip()
+    if not email:
+        return RedirectResponse(url=f"{frontend_base}/login?sso_error=missing_email", status_code=302)
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        user = User(
+            email=email,
+            name=name,
+            full_name=name,
+            role="user",
+            hashed_password=None,
+            auth_provider="sso",
+        )
+        db.add(user)
+        db.flush()
+        db.add(WorkspaceMember(workspace_id=provider.workspace_id, user_id=user.id, role="editor"))
+    elif (user.auth_provider or "local") == "local":
+        user.auth_provider = "sso"
+    session_id = create_user_session(db, user.id)
+    app_access_token = create_access_token(
+        data={"user_id": user.id, "onboarding_completed": user.onboarding_completed, "sid": session_id}
+    )
+    app_refresh_token = create_refresh_token(data={"user_id": user.id, "sid": session_id})
+    log_security_audit_event(
+        db,
+        action="auth.sso.callback_success",
+        resource_type="workspace_sso_provider",
+        resource_id=str(provider.id),
+        actor_user_id=user.id,
+        actor_type="user",
+        workspace_id=provider.workspace_id,
+        metadata={"email": email, "state": state},
+    )
+    db.commit()
+    return RedirectResponse(
+        url=(
+            f"{frontend_base}/google/callback?access_token={app_access_token}"
+            f"&refresh_token={app_refresh_token}"
+            f"&onboarding_completed={'true' if user.onboarding_completed else 'false'}"
+            f"&next={url_quote(return_path, safe='')}"
+        ),
+        status_code=302,
+    )
+
+
+class GoogleMobileTokenRequest(BaseModel):
+    id_token: str
+
+
+@router.post("/sso/google/mobile")
+def sso_google_mobile(payload: GoogleMobileTokenRequest, db: Session = Depends(get_db)):
+    import json as _json
+    from urllib import parse as _parse, request as _request
+    from urllib.error import URLError as _URLError
+
+    token = (payload.id_token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Missing id_token")
+
+    verify_url = f"https://oauth2.googleapis.com/tokeninfo?id_token={_parse.quote(token)}"
+    try:
+        with _request.urlopen(verify_url, timeout=15) as resp:
+            info = _json.loads(resp.read().decode("utf-8"))
+    except _URLError:
+        raise HTTPException(status_code=400, detail="Unable to verify Google token")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Google id_token")
+
+    if info.get("error") or info.get("error_description"):
+        raise HTTPException(status_code=400, detail="Invalid Google id_token")
+
+    expected_client_ids = {
+        cid.strip()
+        for cid in os.getenv("GOOGLE_MOBILE_CLIENT_IDS", "").split(",")
+        if cid.strip()
+    }
+    aud = (info.get("aud") or "").strip()
+    if expected_client_ids and aud not in expected_client_ids:
+        raise HTTPException(status_code=400, detail="Google audience mismatch")
+
+    iss = (info.get("iss") or "").rstrip("/")
+    if iss not in {"accounts.google.com", "https://accounts.google.com"}:
+        raise HTTPException(status_code=400, detail="Invalid Google issuer")
+
+    email_verified = info.get("email_verified")
+    if email_verified not in (True, "true"):
+        raise HTTPException(status_code=400, detail="Google email not verified")
+
+    email = (info.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Google profile missing email")
+    name = (info.get("name") or email.split("@")[0] or "Google User").strip()
+
+    user = db.query(User).filter(User.email == email).first()
+    created_new = False
+    if not user:
+        user = User(
+            email=email,
+            name=name,
+            full_name=name,
+            role="user",
+            hashed_password=None,
+            auth_provider="sso",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        from app.services.workspace_bootstrap import ensure_personal_workspace
+
+        ensure_personal_workspace(db, user)
+        created_new = True
+    elif (user.auth_provider or "local") == "local":
+        user.auth_provider = "sso"
+
+    session_id = create_user_session(db, user.id)
+    access_token = create_access_token(
+        data={
+            "user_id": user.id,
+            "onboarding_completed": user.onboarding_completed,
+            "sid": session_id,
+        }
+    )
+    refresh_token = create_refresh_token(data={"user_id": user.id, "sid": session_id})
+    log_security_audit_event(
+        db,
+        action="auth.sso.google_mobile_success",
+        resource_type="user",
+        resource_id=str(user.id),
+        actor_user_id=user.id,
+        actor_type="user",
+        metadata={"email": email, "created": created_new},
+    )
+    db.commit()
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "onboarding_completed": bool(user.onboarding_completed),
+    }
 
 
 # ── User CRUD (parameterized routes last) ──

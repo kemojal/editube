@@ -1,0 +1,5 @@
+# Optional ML/AI dependencies (transcription + generative features).
+# Install only on machines that run these workloads.
+faster-whisper>=1.0.0
+google-genai
+whisperx

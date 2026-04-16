@@ -13,7 +13,14 @@ class ReviewLinkCreate(BaseModel):
     allow_comments: bool = True
     allow_export: bool = False
     watermark_enabled: bool = True
+    watermark_mode: str = "visible_overlay"
     require_email: bool = False
+    nda_required: bool = False
+    nda_document_id: Optional[int] = None
+    geofence_mode: str = "off"  # off | allowlist | blocklist
+    geo_allow_countries: Optional[List[str]] = None
+    geo_block_countries: Optional[List[str]] = None
+    recording_detection_mode: str = "monitor"
     version_group_id: Optional[str] = None
     version_label: Optional[str] = None
 
@@ -27,10 +34,18 @@ class ReviewLinkUpdate(BaseModel):
     allow_comments: Optional[bool] = None
     allow_export: Optional[bool] = None
     watermark_enabled: Optional[bool] = None
+    watermark_mode: Optional[str] = None
     require_email: Optional[bool] = None
+    nda_required: Optional[bool] = None
+    nda_document_id: Optional[int] = None
+    geofence_mode: Optional[str] = None
+    geo_allow_countries: Optional[List[str]] = None
+    geo_block_countries: Optional[List[str]] = None
+    recording_detection_mode: Optional[str] = None
     version_group_id: Optional[str] = None
     version_label: Optional[str] = None
     revoked: Optional[bool] = None
+    revocation_reason: Optional[str] = None
 
 
 class ReviewLinkResponse(BaseModel):
@@ -45,10 +60,18 @@ class ReviewLinkResponse(BaseModel):
     allow_comments: bool
     allow_export: bool = False
     watermark_enabled: bool
+    watermark_mode: str = "visible_overlay"
     require_email: bool
+    nda_required: bool = False
+    nda_document_id: Optional[int] = None
+    geofence_mode: str = "off"
+    geo_allow_countries: Optional[List[str]] = None
+    geo_block_countries: Optional[List[str]] = None
+    recording_detection_mode: str = "monitor"
     version_group_id: Optional[str] = None
     version_label: Optional[str] = None
     revoked_at: Optional[datetime] = None
+    revocation_reason: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     view_count: int = 0
@@ -66,6 +89,7 @@ class ReviewSessionSummary(BaseModel):
     guest_email: Optional[str] = None
     guest_avatar_url: Optional[str] = None
     ip_address: Optional[str] = None
+    country_code: Optional[str] = None
     total_watch_seconds: int
     max_position: int
     reached_end: bool
@@ -125,8 +149,15 @@ class PublicReviewLinkInfo(BaseModel):
     allow_comments: bool
     allow_export: bool = False
     watermark_enabled: bool
+    watermark_mode: str = "visible_overlay"
     version_group_id: Optional[str] = None
     version_label: Optional[str] = None
+    nda_required: bool = False
+    nda_document_id: Optional[int] = None
+    nda_document_name: Optional[str] = None
+    nda_accepted: bool = False
+    geofence_mode: str = "off"
+    recording_detection_mode: str = "monitor"
     expired: bool
     revoked: bool
     video: Optional[PublicReviewVideo] = None  # null if password required
@@ -148,6 +179,7 @@ class PublicReviewAuthResponse(BaseModel):
     session_id: Optional[int] = None
     video: Optional[PublicReviewVideo] = None
     watermark_text: Optional[str] = None
+    forensic_fingerprint: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -156,6 +188,8 @@ class PublicReviewEventCreate(BaseModel):
     event_type: str  # play|pause|seek|progress|ended
     position: int
     range_end: Optional[int] = None
+    seq: Optional[int] = None
+    meta_info: Optional[dict] = None
 
 
 class PublicReviewCommentCreate(BaseModel):
@@ -166,6 +200,10 @@ class PublicReviewCommentCreate(BaseModel):
     drawing_data: Optional[Any] = None
     parent_id: Optional[int] = None
     kind: Optional[str] = "comment"  # comment | change_request
+    transcript_segment_index: Optional[int] = None
+    word_start_index: Optional[int] = None
+    word_end_index: Optional[int] = None
+    anchor_text: Optional[str] = None
 
 
 class PublicReviewCommentUser(BaseModel):
@@ -184,6 +222,13 @@ class PublicReviewCommentResponse(BaseModel):
     timecode: int
     end_timecode: Optional[int] = None
     drawing_data: Optional[Any] = None
+    transcript_segment_index: Optional[int] = None
+    word_start_index: Optional[int] = None
+    word_end_index: Optional[int] = None
+    anchor_text: Optional[str] = None
+    transcript_anchor_resolved: bool = True
+    transcript_anchor_reason: Optional[str] = None
+    transcript_anchor_remap_timecode: Optional[int] = None
     is_resolved: bool = False
     kind: str = "comment"
     status: str = "open"
@@ -256,6 +301,59 @@ class PublicReviewDraftResponse(BaseModel):
     text: str
     timecode: int
     updated_at: datetime
+
+
+class PublicReviewRoomMessageCreate(BaseModel):
+    session_id: int
+    body: str
+
+
+class PublicReviewRoomMessageResponse(BaseModel):
+    id: int
+    session_id: int
+    guest_name: Optional[str] = None
+    guest_avatar_url: Optional[str] = None
+    body: str
+    created_at: datetime
+
+
+class PublicReviewRecordingCreate(BaseModel):
+    session_id: int
+    consent_snapshot: Optional[dict] = None
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+
+
+class PublicReviewNDAAcceptRequest(BaseModel):
+    guest_name: Optional[str] = None
+    guest_email: Optional[str] = None
+    fingerprint: str
+
+
+class PublicReviewNDAAcceptResponse(BaseModel):
+    ok: bool
+    accepted_at: datetime
+
+
+class PublicReviewRecordingResponse(BaseModel):
+    id: int
+    session_id: Optional[int] = None
+    status: str
+    file_url: Optional[str] = None
+    mime_type: Optional[str] = None
+    bytes_size: Optional[int] = None
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    archived_at: Optional[datetime] = None
+    deleted_at: Optional[datetime] = None
+    retention_days: Optional[int] = None
+    created_at: datetime
+
+
+class PublicReviewRecordingGovernanceUpdate(BaseModel):
+    archived: Optional[bool] = None
+    deleted: Optional[bool] = None
+    retention_days: Optional[int] = None
 
 
 class ReviewSceneGroup(BaseModel):
