@@ -14,8 +14,17 @@ from .api import api_router
 from .db.database import SessionLocal
 from .utils.security import authenticate_access_token
 from .websocket_manager import notifications_ws_manager, review_room_ws_manager
-from .db.models import ReviewLink, ReviewSession, ReviewRoomMessage, Video, Project
-from .services.project_access import can_access_project
+from sqlalchemy.orm import joinedload
+
+from .db.models import (
+    ReviewLink,
+    ReviewSession,
+    ReviewRoomMessage,
+    TeamVideoRoomMessage,
+    Video,
+    Project,
+)
+from .services.project_access import can_access_project, can_moderate_video_comments
 
 load_dotenv()
 
@@ -478,10 +487,54 @@ async def team_video_websocket(websocket: WebSocket, video_id: int):
         for item in review_room_ws_manager.replay_since(room_id, last_seq)[-200:]:
             await websocket.send_json(item)
 
+        await websocket.send_json(
+            review_room_ws_manager.add_event(
+                room_id,
+                {
+                    "event": "room.controls",
+                    "payload": review_room_ws_manager.controls_state(room_id),
+                },
+            )
+        )
+        history_rows = (
+            db.query(TeamVideoRoomMessage)
+            .options(joinedload(TeamVideoRoomMessage.user))
+            .filter(TeamVideoRoomMessage.video_id == video_id)
+            .order_by(TeamVideoRoomMessage.created_at.desc())
+            .limit(50)
+            .all()
+        )
+        history_payload = []
+        for row in reversed(history_rows):
+            author = row.user
+            guest_name = (
+                (author.name or author.email or f"User {row.user_id}") if author else f"User {row.user_id}"
+            )
+            guest_avatar_url = getattr(author, "avatar_url", None) if author else None
+            history_payload.append(
+                {
+                    "id": row.id,
+                    "user_id": row.user_id,
+                    "guest_name": guest_name,
+                    "guest_avatar_url": guest_avatar_url,
+                    "body": row.body,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                }
+            )
+        await websocket.send_json({"event": "chat.history", "payload": history_payload})
+
+        can_mod = can_moderate_video_comments(db, project, user.id)
+
         while True:
             msg = await websocket.receive_json()
             event = (msg.get("event") or "").strip()
             payload = msg.get("payload") or {}
+            if review_room_ws_manager.is_muted(room_id, user.id) and event in (
+                "chat.message",
+                "playback.sync",
+                "host.control",
+            ):
+                continue
             if event == "presence.update":
                 merged = {
                     **base_presence,
@@ -506,6 +559,112 @@ async def team_video_websocket(websocket: WebSocket, video_id: int):
                         room_id, {"event": "presence.snapshot", "payload": snapshot}
                     ),
                 )
+            elif event in ("playback.sync", "host.control"):
+                controls = review_room_ws_manager.controls_state(room_id)
+                if controls.get("locked") and controls.get("host_session_id") not in (
+                    None,
+                    user.id,
+                ):
+                    continue
+                await review_room_ws_manager.broadcast(
+                    room_id,
+                    review_room_ws_manager.add_event(
+                        room_id,
+                        {
+                            "event": event,
+                            "payload": {
+                                **payload,
+                                "session_id": user.id,
+                                "guest_name": user.name or user.email or f"User {user.id}",
+                            },
+                        },
+                    ),
+                )
+            elif event == "chat.message":
+                body = (payload.get("body") or "").strip()
+                if not body:
+                    continue
+                row = TeamVideoRoomMessage(
+                    video_id=video_id,
+                    user_id=user.id,
+                    body=body[:5000],
+                )
+                db.add(row)
+                db.commit()
+                db.refresh(row)
+                await review_room_ws_manager.broadcast(
+                    room_id,
+                    review_room_ws_manager.add_event(
+                        room_id,
+                        {
+                            "event": "chat.message",
+                            "payload": {
+                                "id": row.id,
+                                "user_id": user.id,
+                                "guest_name": user.name or user.email or f"User {user.id}",
+                                "guest_avatar_url": getattr(user, "avatar_url", None),
+                                "body": row.body,
+                                "created_at": row.created_at.isoformat() if row.created_at else None,
+                            },
+                        },
+                    ),
+                )
+            elif event == "moderation.lock":
+                if not can_mod:
+                    continue
+                controls = review_room_ws_manager.controls_state(room_id)
+                existing_host = controls.get("host_session_id")
+                if existing_host is not None and existing_host != user.id:
+                    continue
+                state = review_room_ws_manager.set_lock(
+                    room_id,
+                    bool(payload.get("locked", False)),
+                    (
+                        user.id
+                        if bool(payload.get("locked", False))
+                        else (existing_host if existing_host == user.id else None)
+                    ),
+                )
+                await review_room_ws_manager.broadcast(
+                    room_id,
+                    review_room_ws_manager.add_event(
+                        room_id, {"event": "room.controls", "payload": state}
+                    ),
+                )
+            elif event == "moderation.mute":
+                if not can_mod:
+                    continue
+                controls = review_room_ws_manager.controls_state(room_id)
+                host_session_id = controls.get("host_session_id")
+                if host_session_id is not None and host_session_id != user.id:
+                    continue
+                target_session_id = int(payload.get("target_session_id") or 0)
+                if target_session_id > 0:
+                    state = review_room_ws_manager.mute_session(
+                        room_id,
+                        target_session_id=target_session_id,
+                        muted=bool(payload.get("muted", True)),
+                    )
+                    await review_room_ws_manager.broadcast(
+                        room_id,
+                        review_room_ws_manager.add_event(
+                            room_id, {"event": "room.controls", "payload": state}
+                        ),
+                    )
+            elif event == "moderation.remove":
+                if not can_mod:
+                    continue
+                controls = review_room_ws_manager.controls_state(room_id)
+                host_session_id = controls.get("host_session_id")
+                if host_session_id is not None and host_session_id != user.id:
+                    continue
+                target_session_id = int(payload.get("target_session_id") or 0)
+                if target_session_id > 0 and target_session_id != user.id:
+                    if host_session_id is not None and target_session_id == host_session_id:
+                        continue
+                    await review_room_ws_manager.close_session(
+                        room_id, target_session_id, code=4001
+                    )
             elif event in ("comment.signal", "typing.signal"):
                 await review_room_ws_manager.broadcast(
                     room_id,

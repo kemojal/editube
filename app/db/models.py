@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, Text, Boolean, ARRAY, UniqueConstraint
+from sqlalchemy import Column, Integer, Float, String, ForeignKey, Text, Boolean, ARRAY, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, NUMRANGE
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql.sqltypes import TIMESTAMP
@@ -726,6 +726,31 @@ class ReviewRoomMessage(Base):
     session = relationship("ReviewSession")
 
 
+class TeamVideoRoomMessage(Base):
+    """Persistent team chat for internal /player WebSocket room (per video)."""
+
+    __tablename__ = "team_video_room_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(
+        Integer,
+        ForeignKey("videos.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    body = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    video = relationship("Video")
+    user = relationship("User")
+
+
 class ReviewRecordingSession(Base):
     __tablename__ = "review_recording_sessions"
 
@@ -861,8 +886,8 @@ class Annotation(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     annotation_type = Column(String(50), nullable=False)
     annotation_data = Column(JSONB, nullable=False)
-    timecode = Column(Integer, nullable=False)
-    duration = Column(Integer, server_default="5", nullable=False)
+    timecode = Column(Float, nullable=False)
+    duration = Column(Float, server_default="0.1", nullable=False)
     is_private = Column(Boolean, server_default="false", nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)

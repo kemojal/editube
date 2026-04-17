@@ -5,6 +5,7 @@ from app.services.project_access import assert_write_project_content, can_access
 from app.db.database import get_db
 from app.utils.security import get_current_user
 from app.api.models.annotations import (
+    ANNOTATION_DURATION_FRAMES,
     AnnotationCreate,
     AnnotationUpdate,
     AnnotationResponse,
@@ -36,7 +37,7 @@ def _annotation_response(a: Annotation) -> dict:
         "annotation_type": a.annotation_type,
         "annotation_data": a.annotation_data,
         "timecode": int(a.timecode) if isinstance(a.timecode, str) else a.timecode,
-        "duration": a.duration or 5,
+        "duration": a.duration if a.duration else ANNOTATION_DURATION_FRAMES,
         "is_private": a.is_private,
         "created_at": a.created_at,
         "updated_at": a.updated_at,
@@ -66,7 +67,7 @@ def create_annotation(
         annotation_type=annotation.annotation_type,
         annotation_data=annotation.annotation_data,
         timecode=annotation.timecode,
-        duration=annotation.duration or 5,
+        duration=annotation.duration if annotation.duration else ANNOTATION_DURATION_FRAMES,
         is_private=annotation.is_private,
     )
 
