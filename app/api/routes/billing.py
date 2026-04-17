@@ -19,7 +19,11 @@ from app.services.stripe_catalog_sync import (
     upsert_stripe_price_from_object,
     upsert_stripe_product_from_object,
 )
-from app.utils.email import send_subscription_canceled_email, send_subscription_welcome_email
+from app.utils.email import (
+    send_subscription_canceled_email,
+    send_subscription_welcome_email,
+    send_subscription_will_not_renew_email,
+)
 from app.utils.security import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -81,6 +85,14 @@ def _resolve_price_id_for_checkout(db: Session, plan: str, interval: str) -> str
     )
 
 
+def _stripe_field(obj, key: str):
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
 class CheckoutBody(BaseModel):
     plan: str
     interval: str  # "month" | "year"
@@ -133,6 +145,52 @@ def create_checkout_session(
         },
     )
     return {"url": session.url}
+
+
+@router.get("/checkout-session-status")
+def get_checkout_session_status(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not stripe.api_key:
+        raise HTTPException(status_code=500, detail="Stripe is not configured")
+
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+    except stripe.error.InvalidRequestError as exc:
+        raise HTTPException(status_code=404, detail="Checkout session not found") from exc
+
+    if _stripe_field(session, "mode") != "subscription":
+        raise HTTPException(status_code=400, detail="Checkout session is not a subscription session")
+
+    metadata = _stripe_field(session, "metadata") or {}
+    uid = _stripe_field(session, "client_reference_id") or _stripe_field(metadata, "user_id")
+    if str(uid or "") != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not authorized to inspect this checkout session")
+
+    sub_id = _stripe_field(session, "subscription")
+    if not sub_id:
+        return {
+            "synced": False,
+            "onboarding_completed": bool(current_user.onboarding_completed),
+            "subscription_status": current_user.subscription_status,
+            "plan": current_user.plan,
+        }
+
+    subscription = stripe.Subscription.retrieve(
+        sub_id,
+        expand=["items.data.price"],
+    )
+    plan = _stripe_field(metadata, "plan") or current_user.plan
+    _sync_user_from_subscription(db, current_user, subscription, plan)
+
+    return {
+        "synced": bool(current_user.onboarding_completed),
+        "onboarding_completed": bool(current_user.onboarding_completed),
+        "subscription_status": current_user.subscription_status,
+        "plan": current_user.plan,
+    }
 
 
 @router.get("/catalog")
@@ -197,6 +255,36 @@ def sync_billing_catalog(
     return {"synced_prices": n}
 
 
+def _subscription_detail_dict(db: Session, user: User) -> dict | None:
+    """Snapshot for billing UI from local Subscription row (kept in sync via webhooks / checkout)."""
+    if not user.stripe_subscription_id:
+        return None
+    row = (
+        db.query(Subscription)
+        .filter(Subscription.stripe_subscription_id == user.stripe_subscription_id)
+        .first()
+    )
+    if not row:
+        return {
+            "stripe_subscription_id": user.stripe_subscription_id,
+            "status": user.subscription_status,
+            "plan": user.plan,
+            "current_period_start": None,
+            "current_period_end": None,
+            "cancel_at_period_end": False,
+            "trial_start": user.trial_start_date.isoformat() if user.trial_start_date else None,
+        }
+    return {
+        "stripe_subscription_id": row.stripe_subscription_id,
+        "status": row.status,
+        "plan": row.plan or user.plan,
+        "current_period_start": row.current_period_start.isoformat() if row.current_period_start else None,
+        "current_period_end": row.current_period_end.isoformat() if row.current_period_end else None,
+        "cancel_at_period_end": bool(row.cancel_at_period_end),
+        "trial_start": row.trial_start.isoformat() if row.trial_start else None,
+    }
+
+
 @router.get("/usage")
 def get_billing_usage(
     db: Session = Depends(get_db),
@@ -213,6 +301,7 @@ def get_billing_usage(
     payload = workspace_usage_payload(db, user=current_user, workspace_id=member.workspace_id)
     plan = get_plan_spec(current_user.plan)
     payload["plan_label"] = plan.label
+    payload["subscription_detail"] = _subscription_detail_dict(db, current_user)
     return payload
 
 
@@ -229,7 +318,7 @@ def create_portal_session(
     base = _frontend_base()
     session = stripe.billing_portal.Session.create(
         customer=current_user.stripe_customer_id,
-        return_url=f"{base}/billing",
+        return_url=f"{base}/account?tab=billing",
     )
     return {"url": session.url}
 
@@ -269,11 +358,11 @@ def _plan_from_catalog_price_id(db: Session, sub: stripe.Subscription) -> str | 
 
 
 def _subscription_metadata_plan(sub: stripe.Subscription) -> str | None:
-    meta = getattr(sub, "metadata", None)
+    meta = _stripe_field(sub, "metadata")
     if not meta:
         return None
     try:
-        p = meta.get("plan") if hasattr(meta, "get") else meta["plan"]
+        p = _stripe_field(meta, "plan")
     except (KeyError, TypeError, AttributeError):
         return None
     normalized = normalize_plan_key(p if isinstance(p, str) else None)
@@ -291,33 +380,35 @@ def _upsert_subscription_row(
     plan = plan or _subscription_metadata_plan(sub)
     plan = plan or _plan_from_catalog_price_id(db, sub)
 
-    cust = sub.customer
+    sub_id = _stripe_field(sub, "id")
+    status = _stripe_field(sub, "status")
+    cust = _stripe_field(sub, "customer")
     if cust is not None and not isinstance(cust, str):
         cust = getattr(cust, "id", None) or str(cust)
 
     row = (
         db.query(Subscription)
-        .filter(Subscription.stripe_subscription_id == sub.id)
+        .filter(Subscription.stripe_subscription_id == sub_id)
         .first()
     )
     if not row:
-        row = Subscription(user_id=user.id, stripe_subscription_id=sub.id)
+        row = Subscription(user_id=user.id, stripe_subscription_id=sub_id)
         db.add(row)
 
     row.user_id = user.id
     row.stripe_customer_id = cust
     row.customer_email = user.email
     row.stripe_price_id = _price_id_from_subscription(sub)
-    row.status = sub.status
+    row.status = status
     if plan:
         row.plan = plan
-    row.trial_start = _stripe_dt(sub.trial_start)
-    row.current_period_start = _stripe_dt(sub.current_period_start)
-    row.current_period_end = _stripe_dt(sub.current_period_end)
-    row.cancel_at_period_end = bool(getattr(sub, "cancel_at_period_end", False))
-    if sub.status in ("canceled", "unpaid", "incomplete_expired"):
+    row.trial_start = _stripe_dt(_stripe_field(sub, "trial_start"))
+    row.current_period_start = _stripe_dt(_stripe_field(sub, "current_period_start"))
+    row.current_period_end = _stripe_dt(_stripe_field(sub, "current_period_end"))
+    row.cancel_at_period_end = bool(_stripe_field(sub, "cancel_at_period_end"))
+    if status in ("canceled", "unpaid", "incomplete_expired"):
         row.ended_at = row.ended_at or datetime.now(timezone.utc).replace(tzinfo=None)
-    elif sub.status in ("trialing", "active"):
+    elif status in ("trialing", "active"):
         row.ended_at = None
 
 
@@ -327,8 +418,8 @@ def _sync_user_from_subscription(
     subscription: stripe.Subscription,
     plan_hint: str | None,
 ) -> None:
-    meta = subscription.metadata or {}
-    plan = normalize_plan_key(plan_hint or meta.get("plan"))
+    meta = _stripe_field(subscription, "metadata") or {}
+    plan = normalize_plan_key(plan_hint or _stripe_field(meta, "plan"))
     if plan not in ("pro", "scale"):
         from_catalog = _plan_from_catalog_price_id(db, subscription)
         if from_catalog in ("pro", "scale"):
@@ -336,19 +427,19 @@ def _sync_user_from_subscription(
     if plan in ("pro", "scale"):
         user.plan = plan
 
-    user.stripe_subscription_id = subscription.id
-    user.subscription_status = subscription.status
-    if subscription.customer:
-        cust = subscription.customer
+    user.stripe_subscription_id = _stripe_field(subscription, "id")
+    user.subscription_status = _stripe_field(subscription, "status")
+    cust = _stripe_field(subscription, "customer")
+    if cust:
         user.stripe_customer_id = (
             cust if isinstance(cust, str) else getattr(cust, "id", None) or str(cust)
         )
 
-    ts = subscription.trial_start
+    ts = _stripe_field(subscription, "trial_start")
     if ts:
         user.trial_start_date = _stripe_dt(ts)
 
-    if subscription.status in ("trialing", "active"):
+    if user.subscription_status in ("trialing", "active"):
         user.onboarding_completed = True
 
     _upsert_subscription_row(db, user, subscription, plan_hint)
@@ -412,19 +503,49 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
 
     if etype == "customer.subscription.updated":
         sub = data
+        sid = sub.get("id")
+        prev_row = (
+            db.query(Subscription).filter(Subscription.stripe_subscription_id == sid).first()
+            if sid
+            else None
+        )
+        prev_cancel_at_end = bool(prev_row.cancel_at_period_end) if prev_row else False
+
         uid = (sub.get("metadata") or {}).get("user_id")
         user = None
         if uid:
             user = db.query(User).filter(User.id == int(uid)).first()
-        if not user and sub.get("id"):
-            user = db.query(User).filter(User.stripe_subscription_id == sub["id"]).first()
-        if user:
+        if not user and sid:
+            user = db.query(User).filter(User.stripe_subscription_id == sid).first()
+        if user and sid:
             subscription = stripe.Subscription.retrieve(
-                sub["id"],
+                sid,
                 expand=["items.data.price"],
             )
-            plan = (subscription.metadata or {}).get("plan") or user.plan
+            meta = _stripe_field(subscription, "metadata") or {}
+            plan = _stripe_field(meta, "plan") or user.plan
             _sync_user_from_subscription(db, user, subscription, plan)
+
+            after_row = (
+                db.query(Subscription).filter(Subscription.stripe_subscription_id == sid).first()
+            )
+            if (
+                after_row
+                and not prev_cancel_at_end
+                and after_row.cancel_at_period_end
+                and after_row.status in ("active", "trialing")
+                and user.email
+            ):
+                period_end = after_row.current_period_end
+                try:
+                    send_subscription_will_not_renew_email(
+                        user.email,
+                        user.full_name or user.name or "there",
+                        user.plan,
+                        period_end,
+                    )
+                except Exception:
+                    logger.exception("Will-not-renew email failed for user_id=%s", user.id)
         return {"received": True}
 
     if etype == "customer.subscription.deleted":
@@ -435,6 +556,7 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
             .filter(Subscription.stripe_subscription_id == sid)
             .first()
         )
+        access_until = row.current_period_end if row else None
         if row:
             row.status = "canceled"
             row.ended_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -451,7 +573,13 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         db.commit()
         if cancel_to:
             try:
-                send_subscription_canceled_email(cancel_to, cancel_name, cancel_plan)
+                send_subscription_canceled_email(
+                    cancel_to,
+                    cancel_name,
+                    cancel_plan,
+                    access_until=access_until,
+                    stripe_subscription_id=sid,
+                )
             except Exception:
                 logger.exception("Cancellation email failed for sid=%s", sid)
         return {"received": True}

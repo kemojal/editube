@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import smtplib
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -15,6 +15,11 @@ from sqlalchemy.orm import Session
 from app.db.models import Project, User
 
 logger = logging.getLogger(__name__)
+
+
+def _fmt_long_date_utc(dt: datetime) -> str:
+    """e.g. April 17, 2026 — avoids platform-specific %-d in strftime."""
+    return f"{dt.astimezone(timezone.utc).strftime('%B')} {dt.astimezone(timezone.utc).day}, {dt.astimezone(timezone.utc).year}"
 
 
 def _smtp_settings() -> tuple[str | None, int, str | None, str | None, str | None, bool]:
@@ -108,6 +113,14 @@ def _plan_label(plan: str | None) -> str:
     }.get(plan.lower(), plan)
 
 
+def _sub_get(sub: stripe.Subscription, key: str):
+    """StripeObject raises on missing keys; subscription payloads omit some fields while trialing."""
+    try:
+        return sub[key]
+    except (KeyError, TypeError, AttributeError):
+        return None
+
+
 def send_subscription_welcome_email(user: User, sub: stripe.Subscription) -> None:
     """Called after successful checkout webhook sync. Logs-only on failure."""
     if not user.email:
@@ -115,35 +128,65 @@ def send_subscription_welcome_email(user: User, sub: stripe.Subscription) -> Non
     plan = _plan_label(user.plan or _subscription_plan_from_stripe(sub))
     name = user.full_name or user.name or "there"
     base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+    manage_url = f"{base}/account?tab=billing"
 
-    extra = ""
-    if sub.status == "trialing" and sub.trial_end:
-        end = datetime.fromtimestamp(sub.trial_end, tz=timezone.utc)
-        extra = f"\nYour trial is active until {end.strftime('%Y-%m-%d %H:%M UTC')}.\n"
-    elif sub.current_period_end and sub.status == "active":
-        end = datetime.fromtimestamp(sub.current_period_end, tz=timezone.utc)
-        extra = f"\nCurrent period ends {end.strftime('%Y-%m-%d %H:%M UTC')}.\n"
+    status_val = _sub_get(sub, "status") or getattr(sub, "status", None)
+    trial_end = _sub_get(sub, "trial_end")
+    trial_start = _sub_get(sub, "trial_start")
+    current_period_end = _sub_get(sub, "current_period_end")
+    sub_id = _sub_get(sub, "id") or getattr(sub, "id", None)
+    created_ts = _sub_get(sub, "created")
+
+    order_date = datetime.now(timezone.utc)
+    if isinstance(created_ts, (int, float)):
+        order_date = datetime.fromtimestamp(created_ts, tz=timezone.utc)
+
+    trial_lines = ""
+    if status_val == "trialing" and trial_end:
+        end = datetime.fromtimestamp(int(trial_end), tz=timezone.utc)
+        trial_lines = (
+            f"You have successfully subscribed to Editube {plan}.\n"
+            f"Enjoy your trial. Your trial is active until {_fmt_long_date_utc(end)} (UTC).\n"
+            f"After your trial, your subscription renews according to the billing interval you chose.\n"
+        )
+    elif trial_start and trial_end:
+        ts = datetime.fromtimestamp(int(trial_start), tz=timezone.utc)
+        te = datetime.fromtimestamp(int(trial_end), tz=timezone.utc)
+        trial_lines = (
+            f"Trial period: {_fmt_long_date_utc(ts)} – {_fmt_long_date_utc(te)} (UTC).\n"
+        )
+    else:
+        trial_lines = f"You have successfully subscribed to Editube {plan}.\n"
+
+    renewal_line = ""
+    if current_period_end and status_val == "active":
+        end = datetime.fromtimestamp(int(current_period_end), tz=timezone.utc)
+        renewal_line = f"Your current billing period ends {_fmt_long_date_utc(end)} (UTC).\n"
 
     text = (
         f"Hi {name},\n\n"
-        f"Thanks for subscribing to Editube {plan}.\n"
-        f"{extra}\n"
-        f"Manage billing anytime: {base}/billing\n\n"
-        f"— The Editube team\n"
+        f"{trial_lines}"
+        f"{renewal_line}\n"
+        f"Manage your subscription: {manage_url}\n\n"
+        f"If you have any questions, reply to this email or visit our help center.\n\n"
+        f"— The Editube team\n\n"
+        f"Order number: {sub_id or '—'}\n"
+        f"Order date: {order_date.astimezone(timezone.utc).strftime('%b')} {order_date.astimezone(timezone.utc).day}, {order_date.astimezone(timezone.utc).year}\n"
+        f"Plan: Editube {plan} subscription\n"
     )
     send_transactional_email(
         user.email,
-        f"Welcome to Editube {plan}",
+        f"You are subscribed to Editube {plan}",
         text,
     )
 
 
 def _subscription_plan_from_stripe(sub: stripe.Subscription) -> str | None:
-    meta = getattr(sub, "metadata", None)
+    meta = _sub_get(sub, "metadata")
     if not meta:
         return None
     try:
-        p = meta.get("plan") if hasattr(meta, "get") else None
+        p = meta.get("plan") if hasattr(meta, "get") else meta["plan"]
         if p in ("free", "pro", "scale", "enterprise"):
             return p
         if p == "basic":
@@ -151,7 +194,7 @@ def _subscription_plan_from_stripe(sub: stripe.Subscription) -> str | None:
         if p == "elite":
             return "scale"
         return None
-    except (AttributeError, TypeError):
+    except (AttributeError, TypeError, KeyError):
         return None
 
 
@@ -159,22 +202,80 @@ def send_subscription_canceled_email(
     to_email: str,
     display_name: str,
     plan: str | None,
+    *,
+    access_until: datetime | None = None,
+    stripe_subscription_id: str | None = None,
 ) -> None:
     """Called after subscription deleted webhook. Logs-only on failure."""
     if not to_email:
         return
     pl = _plan_label(plan)
     base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+    billing_url = f"{base}/account?tab=billing"
+    until = ""
+    if access_until:
+        if access_until.tzinfo is None:
+            access_until = access_until.replace(tzinfo=timezone.utc)
+        until = (
+            f"Your {pl} subscription will not renew and has ended in Stripe, "
+            f"but paid features remain available until the end of your billing period on "
+            f"{_fmt_long_date_utc(access_until.astimezone(timezone.utc))} (UTC).\n\n"
+        )
+    else:
+        until = f"Your Editube {pl} subscription has been canceled. You will not be charged again.\n\n"
+
     text = (
         f"Hi {display_name},\n\n"
-        f"Your Editube subscription ({pl}) has been canceled. "
-        f"You will not be charged again for this subscription.\n\n"
-        f"Resubscribe anytime: {base}/billing\n\n"
-        f"— The Editube team\n"
+        f"{until}"
+        f"If you change your mind, you can pick a plan again here: {billing_url}\n\n"
+        f"If you have any questions, please contact us through our help center.\n\n"
+        f"Best,\n"
+        f"The Editube team\n\n"
+        f"You received this email because you have a paid Editube account.\n"
+    )
+    if stripe_subscription_id:
+        text += f"Subscription reference: {stripe_subscription_id}\n"
+    send_transactional_email(
+        to_email,
+        "Your Editube subscription has ended",
+        text,
+    )
+
+
+def send_subscription_will_not_renew_email(
+    to_email: str,
+    display_name: str,
+    plan: str | None,
+    period_end: datetime | date | None,
+) -> None:
+    """User turned off auto-renew; subscription stays active until period end."""
+    if not to_email:
+        return
+    pl = _plan_label(plan)
+    base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+    billing_url = f"{base}/account?tab=billing"
+    end_txt = "the end of your current billing period"
+    if period_end:
+        dt = period_end
+        if isinstance(dt, datetime) and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if isinstance(dt, datetime):
+            end_txt = _fmt_long_date_utc(dt)
+        else:
+            end_txt = f"{dt.strftime('%B')} {dt.day}, {dt.year}"
+
+    text = (
+        f"Hi {display_name},\n\n"
+        f"Your Editube {pl} subscription will not renew and is scheduled to cancel, "
+        f"but remains fully available until {end_txt} (UTC).\n\n"
+        f"If you change your mind, you can manage or renew your subscription here: {billing_url}\n\n"
+        f"If you have any questions, please contact us through our help center.\n\n"
+        f"Best,\n"
+        f"The Editube team\n"
     )
     send_transactional_email(
         to_email,
-        "Your Editube subscription has been canceled",
+        "Your Editube subscription will not renew",
         text,
     )
 
