@@ -33,6 +33,7 @@ def _annotation_response(a: Annotation) -> dict:
             id=a.user.id,
             name=a.user.name,
             email=a.user.email,
+            avatar_url=getattr(a.user, "avatar_url", None),
         ),
         "annotation_type": a.annotation_type,
         "annotation_data": a.annotation_data,

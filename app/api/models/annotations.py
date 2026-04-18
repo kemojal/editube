@@ -24,6 +24,7 @@ class AnnotationUserResponse(BaseModel):
     id: int
     name: str
     email: str
+    avatar_url: Optional[str] = None
 
     class Config:
         orm_mode = True
