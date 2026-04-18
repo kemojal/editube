@@ -129,20 +129,25 @@ def list_my_workspaces(
     current_user: User = Depends(get_current_user),
 ):
     rows = (
-        db.query(WorkspaceMember, Workspace)
+        db.query(WorkspaceMember, Workspace, User)
         .join(Workspace, Workspace.id == WorkspaceMember.workspace_id)
+        .outerjoin(User, User.id == Workspace.owner_user_id)
         .filter(WorkspaceMember.user_id == current_user.id)
         .order_by(Workspace.name.asc())
         .all()
     )
     out: list[WorkspaceSummaryResponse] = []
-    for wm, ws in rows:
+    for wm, ws, owner in rows:
+        owner_name = None
+        if owner:
+            owner_name = (owner.full_name or owner.name or "").strip() or None
         out.append(
             WorkspaceSummaryResponse(
                 id=ws.id,
                 name=ws.name,
                 slug=ws.slug,
                 owner_user_id=ws.owner_user_id,
+                owner_name=owner_name,
                 role=wm.role,
             )
         )
@@ -157,11 +162,14 @@ def get_workspace(
 ):
     ws = _workspace_or_404(db, workspace_id)
     wm = _require_workspace_member(db, workspace_id, current_user)
+    owner = db.query(User).filter(User.id == ws.owner_user_id).first()
+    owner_name = ((owner.full_name or owner.name or "").strip() or None) if owner else None
     return WorkspaceSummaryResponse(
         id=ws.id,
         name=ws.name,
         slug=ws.slug,
         owner_user_id=ws.owner_user_id,
+        owner_name=owner_name,
         role=wm.role,
     )
 
@@ -191,11 +199,14 @@ def update_workspace(
     )
     db.commit()
     db.refresh(ws)
+    owner = db.query(User).filter(User.id == ws.owner_user_id).first()
+    owner_name = ((owner.full_name or owner.name or "").strip() or None) if owner else None
     return WorkspaceSummaryResponse(
         id=ws.id,
         name=ws.name,
         slug=ws.slug,
         owner_user_id=ws.owner_user_id,
+        owner_name=owner_name,
         role=wm.role,
     )
 

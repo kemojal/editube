@@ -50,7 +50,38 @@ router = APIRouter(
 )
 
 
-def convert_project_to_response(db_project: Project) -> ProjectResponse:
+def convert_project_to_response(db_project: Project, db: Session | None = None) -> ProjectResponse:
+    def _user_resp(u: User) -> UserResponse:
+        return UserResponse(
+            id=u.id,
+            name=u.full_name or u.name or u.email,
+            email=u.email,
+            avatar_url=getattr(u, "avatar_url", None),
+            created_at=u.created_at.isoformat(),
+            updated_at=u.updated_at.isoformat(),
+        )
+
+    # Start with project-level collaborators
+    seen: set[int] = {db_project.creator.id}
+    members: list[UserResponse] = []
+    for pc in db_project.collaborators:
+        if pc.user.id not in seen:
+            seen.add(pc.user.id)
+            members.append(_user_resp(pc.user))
+
+    # Also include workspace members so the avatar stack shows everyone
+    if db and db_project.workspace_id:
+        ws_members = (
+            db.query(WorkspaceMember, User)
+            .join(User, User.id == WorkspaceMember.user_id)
+            .filter(WorkspaceMember.workspace_id == db_project.workspace_id)
+            .all()
+        )
+        for _, u in ws_members:
+            if u.id not in seen:
+                seen.add(u.id)
+                members.append(_user_resp(u))
+
     return ProjectResponse(
         id=db_project.id,
         name=db_project.name,
@@ -58,23 +89,8 @@ def convert_project_to_response(db_project: Project) -> ProjectResponse:
         workspace_id=db_project.workspace_id,
         created_at=db_project.created_at.isoformat(),
         updated_at=db_project.updated_at.isoformat(),
-        creator=UserResponse(
-            id=db_project.creator.id,
-            name=db_project.creator.name,
-            email=db_project.creator.email,
-            created_at=db_project.creator.created_at.isoformat(),
-            updated_at=db_project.creator.updated_at.isoformat(),
-        ),
-        collaborators=[
-            UserResponse(
-                id=collaborator.user.id,
-                name=collaborator.user.name,
-                email=collaborator.user.email,
-                created_at=collaborator.user.created_at.isoformat(),
-                updated_at=collaborator.user.updated_at.isoformat(),
-            )
-            for collaborator in db_project.collaborators
-        ],
+        creator=_user_resp(db_project.creator),
+        collaborators=members,
     )
 
 
@@ -148,7 +164,7 @@ def create_project(
 
     db.commit()
     db.refresh(db_project)
-    return convert_project_to_response(db_project)
+    return convert_project_to_response(db_project, db)
 
 
 @router.get("/", response_model=List[ProjectResponse])
@@ -171,7 +187,7 @@ def get_user_projects(db: Session = Depends(get_db), current_user: User = Depend
     merged: dict[int, Project] = {}
     for p in created_projects + collaborated_projects + ws_projects:
         merged[p.id] = p
-    return [convert_project_to_response(project) for project in merged.values()]
+    return [convert_project_to_response(project, db) for project in merged.values()]
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)
@@ -182,7 +198,7 @@ def get_project(project_id: int, db: Session = Depends(get_db), current_user: Us
             raise HTTPException(status_code=404, detail="Project not found")
         if not can_access_project(db, current_user.id, db_project):
             raise HTTPException(status_code=403, detail="Not authorized to access this project")
-        return convert_project_to_response(db_project)
+        return convert_project_to_response(db_project, db)
     except HTTPException:
         raise
     except Exception as e:
@@ -207,7 +223,7 @@ def update_project(
         setattr(db_project, key, value)
     db.commit()
     db.refresh(db_project)
-    return convert_project_to_response(db_project)
+    return convert_project_to_response(db_project, db)
 
 
 @router.delete("/{project_id}")
@@ -419,7 +435,7 @@ def update_collaborator_role(
     row.role = body.role.strip() or row.role
     db.commit()
     db.refresh(db_project)
-    return convert_project_to_response(db_project)
+    return convert_project_to_response(db_project, db)
 
 
 @router.delete("/{project_id}/collaborators/{user_id}", response_model=ProjectResponse)
@@ -444,7 +460,7 @@ def remove_collaborator(
     db.delete(collaborator)
     db.commit()
     db.refresh(db_project)
-    return convert_project_to_response(db_project)
+    return convert_project_to_response(db_project, db)
 
 
 def _workspace_asset_link_dict(link: ProjectWorkspaceAssetLink) -> dict:

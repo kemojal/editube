@@ -20,6 +20,7 @@ class WorkspaceSummaryResponse(BaseModel):
     name: str
     slug: str
     owner_user_id: int
+    owner_name: Optional[str] = None
     role: str  # current user's role in this workspace
 
 
