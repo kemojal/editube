@@ -6,7 +6,7 @@ Editube exports video comments for offline editing tools. Use these formats as t
 
 `GET /projects/{project_id}/videos/{video_id}/comments/export?format=` with Bearer auth.
 
-Supported `format` values: `csv`, `pdf`, `edl`, `fcpxml` (alias `fcp`), `premiere` (aliases `xml`, `xmeml`).
+Supported `format` values: `csv`, `pdf`, `edl`, `fcpxml` (alias `fcp`), `premiere` (aliases `xml`, `xmeml`), `ae` (aliases `jsx`, `after_effects`), `otio` (alias `resolve`).
 
 ## Public export (review link)
 
@@ -24,12 +24,88 @@ Exports use integer **seconds** from the start of the master file (`Comment.time
 
 The `premiere` output is a minimal **XMEML** sequence with `clipitem` rows per top-level comment. The `fcpxml` output uses a `gap` with nested `marker` elements. Validate in your NLE version; Adobe and Apple evolve schemas over time.
 
+## After Effects JSX
+
+The `ae` / `jsx` format generates ExtendScript code that adds `MarkerValue` entries to the active composition. Run the exported `.jsx` file via File → Scripts → Run Script.
+
+## DaVinci Resolve OTIO
+
+The `otio` / `resolve` format generates an OpenTimelineIO JSON file with `Marker.2` schema entries. Import into Resolve via File → Import → Timeline or via the Workflow Integration API.
+
+## NLE Integration API
+
+For two-way sync, use the dedicated integration endpoints:
+
+### Session Management
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/integrations/nle/sessions` | Register NLE session (plugin startup) |
+| `DELETE` | `/integrations/nle/sessions/{id}` | Deregister (plugin shutdown) |
+| `GET` | `/integrations/nle/sessions` | List active sessions |
+
+### Marker Sync
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/integrations/nle/{video_id}/markers` | Export comments as JSON markers |
+| `POST` | `/integrations/nle/{video_id}/markers` | Import markers from NLE as comments |
+| `POST` | `/integrations/nle/{video_id}/sync` | Bidirectional sync (import + export) |
+| `GET` | `/integrations/nle/{video_id}/markers/diff?since=` | Changes since ISO timestamp |
+
+### Proxy Management
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/proxy/videos/{video_id}/proxy` | Generate proxy (540p/720p/1080p H.264) |
+| `GET` | `/proxy/videos/{video_id}/proxy` | List all proxies for a video |
+| `GET` | `/proxy/videos/{video_id}/proxy/{profile}` | Get specific proxy |
+| `DELETE` | `/proxy/videos/{video_id}/proxy/{profile}` | Delete a proxy |
+
+### Watch Folder
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/watch-folders/` | Create watch folder config |
+| `GET` | `/watch-folders/` | List configs |
+| `PUT` | `/watch-folders/{id}` | Update config |
+| `DELETE` | `/watch-folders/{id}` | Delete config |
+| `POST` | `/watch-folders/{id}/sync` | Agent reports detected files |
+| `POST` | `/watch-folders/{id}/upload` | Agent uploads a file |
+
+### Camera-to-Cloud Ingest
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/ingest/upload` | Upload from mobile/camera-to-cloud app |
+| `GET` | `/ingest/status/{video_id}` | Check proxy generation status |
+
+## NLE Plugin Architecture
+
+All NLE plugins share the same REST API surface:
+
+- **Premiere Pro**: CEP panel (`integrations/premiere-pro/`) — ExtendScript bridge reads/writes sequence markers
+- **DaVinci Resolve**: Python script (`integrations/davinci-resolve/`) — DaVinciResolveScript for timeline markers
+- **Final Cut Pro X**: CLI tool (`integrations/fcpx/`) — FCPXML round-trip export/import
+- **After Effects**: CEP panel (`integrations/after-effects/`) — ExtendScript bridge for comp markers
+- **Watch Folder**: Python agent (`integrations/watch-folder/`) — watchdog-based filesystem monitor
+
+## Proxy Generation
+
+Auto-proxy generates a 540p H.264 review proxy when `PROXY_AUTO_GENERATE=1`. Requires `ffmpeg` on the worker machine. Supported profiles:
+
+| Profile | Resolution | Bitrate | Audio |
+|---------|-----------|---------|-------|
+| `540p_h264` | 960×540 | 2 Mbps | AAC 128k |
+| `720p_h264` | 1280×720 | 4 Mbps | AAC 192k |
+| `1080p_h264` | 1920×1080 | 8 Mbps | AAC 256k |
+
 ## Plugin roadmap
 
 A host-side extension should:
 
 1. Call the authenticated export endpoint (store API base URL + token securely).
-2. Save the response to a temp path and run the host’s marker import, or parse XML and call the host SDK directly.
+2. Save the response to a temp path and run the host's marker import, or parse XML and call the host SDK directly.
 3. Map comment `text` to marker names and `timecode` to marker start.
 
 DaVinci Resolve Studio supports Python scripting; Premiere uses ExtendScript CEP. Keep marker text under host limits (often 255–512 characters).

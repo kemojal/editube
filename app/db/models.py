@@ -428,6 +428,11 @@ class Video(Base):
         back_populates="video",
         cascade="all, delete-orphan",
     )
+    proxies = relationship(
+        "VideoProxy",
+        back_populates="video",
+        cascade="all, delete-orphan",
+    )
 
 
 class VideoTranscription(Base):
@@ -1588,6 +1593,76 @@ class ProjectEstimate(Base):
     project = relationship("Project")
 
 
+# =====================================================================
+# Editor Integration models (NLE sync, proxies, watch folders)
+# =====================================================================
+
+
+class VideoProxy(Base):
+    """Proxy renditions of original video uploads for fast NLE review."""
+
+    __tablename__ = "video_proxies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    profile = Column(String, nullable=False, index=True)  # 540p_h264 | 720p_h264 | 1080p_h264
+    status = Column(String, server_default="pending", nullable=False)  # pending|processing|completed|failed
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    bitrate_kbps = Column(Integer, nullable=True)
+    codec = Column(String, nullable=True)
+    file_url = Column(String, nullable=True)
+    file_path_local = Column(String, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    duration = Column(Integer, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    video = relationship("Video", back_populates="proxies")
+
+
+class WatchFolderConfig(Base):
+    """Per-user/project watch folder settings for auto-upload."""
+
+    __tablename__ = "watch_folder_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    folder_path = Column(String, nullable=False)
+    auto_proxy = Column(Boolean, server_default="true", nullable=False)
+    auto_version = Column(Boolean, server_default="true", nullable=False)
+    file_pattern = Column(String, server_default="*", nullable=False)  # glob, e.g. "*.mp4,*.mov"
+    last_sync_at = Column(TIMESTAMP, nullable=True)
+    is_active = Column(Boolean, server_default="true", nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User")
+    project = relationship("Project")
+
+
+class NLESession(Base):
+    """Tracks active NLE integration connections (Premiere, Resolve, FCP X, AE)."""
+
+    __tablename__ = "nle_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    nle_type = Column(String, nullable=False, index=True)  # premiere|resolve|fcpx|after_effects
+    nle_version = Column(String, nullable=True)
+    host_name = Column(String, nullable=True)
+    last_sync_at = Column(TIMESTAMP, nullable=True)
+    sync_direction = Column(String, server_default="bidirectional", nullable=False)  # push|pull|bidirectional
+    is_active = Column(Boolean, server_default="true", nullable=False)
+    extra = Column(JSONB, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User")
+    project = relationship("Project")
 
 
 # class ProjectAnalytics(Base):

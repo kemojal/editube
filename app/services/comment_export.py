@@ -193,6 +193,132 @@ def export_comments_pdf(comments: Sequence[Comment], video_name: str) -> bytes:
     return out
 
 
+def export_comments_ae_jsx(comments: Sequence[Comment]) -> bytes:
+    """Generate After Effects ExtendScript (.jsx) that adds markers to the active comp."""
+    lines: List[str] = [
+        "// Editube comment markers — run in After Effects ExtendScript",
+        "var comp = app.project.activeItem;",
+        "if (comp && comp instanceof CompItem) {",
+    ]
+    for c in _flat_comments_in_order(comments):
+        if c.parent_id is not None:
+            continue
+        tc = max(0, int(c.timecode or 0))
+        safe = ((c.text or "")[:200]).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+        author = _author(c).replace('"', '\\"')
+        lines.append(f'  var m = new MarkerValue("{safe}");')
+        lines.append(f'  m.comment = "{author}";')
+        lines.append(f"  comp.markerProperty.setValueAtTime({tc}, m);")
+    lines.append("} else {")
+    lines.append('  alert("No active composition — open a comp first.");')
+    lines.append("}")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def export_comments_resolve_otio(comments: Sequence[Comment], duration_sec: int = 3600) -> bytes:
+    """Generate OpenTimelineIO JSON with markers for DaVinci Resolve.
+
+    Resolve can import OTIO files via Workflow Integration API or File > Import.
+    This creates a minimal timeline with marker annotations.
+    """
+    markers = []
+    for c in _flat_comments_in_order(comments):
+        if c.parent_id is not None:
+            continue
+        tc = max(0, int(c.timecode or 0))
+        text = ((c.text or "")[:200]).replace("\n", " ")
+        author = _author(c)
+        markers.append({
+            "OTIO_SCHEMA": "Marker.2",
+            "metadata": {"editube_id": c.id, "author": author},
+            "name": text[:80] or "comment",
+            "color": "RED",
+            "marked_range": {
+                "OTIO_SCHEMA": "TimeRange.1",
+                "start_time": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "value": tc * 24,
+                    "rate": 24.0,
+                },
+                "duration": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "value": 24,
+                    "rate": 24.0,
+                },
+            },
+            "comment": text,
+        })
+
+    import json
+    otio = {
+        "OTIO_SCHEMA": "Timeline.1",
+        "metadata": {"source": "editube"},
+        "name": "Editube Comments",
+        "tracks": {
+            "OTIO_SCHEMA": "Stack.1",
+            "children": [
+                {
+                    "OTIO_SCHEMA": "Track.1",
+                    "name": "Comments",
+                    "kind": "Video",
+                    "children": [
+                        {
+                            "OTIO_SCHEMA": "Gap.1",
+                            "source_range": {
+                                "OTIO_SCHEMA": "TimeRange.1",
+                                "start_time": {
+                                    "OTIO_SCHEMA": "RationalTime.1",
+                                    "value": 0,
+                                    "rate": 24.0,
+                                },
+                                "duration": {
+                                    "OTIO_SCHEMA": "RationalTime.1",
+                                    "value": duration_sec * 24,
+                                    "rate": 24.0,
+                                },
+                            },
+                            "markers": markers,
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+    return json.dumps(otio, indent=2).encode("utf-8")
+
+
+def import_comments_from_fcpxml(xml_bytes: bytes) -> List[dict]:
+    """Parse FCPXML markers and return a list of marker dicts.
+
+    Each dict has shape: {"timecode_sec": int, "text": str, "end_timecode_sec": int|None}.
+    The caller is responsible for creating Comment rows from these.
+    """
+    root = ET.fromstring(xml_bytes)
+    markers: List[dict] = []
+
+    def _parse_offset(val: str) -> int:
+        """Parse FCPXML time values like '10s', '100/30s', '10.5s'."""
+        if not val:
+            return 0
+        val = val.strip().rstrip("s")
+        if "/" in val:
+            parts = val.split("/")
+            return int(float(parts[0]) / float(parts[1]))
+        return int(float(val))
+
+    for marker in root.iter("marker"):
+        start = _parse_offset(marker.get("start", "0s"))
+        dur = _parse_offset(marker.get("duration", "1s"))
+        text = marker.get("value", "").strip() or marker.get("name", "comment")
+        markers.append({
+            "timecode_sec": start,
+            "end_timecode_sec": start + dur if dur > 1 else None,
+            "text": text,
+        })
+
+    return markers
+
+
 def export_comments(comments: Sequence[Comment], fmt: str, video_name: str = "Video") -> tuple[bytes, str, str]:
     f = fmt.lower().strip()
     if f == "csv":
@@ -205,4 +331,9 @@ def export_comments(comments: Sequence[Comment], fmt: str, video_name: str = "Vi
         return export_comments_premiere_xml(comments), "application/xml", "comments_premiere.xml"
     if f == "pdf":
         return export_comments_pdf(comments, video_name), "application/pdf", "comments.pdf"
+    if f in ("ae", "jsx", "after_effects"):
+        return export_comments_ae_jsx(comments), "text/plain", "comments_ae.jsx"
+    if f in ("otio", "resolve"):
+        return export_comments_resolve_otio(comments), "application/json", "comments.otio"
     raise ValueError(f"Unknown export format: {fmt}")
+

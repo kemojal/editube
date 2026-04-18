@@ -316,3 +316,50 @@ def enqueue_push_notification_job(user_id: int, notification_id: int) -> bool:
             e,
         )
         return False
+
+
+def enqueue_proxy_generation_job(proxy_id: int) -> bool:
+    """Enqueue FFmpeg proxy transcoding for a VideoProxy row."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; proxy generation not enqueued for proxy %s", proxy_id)
+        return False
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=7200)
+        q.enqueue(
+            "app.jobs.proxy_generation.proxy_generation_job",
+            proxy_id,
+            job_timeout=7200,
+        )
+        return True
+    except Exception as e:
+        logger.exception("Failed to enqueue proxy generation for proxy %s: %s", proxy_id, e)
+        return False
+
+
+def enqueue_watch_folder_sync_job(config_id: int) -> bool:
+    """Enqueue watch folder sync processing."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; watch folder sync not enqueued for config %s", config_id)
+        return False
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=1800)
+        q.enqueue(
+            "app.jobs.watch_folder_sync.watch_folder_sync_job",
+            config_id,
+            job_timeout=1800,
+        )
+        return True
+    except Exception as e:
+        logger.exception("Failed to enqueue watch folder sync for config %s: %s", config_id, e)
+        return False
+

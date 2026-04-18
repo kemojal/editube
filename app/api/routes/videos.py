@@ -132,6 +132,13 @@ def upload_video(
     except Exception as e:
         logger.warning("Transcription job not enqueued for video %s: %s", db_video.id, e)
 
+    # Auto-generate review proxy if enabled
+    try:
+        from app.services.proxy_service import auto_proxy_on_upload
+        auto_proxy_on_upload(db, db_video.id)
+    except Exception as e:
+        logger.warning("Auto-proxy not triggered for video %s: %s", db_video.id, e)
+
     db_video = (
         db.query(Video)
         .options(
