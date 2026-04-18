@@ -3,6 +3,15 @@ from datetime import datetime
 from typing import Optional, List
 
 
+class ContributorInfo(BaseModel):
+    id: Optional[int] = None
+    name: str
+    avatar_url: Optional[str] = None
+
+    class Config:
+        orm_mode = True
+
+
 class FolderCreate(BaseModel):
     name: str
     parent_id: Optional[int] = None
@@ -38,6 +47,9 @@ class VideoResponse(BaseModel):
     uploader_id: int
     created_at: datetime
     updated_at: datetime
+    comment_count: int = 0
+    task_count: int = 0
+    contributors: List[ContributorInfo] = []
 
     class Config:
         orm_mode = True

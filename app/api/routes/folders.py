@@ -1,11 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from typing import Optional, List
 
 from app.db.database import get_db
-from app.db.models import Project, Folder, Video, User
+from app.db.models import Annotation, Comment, Project, Folder, Video, User
 from app.services.project_access import assert_write_project_content, can_access_project
 from app.api.models.folders import (
+    ContributorInfo,
     FolderCreate,
     FolderUpdate,
     FolderResponse,
@@ -90,6 +92,77 @@ def get_project_contents(
 
     breadcrumb = _build_breadcrumb(db, parent_id)
 
+    # ---- per-video stats ------------------------------------------------
+    video_ids = [v.id for v in videos]
+    comment_counts: dict[int, int] = {}
+    task_counts: dict[int, int] = {}
+    contributors_map: dict[int, list] = {v.id: [] for v in videos}
+    seen_users: dict[int, set] = {v.id: set() for v in videos}
+
+    if video_ids:
+        for vid_id, cnt in (
+            db.query(Comment.video_id, func.count(Comment.id))
+            .filter(Comment.video_id.in_(video_ids), Comment.parent_id.is_(None))
+            .group_by(Comment.video_id)
+            .all()
+        ):
+            comment_counts[vid_id] = cnt
+
+        for vid_id, cnt in (
+            db.query(Comment.video_id, func.count(Comment.id))
+            .filter(
+                Comment.video_id.in_(video_ids),
+                Comment.parent_id.is_(None),
+                Comment.assignee_user_id.isnot(None),
+            )
+            .group_by(Comment.video_id)
+            .all()
+        ):
+            task_counts[vid_id] = cnt
+
+        for vid_id, uid, uname, uavatar in (
+            db.query(Comment.video_id, User.id, User.name, User.avatar_url)
+            .join(User, User.id == Comment.user_id)
+            .filter(
+                Comment.video_id.in_(video_ids),
+                Comment.parent_id.is_(None),
+                Comment.user_id.isnot(None),
+            )
+            .all()
+        ):
+            if uid not in seen_users[vid_id]:
+                seen_users[vid_id].add(uid)
+                contributors_map[vid_id].append(
+                    ContributorInfo(id=uid, name=uname, avatar_url=uavatar)
+                )
+
+        for vid_id, uid, uname, uavatar in (
+            db.query(Annotation.video_id, User.id, User.name, User.avatar_url)
+            .join(User, User.id == Annotation.user_id)
+            .filter(Annotation.video_id.in_(video_ids))
+            .all()
+        ):
+            if uid not in seen_users[vid_id]:
+                seen_users[vid_id].add(uid)
+                contributors_map[vid_id].append(
+                    ContributorInfo(id=uid, name=uname, avatar_url=uavatar)
+                )
+
+        for vid_id, gname, gavatar in (
+            db.query(Comment.video_id, Comment.guest_name, Comment.guest_avatar_url)
+            .filter(
+                Comment.video_id.in_(video_ids),
+                Comment.parent_id.is_(None),
+                Comment.user_id.is_(None),
+                Comment.guest_name.isnot(None),
+            )
+            .all()
+        ):
+            contributors_map[vid_id].append(
+                ContributorInfo(id=None, name=gname, avatar_url=gavatar)
+            )
+    # ---------------------------------------------------------------------
+
     folder_responses = [
         FolderResponse(
             id=f.id,
@@ -115,6 +188,9 @@ def get_project_contents(
             uploader_id=v.uploader_id,
             created_at=v.created_at,
             updated_at=v.updated_at,
+            comment_count=comment_counts.get(v.id, 0),
+            task_count=task_counts.get(v.id, 0),
+            contributors=contributors_map.get(v.id, []),
         )
         for v in videos
     ]
