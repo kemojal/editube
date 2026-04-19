@@ -1665,30 +1665,73 @@ class NLESession(Base):
     project = relationship("Project")
 
 
-# class ProjectAnalytics(Base):
-#     __tablename__ = "ProjectAnalytics"
+# =====================================================================
+# COMMUNITY FORUM MODELS (Schema: community)
+# =====================================================================
 
-#     id = Column(Integer, primary_key=True, index=True)
-#     projectId = Column(Integer, ForeignKey("projects.id"), nullable=False)
-#     videoCount = Column(Integer, nullable=False, default=0)
-#     commentCount = Column(Integer, nullable=False, default=0)
-#     collaboratorCount = Column(Integer, nullable=False, default=0)
-#     lastActivity = Column(TIMESTAMP)
-#     createdAt = Column(TIMESTAMP, nullable=False, server_default=func.now())
-#     updatedAt = Column(TIMESTAMP, nullable=False, server_default=func.now())
+class ForumCategory(Base):
+    __tablename__ = "categories"
+    __table_args__ = {"schema": "community"}
 
-#     project = relationship("Project", back_populates="analytics")
+    id = Column(Integer, primary_key=True, index=True)
+    slug = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    color = Column(String, nullable=True, server_default="#8B5CF6")
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
-# class UserAnalytics(Base):
-#     __tablename__ = "UserAnalytics"
+    posts = relationship("ForumPost", back_populates="category", cascade="all, delete-orphan")
 
-#     id = Column(Integer, primary_key=True, index=True)
-#     userId = Column(Integer, ForeignKey("users.id"), nullable=False)
-#     projectsCollaborated = Column(ARRAY(Integer))
-#     videosUploaded = Column(Integer, nullable=False, default=0)
-#     commentsPosted = Column(Integer, nullable=False, default=0)
-#     lastActivity = Column(TIMESTAMP)
-#     createdAt = Column(TIMESTAMP, nullable=False, server_default=func.now())
-#     updatedAt = Column(TIMESTAMP, nullable=False, server_default=func.now())
 
-#     user = relationship("User", back_populates="analytics")
+class ForumPost(Base):
+    __tablename__ = "posts"
+    __table_args__ = {"schema": "community"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    status = Column(String, server_default="open", index=True, nullable=False) # open, planned, in_progress, completed, closed
+    view_count = Column(Integer, server_default="0", nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    category_id = Column(Integer, ForeignKey("community.categories.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User")
+    category = relationship("ForumCategory", back_populates="posts")
+    comments = relationship("ForumComment", back_populates="post", cascade="all, delete-orphan")
+    votes = relationship("ForumVote", back_populates="post", cascade="all, delete-orphan")
+
+
+class ForumComment(Base):
+    __tablename__ = "comments"
+    __table_args__ = {"schema": "community"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    content = Column(Text, nullable=False)
+    post_id = Column(Integer, ForeignKey("community.posts.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    parent_id = Column(Integer, ForeignKey("community.comments.id", ondelete="CASCADE"), nullable=True, index=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    post = relationship("ForumPost", back_populates="comments")
+    user = relationship("User")
+    parent = relationship("ForumComment", remote_side=[id], back_populates="replies")
+    replies = relationship("ForumComment", back_populates="parent", cascade="all, delete-orphan")
+
+
+class ForumVote(Base):
+    __tablename__ = "votes"
+    __table_args__ = (
+        UniqueConstraint("post_id", "user_id", name="uq_forum_votes_post_user"),
+        {"schema": "community"}
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("community.posts.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    post = relationship("ForumPost", back_populates="votes")
+    user = relationship("User")
