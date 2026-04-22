@@ -341,6 +341,26 @@ def enqueue_proxy_generation_job(proxy_id: int) -> bool:
         return False
 
 
+def enqueue_clip_render_job(clip_id: int) -> str | None:
+    """Enqueue clip render. Returns the RQ job id if queued, else None."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; clip render not enqueued for clip %s", clip_id)
+        return None
+    try:
+        from app.jobs.clip_render import clip_render_job
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=7200)
+        job = q.enqueue(clip_render_job, clip_id, job_timeout=7200)
+        return job.id
+    except Exception as e:
+        logger.exception("Failed to enqueue clip render for clip %s: %s", clip_id, e)
+        return None
+
+
 def enqueue_watch_folder_sync_job(config_id: int) -> bool:
     """Enqueue watch folder sync processing."""
     url = os.environ.get("REDIS_URL", "").strip()

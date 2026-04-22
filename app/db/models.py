@@ -1734,4 +1734,176 @@ class ForumVote(Base):
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
     post = relationship("ForumPost", back_populates="votes")
+
+
+# ---------------------------------------------------------------------------
+# Repurpose (OpusClip-style short-clip pipeline)
+# ---------------------------------------------------------------------------
+
+
+class Clip(Base):
+    """A short clip cut from a source video for social repurposing."""
+
+    __tablename__ = "clips"
+    __table_args__ = {"schema": "repurpose"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(
+        Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    name = Column(String, nullable=False, server_default="Untitled clip")
+    start_time = Column(Float, nullable=False)
+    end_time = Column(Float, nullable=False)
+    duration_seconds = Column(Float, nullable=True)
+    aspect_ratio = Column(String, nullable=False, server_default="9:16")
+    virality_score = Column(Float, nullable=True)
+    status = Column(String, nullable=False, server_default="draft", index=True)
+    render_progress = Column(Integer, nullable=False, server_default="0")
+    render_error = Column(Text, nullable=True)
+    storage_path = Column(String, nullable=True)
+    thumbnail_url = Column(String, nullable=True)
+    transcript_text = Column(Text, nullable=True)
+    is_ai_suggested = Column(Boolean, nullable=False, server_default="false")
+    suggestion_reason = Column(Text, nullable=True)
+    hooks_matched = Column(JSONB, nullable=True)
+    preset = Column(String, nullable=True)
+    rq_job_id = Column(String, nullable=True)
+    completed_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    video = relationship("Video")
+    user = relationship("User")
+    style = relationship(
+        "ClipStyle",
+        back_populates="clip",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class ClipStyle(Base):
+    """Caption/motion style for a clip (1:1 with Clip)."""
+
+    __tablename__ = "clip_styles"
+    __table_args__ = {"schema": "repurpose"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    clip_id = Column(
+        Integer,
+        ForeignKey("repurpose.clips.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    caption_enabled = Column(Boolean, nullable=False, server_default="true")
+    caption_font = Column(String, nullable=False, server_default="Inter")
+    caption_size = Column(Integer, nullable=False, server_default="56")
+    caption_color = Column(String, nullable=False, server_default="#FFFFFF")
+    caption_bg_color = Column(String, nullable=True)
+    caption_position = Column(String, nullable=False, server_default="bottom")
+    caption_animation = Column(String, nullable=True)
+    caption_max_words = Column(Integer, nullable=False, server_default="4")
+    caption_words_per_line = Column(Integer, nullable=False, server_default="3")
+    caption_max_lines = Column(Integer, nullable=False, server_default="2")
+    caption_highlight_color = Column(String, nullable=False, server_default="#FACC15")
+    caption_highlight_style = Column(String, nullable=False, server_default="color")
+    caption_stroke_color = Column(String, nullable=True, server_default="#000000")
+    caption_stroke_width = Column(Integer, nullable=False, server_default="3")
+    caption_font_weight = Column(String, nullable=False, server_default="700")
+    caption_position_y = Column(Float, nullable=True, server_default="85")
+    caption_position_x = Column(Float, nullable=True, server_default="50")
+    caption_uppercase = Column(Boolean, nullable=False, server_default="false")
+    brand_logo_url = Column(String, nullable=True)
+    brand_logo_position = Column(String, nullable=True, server_default="top-right")
+    brand_logo_scale = Column(Float, nullable=False, server_default="0.12")
+    brand_watermark_opacity = Column(Float, nullable=False, server_default="0.85")
+    background_music_url = Column(String, nullable=True)
+    background_music_volume = Column(Float, nullable=False, server_default="0.25")
+    original_audio_volume = Column(Float, nullable=False, server_default="1.0")
+    video_keyframes = Column(JSONB, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    clip = relationship("Clip", back_populates="style")
+
+
+class ClipTemplate(Base):
+    """Reusable caption/motion preset. user_id NULL = global built-in."""
+
+    __tablename__ = "clip_templates"
+    __table_args__ = {"schema": "repurpose"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    name = Column(String, nullable=False)
+    category = Column(String, nullable=False, server_default="social")
+    is_public = Column(Boolean, nullable=False, server_default="false")
+    preview_url = Column(String, nullable=True)
+    style_config = Column(JSONB, nullable=False)
+    usage_count = Column(Integer, nullable=False, server_default="0")
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user = relationship("User")
+
+
+class RepurposeJob(Base):
+    __tablename__ = "repurpose_jobs"
+    __table_args__ = {"schema": "repurpose"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="SET NULL"), nullable=True)
+    source_mode = Column(String, nullable=False)  # youtube_url | upload | project_video
+    source_url = Column(Text, nullable=True)
+    source_file_url = Column(Text, nullable=True)
+    source_title = Column(String, nullable=True)
+    source_meta = Column(JSONB, nullable=True)
+    clip_mode = Column(String, nullable=False, server_default="basic")
+    clip_anything_prompt = Column(Text, nullable=True)
+    genres = Column(JSONB, nullable=True)
+    clip_length_bucket = Column(String, nullable=False)
+    subtitle_template_id = Column(Integer, nullable=True)
+    aspect_ratio = Column(String, nullable=False, server_default="9:16")
+    source_trim_seconds = Column(Integer, nullable=True)
+    status = Column(String, nullable=False, server_default="queued")
+    created_clip_ids = Column(JSONB, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User")
+    project = relationship("Project")
+    video = relationship("Video")
+
+
+class RepurposeUserDefaults(Base):
+    __tablename__ = "user_defaults"
+    __table_args__ = {"schema": "repurpose"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True, unique=True)
+    clip_mode = Column(String, nullable=False, server_default="basic")
+    default_prompt = Column(Text, nullable=True)
+    genres = Column(JSONB, nullable=True)
+    clip_length_bucket = Column(String, nullable=False, server_default="lt_30")
+    subtitle_template_id = Column(Integer, nullable=True)
+    aspect_ratio = Column(String, nullable=False, server_default="9:16")
+    source_trim_seconds = Column(Integer, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
     user = relationship("User")

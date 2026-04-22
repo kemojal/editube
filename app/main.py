@@ -153,6 +153,14 @@ cloudinary.config(
 
 app.include_router(api_router)
 
+# Serve rendered clips (and other local uploads) in dev so the frontend can play
+# and download the mp4 produced by the clip render worker.
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+_uploads_dir = os.path.abspath(os.environ.get("UPLOADS_DIR", "./uploads"))
+os.makedirs(_uploads_dir, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=_uploads_dir), name="uploads")
+
 # Include the WebSocket app
 # app.mount("/", websocket_app)
 
