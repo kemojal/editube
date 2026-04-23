@@ -22,12 +22,15 @@ def enqueue_transcription_job(video_id: int) -> bool:
         from redis import Redis
         from rq import Queue
 
+        timeout_sec = int(os.environ.get("TRANSCRIPTION_JOB_TIMEOUT_SEC", "14400") or "14400")
+        timeout_sec = max(600, min(timeout_sec, 86400))
+
         conn = Redis.from_url(url)
-        q = Queue("default", connection=conn, default_timeout=3600)
+        q = Queue("default", connection=conn, default_timeout=timeout_sec)
         q.enqueue(
             transcribe_video,
             video_id,
-            job_timeout=3600,
+            job_timeout=timeout_sec,
         )
         return True
     except Exception as e:
@@ -264,6 +267,25 @@ def enqueue_review_forensic_package_job(forensic_asset_id: int) -> bool:
             forensic_asset_id,
         )
         return False
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=1800)
+        q.enqueue(
+            "app.jobs.review_forensic.package_forensic_asset_job",
+            forensic_asset_id,
+            job_timeout=1800,
+        )
+        return True
+    except Exception as e:
+        logger.exception(
+            "Failed to enqueue forensic packaging for asset %s: %s",
+            forensic_asset_id,
+            e,
+        )
+        return False
 
 
 def enqueue_push_notification_job(user_id: int, notification_id: int) -> bool:
@@ -294,25 +316,6 @@ def enqueue_push_notification_job(user_id: int, notification_id: int) -> bool:
             "Failed to enqueue push notification for user %s notification %s: %s",
             user_id,
             notification_id,
-            e,
-        )
-        return False
-    try:
-        from redis import Redis
-        from rq import Queue
-
-        conn = Redis.from_url(url)
-        q = Queue("default", connection=conn, default_timeout=1800)
-        q.enqueue(
-            "app.jobs.review_forensic.package_forensic_asset_job",
-            forensic_asset_id,
-            job_timeout=1800,
-        )
-        return True
-    except Exception as e:
-        logger.exception(
-            "Failed to enqueue forensic packaging for asset %s: %s",
-            forensic_asset_id,
             e,
         )
         return False

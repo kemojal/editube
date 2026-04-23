@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db.database import get_db
@@ -51,6 +51,10 @@ def _video_with_project_payload(
 @router.post("/{video_id}/transcription", response_model=VideoWithProjectResponse)
 def start_video_transcription(
     video_id: int,
+    force: bool = Query(
+        False,
+        description="If true, reset stuck queued/processing and enqueue again (worker crash, RQ timeout, expired URL).",
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -74,7 +78,7 @@ def start_video_transcription(
         raise HTTPException(status_code=403, detail="Not authorized to access this video")
     assert_write_project_content(db, current_user, db_project)
 
-    prepare_and_enqueue_transcription(db, video_id)
+    prepare_and_enqueue_transcription(db, video_id, force=force)
 
     db_video = (
         db.query(Video)

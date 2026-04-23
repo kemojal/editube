@@ -26,6 +26,7 @@ class VideoTranscriptionNested(BaseModel):
     speakers: Optional[List[str]] = None
     speaker_count: Optional[int] = None
     error_message: Optional[str] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         orm_mode = True

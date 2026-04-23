@@ -1,33 +1,12 @@
-# router/upload.py
+from fastapi import APIRouter, HTTPException, status, UploadFile, File
+from app.utils.cloudinary import upload_file_to_cloudinary_with_meta
 
-from fastapi import APIRouter, HTTPException, status, UploadFile
-from typing import List
-from app.utils.cloudinary import upload_image
-
-from pydantic import BaseModel
-
-router = APIRouter(
-    prefix="/upload",
-    tags=["Upload"],
-)
-
-
-class Item(BaseModel):
-    image: str
-    
-
-    class Config:
-        orm_mode = True
+router = APIRouter(prefix="/upload", tags=["Upload"])
 
 @router.post("/video")
-async def handle_upload(image: Item):
-    print("image test 00 ", image.filename)
+async def handle_upload(video_file: UploadFile = File(...)):
     try:
-        url = await upload_image(image)
-        return {
-            "data": {
-                "url": url
-            }
-        }
+        upload = upload_file_to_cloudinary_with_meta(video_file, resource_type="video")
+        return {"file_path": str(upload["url"])}
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))

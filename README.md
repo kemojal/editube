@@ -67,9 +67,9 @@ Transactional email (invitations, subscription welcome/cancel) uses SMTP when co
 ### What happens
 
 1. On **POST** `/projects/{project_id}/videos/` (upload), the API creates a **`video_transcriptions`** row (`status` starts as `pending`, then `queued` if the job is enqueued).
-2. A separate **RQ worker** runs `app.jobs.transcription.transcribe_video(video_id)`: downloads the stored video URL, runs **ffmpeg** to 16 kHz mono WAV, runs **faster-whisper**, writes **`segments`** (JSON list of `start` / `end` / `text` in seconds) and sets **`completed`** or **`failed`** (+ `error_message`).
+2. A separate **RQ worker** runs `app.jobs.transcription.transcribe_video(video_id)`: **ffmpeg** reads a media URL. For **YouTube**, the worker resolves a fresh **audio** stream via `yt-dlp` using **`videos.ingest_page_url`** (canonical watch URL) or the repurpose job’s `source_url` — **not** `videos.file_path` alone (that URL is often **video-only** DASH, which yields empty transcripts under `ffmpeg -vn`). Then **faster-whisper** writes **`segments`** (`start` / `end` / `text` in seconds) and sets **`completed`** or **`failed`** (+ `error_message`). *(This stack is **editube** Postgres + Alembic; the **reelcut** repo uses a separate Go schema and is not the same database.)*
 3. The player loads **`GET /videos/{video_id}`** (or project-scoped video detail); the JSON includes nested **`transcription`** (`status`, `segments`, `error_message`). The frontend polls while `status` is `pending`, `queued`, or `processing`.
-4. To **start or retry** transcription (e.g. legacy videos, failed jobs, or stuck `pending`), call **`POST /videos/{video_id}/transcription`** or **`POST /projects/{project_id}/videos/{video_id}/transcription`** (same access rules as the video). Returns the same payload shape as **`GET /videos/{video_id}`**. If a job is already **`queued`** or **`processing`**, the API responds **409**.
+4. To **start or retry** transcription (e.g. legacy videos, failed jobs, or stuck `pending`), call **`POST /videos/{video_id}/transcription`** or **`POST /projects/{project_id}/videos/{video_id}/transcription`** (same access rules as the video). Returns the same payload shape as **`GET /videos/{video_id}`**. If a job is already **`queued`** or **`processing`**, the API responds **409** unless you pass **`?force=true`**, which resets a stuck row and enqueues again (after a worker crash, RQ timeout, or expired YouTube signed URL).
 
 ### Dependencies
 
@@ -81,9 +81,13 @@ Transcription/ML extras are in `requirements-ml.txt` (`faster-whisper`, `whisper
 | Variable | Description |
 |----------|-------------|
 | `REDIS_URL` | Broker for RQ (see table above). |
-| `WHISPER_MODEL_SIZE` | faster-whisper model id (default `base`). Larger models are slower and heavier. |
+| `WHISPER_MODEL_SIZE` | faster-whisper model id (default `base`). Use **`tiny`** for much faster local dev on CPU. |
+| `WHISPER_BEAM_SIZE` | Decoder beam size (default **`1`**; max `5`). Higher is slower with modest quality gains. |
 | `TRANSCRIPTION_DEVICE` | `cpu` or `cuda` (default `cpu`). |
 | `TRANSCRIPTION_COMPUTE_TYPE` | e.g. `int8`, `float16` (default `int8` on CPU; use `float16` on GPU as appropriate). |
+| `TRANSCRIPTION_JOB_TIMEOUT_SEC` | RQ **`job_timeout`** for `transcribe_video` (default **`14400`** = 4h). Long videos on CPU may exceed 1h. |
+| `FFMPEG_PROCESS_TIMEOUT_SEC` | **`subprocess`** timeout for the ffmpeg extract step (default **`10800`** = 3h). |
+| `FFMPEG_USER_AGENT` | Optional. Set if **ffmpeg** cannot open a remote URL (some CDNs require a browser-like User-Agent). |
 
 ### Run the worker (second terminal)
 
@@ -97,6 +101,45 @@ rq worker -u "$REDIS_URL" default
 ```
 
 The job function is registered as **`app.jobs.transcription.transcribe_video`**. RQ **`job_timeout`** is set to **3600** seconds in code for long files.
+
+### One-command local run (API + worker)
+
+If your clips/transcriptions get stuck in `queued` because the worker is not running, start both processes together:
+
+```bash
+cd editube
+chmod +x scripts/dev_with_worker.sh
+./scripts/dev_with_worker.sh
+```
+
+This runs:
+- `rq worker -u "$REDIS_URL" default`
+- `uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload` (when port 8000 is free)
+
+On macOS, the script also sets `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` to avoid fork-related worker crashes.
+
+### Queue health check (API + CLI)
+
+Live queue diagnostics endpoint:
+
+```bash
+GET /health/queue
+```
+
+Response includes:
+- `redis_reachable`
+- `worker_connected`
+- `worker_count`
+- `queue_backlog_count`
+
+If this URL returns **404**, the API process on port 8000 was started **before** the route existed. Restart uvicorn (or run it with `--reload` as in `./scripts/dev_with_worker.sh` when nothing else is bound to 8000).
+
+CLI helper:
+
+```bash
+cd editube
+.venv/bin/python scripts/check_queue_health.py
+```
 
 ### Database
 

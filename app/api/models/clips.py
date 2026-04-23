@@ -113,6 +113,7 @@ class ClipUpdate(BaseModel):
     start_time: float | None = Field(default=None, ge=0)
     end_time: float | None = Field(default=None, gt=0)
     aspect_ratio: str | None = None
+    transcript_text: str | None = None
 
 
 class ClipOut(BaseModel):
@@ -220,7 +221,9 @@ class RepurposeJobCreate(BaseModel):
     clip_length_bucket: str = "lt_30"
     subtitle_template_id: int | None = None
     aspect_ratio: str = "9:16"
-    source_trim_seconds: int | None = Field(default=None, ge=5, le=7200)
+    source_range_start_seconds: float | None = Field(default=None, ge=0, le=43200)
+    source_range_end_seconds: float | None = Field(default=None, ge=1, le=43200)
+    source_trim_seconds: int | None = Field(default=None, ge=5, le=43200)
     save_as_default: bool = False
 
 
@@ -240,6 +243,8 @@ class RepurposeJobOut(BaseModel):
     clip_length_bucket: str
     subtitle_template_id: int | None
     aspect_ratio: str
+    source_range_start_seconds: float | None = None
+    source_range_end_seconds: float | None = None
     source_trim_seconds: int | None
     status: str
     created_clip_ids: list[int] | None

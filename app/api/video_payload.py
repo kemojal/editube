@@ -35,12 +35,16 @@ def _annotation_visible_to_viewer(annotation: Annotation, viewer_user_id: int) -
 def transcription_to_dict(tr: VideoTranscription | None) -> dict[str, Any] | None:
     if tr is None:
         return None
+    # JSON clients: use [] instead of null when no transcript has been persisted yet.
+    segments = tr.segments if tr.segments is not None else []
+    speakers = tr.speakers if tr.speakers is not None else []
     return {
         "status": tr.status,
-        "segments": tr.segments,
-        "speakers": tr.speakers,
-        "speaker_count": tr.speaker_count,
+        "segments": segments,
+        "speakers": speakers,
+        "speaker_count": tr.speaker_count if tr.speaker_count is not None else 0,
         "error_message": tr.error_message,
+        "updated_at": tr.updated_at,
     }
 
 

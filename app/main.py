@@ -719,6 +719,52 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/health/queue")
+async def queue_health():
+    """
+    Queue health snapshot for UI and CLI checks.
+    Reports Redis connectivity, worker presence on the default queue, and backlog size.
+    """
+    result = {
+        "status": "degraded",
+        "redis_reachable": False,
+        "worker_connected": False,
+        "worker_count": 0,
+        "queue_backlog_count": 0,
+        "queue_name": "default",
+        "error": None,
+    }
+
+    redis_url = (os.getenv("REDIS_URL") or "").strip()
+    if not redis_url:
+        result["error"] = "REDIS_URL not configured"
+        return result
+
+    try:
+        from redis import Redis
+        from rq import Queue, Worker
+
+        conn = Redis.from_url(redis_url)
+        conn.ping()
+        result["redis_reachable"] = True
+
+        queue = Queue("default", connection=conn)
+        result["queue_backlog_count"] = int(queue.count)
+
+        workers = Worker.all(connection=conn)
+        default_workers = sum(
+            1 for worker in workers if any(q.name == "default" for q in worker.queues)
+        )
+        result["worker_count"] = default_workers
+        result["worker_connected"] = default_workers > 0
+        result["status"] = "ok" if result["worker_connected"] else "degraded"
+    except Exception as exc:  # noqa: BLE001
+        result["status"] = "down"
+        result["error"] = str(exc)[:300]
+
+    return result
+
+
 @app.get("/")
 async def read_item():
     return {"hello word"}

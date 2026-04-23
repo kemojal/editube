@@ -52,10 +52,17 @@ def _build_prompt(
     min_duration: float,
     max_duration: float,
     max_suggestions: int,
+    focus_prompt: str | None = None,
 ) -> str:
     transcript_block = "\n".join(transcript_lines)
+    focus = (
+        f"\nUSER CLIPPING INTENT:\n{focus_prompt.strip()}\n"
+        if focus_prompt and focus_prompt.strip()
+        else ""
+    )
     return f"""You are an expert viral content curator for TikTok, Instagram Reels, and YouTube Shorts.
 Find the absolute BEST {max_suggestions} moments from the transcript below.
+{focus}
 
 FINDER HOOKS — prioritize clips that match one or more of these signals:
 1. LOUD WORDS / EMPHASIS — emphatic, punchy language, exclamations
@@ -235,6 +242,7 @@ def suggest_clips(
     max_duration: float = 60.0,
     max_suggestions: int = 8,
     video_duration: float | None = None,
+    focus_prompt: str | None = None,
 ) -> list[ClipSuggestion]:
     """
     Entry point. Returns up to max_suggestions ClipSuggestion instances,
@@ -251,7 +259,7 @@ def suggest_clips(
     if not lines:
         return []
 
-    prompt = _build_prompt(lines, min_duration, max_duration, max_suggestions)
+    prompt = _build_prompt(lines, min_duration, max_duration, max_suggestions, focus_prompt)
     try:
         raw = generate_text(prompt)
     except Exception as e:  # noqa: BLE001

@@ -403,7 +403,8 @@ class Video(Base):
     name = Column(String)
     description = Column(Text)
     version = Column(Integer)
-    file_path = Column(String)
+    file_path = Column(Text, nullable=False)
+    ingest_page_url = Column(Text, nullable=True)
     thumbnail_url = Column(String, nullable=True)
     status = Column(String, server_default="in_progress", nullable=False)  # in_progress, in_review, approved, needs_changes
     duration = Column(Integer, nullable=True)  # duration in seconds
