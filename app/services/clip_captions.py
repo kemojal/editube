@@ -63,6 +63,56 @@ def blocks_from_segments(
     return out
 
 
+def blocks_from_cuts(
+    segments: Iterable[dict[str, Any]],
+    *,
+    cuts: list[dict[str, float]],
+    words_per_line: int = 3,
+    max_lines: int = 2,
+    uppercase: bool = False,
+) -> list[CaptionBlock]:
+    """Caption blocks where each kept range is mapped onto the concat timeline.
+
+    For a cuts list `[[s1,e1], [s2,e2], ...]`, the rendered video plays the
+    ranges back-to-back. Caption start times must be shifted by the running
+    total of prior kept-range durations so they line up on the output clock.
+    Segments that fall entirely inside removed gaps are dropped; segments
+    straddling a boundary are split into pieces per intersecting range.
+    """
+    if not cuts:
+        return []
+
+    segs = list(segments or [])
+    out: list[CaptionBlock] = []
+    offset = 0.0
+    for cut in cuts:
+        cs = float(cut["start"])
+        ce = float(cut["end"])
+        if ce <= cs:
+            continue
+        range_dur = ce - cs
+        for seg in segs:
+            try:
+                s = float(seg.get("start", 0.0))
+                e = float(seg.get("end", 0.0))
+                text = str(seg.get("text", "")).strip()
+            except (TypeError, ValueError):
+                continue
+            if e <= cs or s >= ce:
+                continue
+            clipped_s = max(s, cs)
+            clipped_e = min(e, ce)
+            rel_start = offset + (clipped_s - cs)
+            rel_end = max(rel_start + 0.1, offset + (clipped_e - cs))
+            if uppercase:
+                text = text.upper()
+            lines = _chunk_words(text, words_per_line, max_lines)
+            if lines:
+                out.append(CaptionBlock(rel_start, rel_end, lines))
+        offset += range_dur
+    return out
+
+
 def _fmt_srt(t: float) -> str:
     if t < 0:
         t = 0.0

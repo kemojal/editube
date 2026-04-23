@@ -53,9 +53,14 @@ from app.api.models.clips import (
 )
 from app.services.clip_analysis import suggest_clips as run_suggest_clips
 from app.services.clip_captions import (
-    blocks_from_segments,
+    blocks_from_cuts,
     to_srt,
     to_vtt,
+)
+from app.services.clip_cuts import (
+    cuts_bounds,
+    cuts_total_duration,
+    normalize_cuts,
 )
 from app.services.project_access import can_access_project
 from app.services.project_access import assert_write_project_content
@@ -597,13 +602,21 @@ def create_clip(
         raise HTTPException(status_code=400, detail="end_time exceeds video duration")
 
     name = body.name or (body.transcript_text[:60] if body.transcript_text else "Untitled clip")
+    raw_cuts = [c.model_dump() for c in body.cuts] if body.cuts else None
+    cuts = normalize_cuts(
+        raw_cuts,
+        fallback_start=float(body.start_time),
+        fallback_end=float(body.end_time),
+    )
+    outer_start, outer_end = cuts_bounds(cuts)
     clip = Clip(
         video_id=body.video_id,
         user_id=current_user.id,
         name=name,
-        start_time=float(body.start_time),
-        end_time=float(body.end_time),
-        duration_seconds=float(body.end_time) - float(body.start_time),
+        start_time=outer_start,
+        end_time=outer_end,
+        cuts=cuts,
+        duration_seconds=cuts_total_duration(cuts),
         aspect_ratio=body.aspect_ratio or "9:16",
         virality_score=body.virality_score,
         status="draft",
@@ -617,6 +630,8 @@ def create_clip(
     db.refresh(clip)
     _ensure_style(db, clip)
     db.refresh(clip)
+
+    _auto_render_clip(db, clip)
     return _serialize_clip(clip)
 
 
@@ -662,26 +677,95 @@ def update_clip(
     current_user: User = Depends(get_current_user),
 ):
     clip = _clip_with_access(clip_id, db, current_user)
+    prior_cuts = list(clip.cuts or [])
+    prior_start = float(clip.start_time)
+    prior_end = float(clip.end_time)
+
     if body.name is not None:
         clip.name = body.name
     if body.aspect_ratio is not None:
         clip.aspect_ratio = body.aspect_ratio
-    if body.start_time is not None:
-        clip.start_time = float(body.start_time)
-    if body.end_time is not None:
-        clip.end_time = float(body.end_time)
     if body.transcript_text is not None:
         clip.transcript_text = body.transcript_text
-    if clip.end_time <= clip.start_time:
-        raise HTTPException(status_code=400, detail="end_time must be greater than start_time")
-    clip.duration_seconds = float(clip.end_time) - float(clip.start_time)
-    # Edit invalidates the render.
-    if clip.status == "ready":
+
+    # Cuts is the source of truth when provided; otherwise fall back to
+    # legacy single-range updates via start_time/end_time.
+    if body.cuts is not None:
+        raw = [c.model_dump() for c in body.cuts]
+        cuts = normalize_cuts(raw, fallback_start=prior_start, fallback_end=prior_end)
+    else:
+        new_start = float(body.start_time) if body.start_time is not None else prior_start
+        new_end = float(body.end_time) if body.end_time is not None else prior_end
+        if new_end <= new_start:
+            raise HTTPException(status_code=400, detail="end_time must be greater than start_time")
+        cuts = normalize_cuts(
+            [{"start": new_start, "end": new_end}],
+            fallback_start=new_start,
+            fallback_end=new_end,
+        )
+
+    outer_start, outer_end = cuts_bounds(cuts)
+    clip.cuts = cuts
+    clip.start_time = outer_start
+    clip.end_time = outer_end
+    clip.duration_seconds = cuts_total_duration(cuts)
+
+    cuts_changed = _cuts_differ(prior_cuts, cuts)
+    if cuts_changed and clip.status == "ready":
         clip.status = "draft"
         clip.storage_path = None
+
     db.commit()
     db.refresh(clip)
     return _serialize_clip(clip)
+
+
+def _cuts_differ(a: list, b: list) -> bool:
+    if len(a) != len(b):
+        return True
+    for x, y in zip(a, b):
+        xs = float(x.get("start", 0))
+        xe = float(x.get("end", 0))
+        ys = float(y.get("start", 0))
+        ye = float(y.get("end", 0))
+        if abs(xs - ys) > 1e-3 or abs(xe - ye) > 1e-3:
+            return True
+    return False
+
+
+def _auto_render_clip(db: Session, clip: Clip) -> None:
+    """Best-effort: kick off a render so each clip has its own MP4 + thumbnail.
+
+    Uses the background queue when Redis is available. Swallows failures so
+    the CRUD response stays fast; the user can still click Render manually.
+
+    Also extracts a fast single-frame thumbnail from the source synchronously
+    so the gallery has a real image before the render finishes.
+    """
+    try:
+        from app.jobs.queue import enqueue_clip_render_job
+        from app.services.clip_renderer import fast_thumbnail_for_clip
+
+        fast_thumbnail_for_clip(db, clip.id)
+
+        clip.status = "queued"
+        clip.render_progress = 0
+        clip.render_error = None
+        db.commit()
+        job_id = enqueue_clip_render_job(clip.id)
+        if job_id is None:
+            clip.status = "draft"
+            db.commit()
+            return
+        clip.rq_job_id = job_id
+        db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("auto-render enqueue failed for clip %s", clip.id)
+        try:
+            clip.status = "draft"
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
 
 
 @router.delete("/clips/{clip_id}", status_code=204)
@@ -771,10 +855,14 @@ def _blocks_for_clip(clip: Clip, db: Session):
     wpl = style.caption_words_per_line if style else 3
     ml = style.caption_max_lines if style else 2
     uc = bool(style.caption_uppercase) if style else False
-    return blocks_from_segments(
+    cuts = normalize_cuts(
+        list(clip.cuts or []),
+        fallback_start=float(clip.start_time),
+        fallback_end=float(clip.end_time),
+    )
+    return blocks_from_cuts(
         list(vt.segments),
-        clip_start=float(clip.start_time),
-        clip_end=float(clip.end_time),
+        cuts=cuts,
         words_per_line=wpl,
         max_lines=ml,
         uppercase=uc,

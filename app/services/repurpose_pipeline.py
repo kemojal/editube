@@ -184,6 +184,28 @@ def create_clips_for_repurpose_job(
     job.status = "completed"
     job.error_message = None
     db.commit()
+
+    # Fire-and-forget auto-render for every freshly suggested clip so each has
+    # its own MP4 + thumbnail instead of falling back to the source video.
+    if created_ids:
+        try:
+            from app.jobs.queue import enqueue_clip_render_job
+            from app.services.clip_renderer import fast_thumbnail_for_clip
+
+            for cid in created_ids:
+                clip_row = db.query(Clip).filter(Clip.id == cid).first()
+                if not clip_row:
+                    continue
+                fast_thumbnail_for_clip(db, cid)
+                job_id = enqueue_clip_render_job(cid)
+                if job_id is not None:
+                    clip_row.status = "queued"
+                    clip_row.rq_job_id = job_id
+            db.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("auto-render enqueue failed for repurpose job %s", job.id)
+            db.rollback()
+
     return created_ids
 
 
@@ -216,12 +238,15 @@ def _mark_job_failed(db: Session, job_id: int, message: str) -> None:
 
 
 def _clip_from_suggestion(job: RepurposeJob, suggestion: ClipSuggestion) -> Clip:
+    start = float(suggestion.start_time)
+    end = float(suggestion.end_time)
     return Clip(
         video_id=job.video_id,
         user_id=job.user_id,
         name=_clip_name(suggestion.transcript),
-        start_time=float(suggestion.start_time),
-        end_time=float(suggestion.end_time),
+        start_time=start,
+        end_time=end,
+        cuts=[{"start": start, "end": end}],
         duration_seconds=float(suggestion.duration),
         aspect_ratio=job.aspect_ratio or "9:16",
         virality_score=float(suggestion.virality_score),

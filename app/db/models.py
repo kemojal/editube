@@ -1758,6 +1758,10 @@ class Clip(Base):
     name = Column(String, nullable=False, server_default="Untitled clip")
     start_time = Column(Float, nullable=False)
     end_time = Column(Float, nullable=False)
+    # Ordered kept ranges on the source timeline. Invariant:
+    # first.start == start_time, last.end == end_time, sum(end-start) == duration_seconds.
+    # Transcript-based deletions shrink or split entries; renderer concats these.
+    cuts = Column(JSONB, nullable=False, server_default="[]")
     duration_seconds = Column(Float, nullable=True)
     aspect_ratio = Column(String, nullable=False, server_default="9:16")
     virality_score = Column(Float, nullable=True)

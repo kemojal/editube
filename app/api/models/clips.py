@@ -95,6 +95,11 @@ class ClipStyleUpdate(BaseModel):
     video_keyframes: Any | None = None
 
 
+class ClipRange(BaseModel):
+    start: float = Field(..., ge=0)
+    end: float = Field(..., gt=0)
+
+
 class ClipCreate(BaseModel):
     video_id: int
     name: str | None = None
@@ -106,6 +111,7 @@ class ClipCreate(BaseModel):
     suggestion_reason: str | None = None
     hooks_matched: list[str] | None = None
     transcript_text: str | None = None
+    cuts: list[ClipRange] | None = None
 
 
 class ClipUpdate(BaseModel):
@@ -114,6 +120,7 @@ class ClipUpdate(BaseModel):
     end_time: float | None = Field(default=None, gt=0)
     aspect_ratio: str | None = None
     transcript_text: str | None = None
+    cuts: list[ClipRange] | None = None
 
 
 class ClipOut(BaseModel):
@@ -123,6 +130,7 @@ class ClipOut(BaseModel):
     name: str
     start_time: float
     end_time: float
+    cuts: list[ClipRange] = Field(default_factory=list)
     duration_seconds: float | None
     aspect_ratio: str
     virality_score: float | None
