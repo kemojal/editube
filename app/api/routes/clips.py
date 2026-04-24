@@ -9,12 +9,14 @@ Shape mirrors reelcut's /clips domain but adapted to editube conventions:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 import re
 from typing import List, Optional
 import json
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload
@@ -128,6 +130,110 @@ def _ensure_style(db: Session, clip: Clip) -> ClipStyle:
 
 def _serialize_clip(clip: Clip) -> dict:
     return ClipOut.model_validate(clip).model_dump()
+
+
+def _clip_transcript_author(user: User) -> dict:
+    return {
+        "user_id": user.id,
+        "name": (
+            getattr(user, "full_name", None)
+            or getattr(user, "name", None)
+            or getattr(user, "email", None)
+            or f"User {user.id}"
+        )[:120],
+        "avatar_url": getattr(user, "avatar_url", None),
+    }
+
+
+def _normalize_clip_transcript_author(raw: object, fallback: dict, current_user_id: int) -> dict:
+    if not isinstance(raw, dict):
+        return fallback
+    raw_user_id = raw.get("user_id")
+    try:
+        user_id = int(raw_user_id) if raw_user_id is not None else None
+    except (TypeError, ValueError):
+        user_id = None
+    if user_id == current_user_id:
+        return fallback
+    name = str(raw.get("name") or "").strip()[:120]
+    return {
+        "user_id": user_id,
+        "name": name or fallback["name"],
+        "avatar_url": str(raw.get("avatar_url")).strip() if raw.get("avatar_url") else None,
+    }
+
+
+def _normalize_clip_transcript_highlights(rows: object, current_user: User) -> list[dict]:
+    author_fallback = _clip_transcript_author(current_user)
+    now = datetime.now(timezone.utc).isoformat()
+    normalized: list[dict] = []
+    for row in rows or []:
+        payload = row.model_dump(mode="json") if hasattr(row, "model_dump") else dict(row or {})
+        try:
+            start = float(payload.get("start"))
+            end = float(payload.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        normalized.append(
+            {
+                "id": str(payload.get("id") or uuid4()),
+                "start": start,
+                "end": end,
+                "color": str(payload.get("color") or "yellow").strip().lower()[:24] or "yellow",
+                "start_segment_index": payload.get("start_segment_index"),
+                "start_word_index": payload.get("start_word_index"),
+                "end_segment_index": payload.get("end_segment_index"),
+                "end_word_index": payload.get("end_word_index"),
+                "anchor_text": str(payload.get("anchor_text") or "").strip()[:500] or None,
+                "author": _normalize_clip_transcript_author(
+                    payload.get("author"), author_fallback, current_user.id
+                ),
+                "created_at": payload.get("created_at") or now,
+                "updated_at": payload.get("updated_at") or now,
+            }
+        )
+    normalized.sort(key=lambda item: (item["start"], item["end"], item["created_at"], item["id"]))
+    return normalized
+
+
+def _normalize_clip_transcript_comments(rows: object, current_user: User) -> list[dict]:
+    author_fallback = _clip_transcript_author(current_user)
+    now = datetime.now(timezone.utc).isoformat()
+    normalized: list[dict] = []
+    for row in rows or []:
+        payload = row.model_dump(mode="json") if hasattr(row, "model_dump") else dict(row or {})
+        try:
+            start = float(payload.get("start"))
+            end = float(payload.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            continue
+        normalized.append(
+            {
+                "id": str(payload.get("id") or uuid4()),
+                "start": start,
+                "end": end,
+                "text": text[:4000],
+                "start_segment_index": payload.get("start_segment_index"),
+                "start_word_index": payload.get("start_word_index"),
+                "end_segment_index": payload.get("end_segment_index"),
+                "end_word_index": payload.get("end_word_index"),
+                "anchor_text": str(payload.get("anchor_text") or "").strip()[:500] or None,
+                "author": _normalize_clip_transcript_author(
+                    payload.get("author"), author_fallback, current_user.id
+                ),
+                "created_at": payload.get("created_at") or now,
+                "updated_at": payload.get("updated_at") or now,
+            }
+        )
+    normalized.sort(key=lambda item: (item["start"], item["end"], item["created_at"], item["id"]))
+    return normalized
 
 
 def _extract_youtube_video_id(url: str) -> str | None:
@@ -624,6 +730,12 @@ def create_clip(
         suggestion_reason=body.suggestion_reason,
         hooks_matched=body.hooks_matched,
         transcript_text=body.transcript_text,
+        transcript_highlights=_normalize_clip_transcript_highlights(
+            body.transcript_highlights, current_user
+        ),
+        transcript_comments=_normalize_clip_transcript_comments(
+            body.transcript_comments, current_user
+        ),
     )
     db.add(clip)
     db.commit()
@@ -687,6 +799,14 @@ def update_clip(
         clip.aspect_ratio = body.aspect_ratio
     if body.transcript_text is not None:
         clip.transcript_text = body.transcript_text
+    if body.transcript_highlights is not None:
+        clip.transcript_highlights = _normalize_clip_transcript_highlights(
+            body.transcript_highlights, current_user
+        )
+    if body.transcript_comments is not None:
+        clip.transcript_comments = _normalize_clip_transcript_comments(
+            body.transcript_comments, current_user
+        )
 
     # Cuts is the source of truth when provided; otherwise fall back to
     # legacy single-range updates via start_time/end_time.

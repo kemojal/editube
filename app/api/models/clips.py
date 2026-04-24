@@ -100,6 +100,42 @@ class ClipRange(BaseModel):
     end: float = Field(..., gt=0)
 
 
+class ClipTranscriptAuthor(BaseModel):
+    user_id: int | None = None
+    name: str
+    avatar_url: str | None = None
+
+
+class ClipTranscriptHighlight(BaseModel):
+    id: str
+    start: float = Field(..., ge=0)
+    end: float = Field(..., gt=0)
+    color: str = "yellow"
+    start_segment_index: int | None = None
+    start_word_index: int | None = None
+    end_segment_index: int | None = None
+    end_word_index: int | None = None
+    anchor_text: str | None = None
+    author: ClipTranscriptAuthor | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ClipTranscriptComment(BaseModel):
+    id: str
+    start: float = Field(..., ge=0)
+    end: float = Field(..., gt=0)
+    text: str
+    start_segment_index: int | None = None
+    start_word_index: int | None = None
+    end_segment_index: int | None = None
+    end_word_index: int | None = None
+    anchor_text: str | None = None
+    author: ClipTranscriptAuthor | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 class ClipCreate(BaseModel):
     video_id: int
     name: str | None = None
@@ -112,6 +148,8 @@ class ClipCreate(BaseModel):
     hooks_matched: list[str] | None = None
     transcript_text: str | None = None
     cuts: list[ClipRange] | None = None
+    transcript_highlights: list[ClipTranscriptHighlight] | None = None
+    transcript_comments: list[ClipTranscriptComment] | None = None
 
 
 class ClipUpdate(BaseModel):
@@ -121,6 +159,8 @@ class ClipUpdate(BaseModel):
     aspect_ratio: str | None = None
     transcript_text: str | None = None
     cuts: list[ClipRange] | None = None
+    transcript_highlights: list[ClipTranscriptHighlight] | None = None
+    transcript_comments: list[ClipTranscriptComment] | None = None
 
 
 class ClipOut(BaseModel):
@@ -140,6 +180,8 @@ class ClipOut(BaseModel):
     storage_path: str | None
     thumbnail_url: str | None
     transcript_text: str | None
+    transcript_highlights: list[ClipTranscriptHighlight] = Field(default_factory=list)
+    transcript_comments: list[ClipTranscriptComment] = Field(default_factory=list)
     is_ai_suggested: bool
     suggestion_reason: str | None
     hooks_matched: list[str] | None
