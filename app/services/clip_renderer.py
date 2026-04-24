@@ -27,6 +27,10 @@ from app.services.clip_cuts import (
     normalize_cuts,
 )
 from app.services.youtube_stream_resolve import resolve_youtube_page_to_stream_url
+from app.utils.cloudinary import (
+    cloudinary_credentials_configured,
+    upload_local_path_to_cloudinary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +46,9 @@ ASPECT_RATIOS = {
 ProgressCb = Callable[[int], None]
 
 
-def _run(cmd: list[str]) -> None:
+def _run(cmd: list[str], *, cwd: str | None = None) -> None:
     logger.debug("ffmpeg: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "")[-1500:]
         raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {tail}")
@@ -126,18 +130,24 @@ def _scale_crop(src: Path, aspect_ratio: str, dst: Path) -> None:
 
 
 def _burn_subs(src: Path, ass_path: Path, dst: Path) -> None:
-    # ASS path needs ffmpeg-safe escaping (colon + backslash).
-    escaped = str(ass_path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    """Burn ASS captions. Run ffmpeg with ``cwd`` = temp dir and basename-only paths so
+    libavfilter's ``ass=`` parser does not choke on macOS ``/var/folders/...`` paths
+    (quoted absolute paths produce ``No option name near '/var/...'`` on recent ffmpeg).
+    """
+    work = ass_path.resolve().parent
+    if src.resolve().parent != work or dst.resolve().parent != work:
+        raise RuntimeError("_burn_subs expects src, ass, and dst in the same directory")
     _run(
         [
             "ffmpeg", "-y",
-            "-i", str(src),
-            "-vf", f"ass='{escaped}'",
+            "-i", src.name,
+            "-vf", f"ass={ass_path.name}",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-c:a", "copy",
             "-movflags", "+faststart",
-            str(dst),
-        ]
+            dst.name,
+        ],
+        cwd=str(work),
     )
 
 
@@ -227,10 +237,29 @@ def fast_thumbnail_for_clip(db: "Session", clip_id: int) -> str | None:
         t = start + min(1.0, max(0.0, (end - start) / 2.0))
 
         _extract_thumbnail_remote(video.file_path, dst, t)
-        public = f"{CLIP_PUBLIC_PREFIX.rstrip('/')}/{clip.id}/thumbnail.jpg"
-        clip.thumbnail_url = public
+        folder = os.environ.get("CLOUDINARY_CLIPS_FOLDER", "repurpose_clips").strip().strip("/")
+        if cloudinary_credentials_configured() and os.environ.get(
+            "CLIP_STORAGE", "cloudinary"
+        ).strip().lower() != "local":
+            try:
+                import app.utils.cloudinary  # noqa: F401 — ensure cloudinary.config runs
+
+                url = upload_local_path_to_cloudinary(
+                    dst,
+                    resource_type="image",
+                    folder=folder,
+                    public_id=f"{clip.id}/thumbnail",
+                )
+                clip.thumbnail_url = url
+            except Exception:  # noqa: BLE001
+                logger.exception("Cloudinary thumbnail upload failed for clip %s; using local URL", clip.id)
+                public = f"{CLIP_PUBLIC_PREFIX.rstrip('/')}/{clip.id}/thumbnail.jpg"
+                clip.thumbnail_url = public
+        else:
+            public = f"{CLIP_PUBLIC_PREFIX.rstrip('/')}/{clip.id}/thumbnail.jpg"
+            clip.thumbnail_url = public
         db.commit()
-        return public
+        return clip.thumbnail_url
     except Exception:  # noqa: BLE001
         logger.exception("fast thumbnail failed for clip %s", clip_id)
         try:
@@ -259,7 +288,13 @@ def _style_dict(style: ClipStyle | None) -> dict:
 
 
 def render_clip(db: Session, clip_id: int, *, on_progress: ProgressCb | None = None) -> str:
-    """Full FFmpeg pipeline for one clip. Returns the public path of the output."""
+    """Full FFmpeg pipeline for one clip.
+
+    Writes under ``uploads/clips/<id>/`` then, when Cloudinary env vars are set
+    (and ``CLIP_STORAGE`` is not ``local``), uploads MP4 + thumbnail and stores
+    ``secure_url`` values on the clip so browsers are not tied to expiring
+    YouTube ``googlevideo`` URLs for preview.
+    """
     clip: Clip | None = db.query(Clip).filter(Clip.id == clip_id).first()
     if clip is None:
         raise ValueError(f"clip {clip_id} not found")
@@ -359,11 +394,41 @@ def render_clip(db: Session, clip_id: int, *, on_progress: ProgressCb | None = N
 
     public_path = f"{CLIP_PUBLIC_PREFIX.rstrip('/')}/{clip.id}/output.mp4"
     thumb_public = f"{CLIP_PUBLIC_PREFIX.rstrip('/')}/{clip.id}/thumbnail.jpg"
-    clip.storage_path = public_path
-    clip.thumbnail_url = thumb_public
     clip.start_time = outer_start
     clip.end_time = outer_end
     clip.duration_seconds = total_duration
+
+    folder = os.environ.get("CLOUDINARY_CLIPS_FOLDER", "repurpose_clips").strip().strip("/")
+    if cloudinary_credentials_configured() and os.environ.get(
+        "CLIP_STORAGE", "cloudinary"
+    ).strip().lower() != "local":
+        try:
+            import app.utils.cloudinary  # noqa: F401
+
+            clip.storage_path = upload_local_path_to_cloudinary(
+                output_file,
+                resource_type="video",
+                folder=folder,
+                public_id=f"{clip.id}/output",
+            )
+            if thumb_file.exists():
+                clip.thumbnail_url = upload_local_path_to_cloudinary(
+                    thumb_file,
+                    resource_type="image",
+                    folder=folder,
+                    public_id=f"{clip.id}/thumbnail",
+                )
+            else:
+                clip.thumbnail_url = thumb_public
+            logger.info("clip %s stored on Cloudinary: %s", clip.id, clip.storage_path)
+        except Exception:  # noqa: BLE001
+            logger.exception("clip %s Cloudinary upload failed; using local paths", clip.id)
+            clip.storage_path = public_path
+            clip.thumbnail_url = thumb_public
+    else:
+        clip.storage_path = public_path
+        clip.thumbnail_url = thumb_public
+
     db.commit()
     report(100)
-    return public_path
+    return str(clip.storage_path or public_path)

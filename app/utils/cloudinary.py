@@ -78,6 +78,52 @@ def upload_file_to_cloudinary(file: UploadFile, resource_type: str = "video") ->
     return str(result["url"])
 
 
+def cloudinary_credentials_configured() -> bool:
+    return bool(
+        os.getenv("CLOUDINARY_CLOUD_NAME")
+        and os.getenv("CLOUDINARY_API_KEY")
+        and os.getenv("CLOUDINARY_API_SECRET")
+    )
+
+
+def upload_local_path_to_cloudinary(
+    file_path: str | Path,
+    *,
+    resource_type: str,
+    folder: str,
+    public_id: str,
+) -> str:
+    """
+    Upload a file already on disk (e.g. ffmpeg output). Returns ``secure_url``.
+    Uses chunked upload for large videos.
+    """
+    p = Path(file_path).resolve()
+    if not p.is_file():
+        raise FileNotFoundError(str(p))
+    folder = folder.strip().strip("/")
+    opts: dict = {
+        "resource_type": resource_type,
+        "folder": folder,
+        "public_id": public_id.strip().strip("/"),
+        "timeout": _CLOUDINARY_UPLOAD_TIMEOUT,
+    }
+    try:
+        if resource_type == "video" and p.stat().st_size > _VIDEO_CHUNK_BYTES:
+            result = cloudinary.uploader.upload_large(
+                str(p),
+                chunk_size=_VIDEO_CHUNK_BYTES,
+                **opts,
+            )
+        else:
+            result = cloudinary.uploader.upload(str(p), **opts)
+    except CloudinaryError as e:
+        raise RuntimeError(f"Cloudinary upload failed: {e}") from e
+    url = result.get("secure_url")
+    if not url:
+        raise RuntimeError("Cloudinary returned no secure_url")
+    return str(url)
+
+
 async def upload_image(image: UploadFile):
     try:
         upload_result = cloudinary.uploader.upload(

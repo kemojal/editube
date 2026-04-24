@@ -161,6 +161,28 @@ _uploads_dir = os.path.abspath(os.environ.get("UPLOADS_DIR", "./uploads"))
 os.makedirs(_uploads_dir, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=_uploads_dir), name="uploads")
 
+
+@app.middleware("http")
+async def uploads_media_cors_fallback(request: Request, call_next):
+    """
+    StaticFiles responses sometimes omit CORS headers when the browser sends no `Origin`
+    (common for `<video src>`). Mirror CORSMiddleware for known dev origins, else `*` so
+    cross-port localhost playback (e.g. Next on :3002, API on :8000) still works.
+    """
+    response = await call_next(request)
+    if not request.url.path.startswith("/uploads"):
+        return response
+    if response.headers.get("access-control-allow-origin"):
+        return response
+    origin = request.headers.get("origin")
+    if origin and (origin in origins or _local_origin_pattern.fullmatch(origin)):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    elif request.method in ("GET", "HEAD", "OPTIONS"):
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
 # Include the WebSocket app
 # app.mount("/", websocket_app)
 
