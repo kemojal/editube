@@ -744,11 +744,20 @@ def list_repurpose_jobs(
 ):
     rows = (
         db.query(RepurposeJob)
-        .filter(RepurposeJob.user_id == current_user.id)
         .order_by(RepurposeJob.created_at.desc())
         .all()
     )
-    return [_serialize_job(r) for r in rows]
+    visible_rows: list[RepurposeJob] = []
+    for row in rows:
+        if row.user_id == current_user.id:
+            visible_rows.append(row)
+            continue
+        if row.project_id is None:
+            continue
+        project = db.query(Project).filter(Project.id == row.project_id).first()
+        if project and can_access_project(db, current_user.id, project):
+            visible_rows.append(row)
+    return [_serialize_job(r) for r in visible_rows]
 
 
 # --- Clip CRUD -----------------------------------------------------------
@@ -822,11 +831,16 @@ def list_clips(
     if video_id is not None:
         _video_with_access(video_id, db, current_user)
         q = q.filter(Clip.video_id == video_id)
-    else:
-        q = q.filter(Clip.user_id == current_user.id)
     if status_filter:
         q = q.filter(Clip.status == status_filter)
     rows = q.order_by(Clip.created_at.desc()).all()
+    if video_id is None:
+        rows = [
+            clip
+            for clip in rows
+            if clip.user_id == current_user.id
+            or can_access_project(db, current_user.id, clip.video.project)
+        ]
     return [_serialize_clip(c) for c in rows]
 
 

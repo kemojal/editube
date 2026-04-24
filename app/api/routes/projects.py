@@ -4,6 +4,7 @@ import logging
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.models.projects import (
@@ -25,10 +26,12 @@ from app.db.models import (
     ProjectWorkspaceAssetLink,
     ProjectArchiveState,
     ProjectRetentionPolicy,
+    Notification,
     User,
     WorkspaceAsset,
     WorkspaceMember,
 )
+from app.jobs.queue import enqueue_push_notification_job
 from app.jobs.queue import enqueue_archive_cold_storage_job
 from app.services.project_access import (
     assert_write_project_content,
@@ -41,6 +44,7 @@ from app.services.project_template_apply import apply_project_template
 from app.services.workspace_bootstrap import ensure_personal_workspace
 from app.utils.email import send_invitation_email
 from app.utils.security import get_current_user
+from app.websocket_manager import notifications_ws_manager
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +114,89 @@ def _ensure_workspace_collaborator(db: Session, project: Project, user_id: int) 
             user_id=user_id,
             role="editor",
         )
+    )
+
+
+def _project_invite_message(project: Project, inviter: User) -> str:
+    inviter_name = inviter.full_name or inviter.name or inviter.email or "A teammate"
+    return f"{inviter_name} invited you to collaborate on {project.name}"
+
+
+async def _emit_project_invite_notification(
+    db: Session,
+    *,
+    project: Project,
+    inviter: User,
+    invited_user: User | None,
+) -> None:
+    if invited_user is None:
+        return
+    msg = _project_invite_message(project, inviter)
+    existing_unread = (
+        db.query(Notification)
+        .filter(
+            Notification.user_id == invited_user.id,
+            Notification.type == "project_invite",
+            Notification.project_id == project.id,
+            Notification.read.is_(False),
+        )
+        .first()
+    )
+    if existing_unread:
+        existing_unread.message = msg
+        db.commit()
+        db.refresh(existing_unread)
+        enqueue_push_notification_job(existing_unread.user_id, existing_unread.id)
+        await notifications_ws_manager.send_to_user(
+            existing_unread.user_id,
+            {
+                "event": "notification.new",
+                "payload": {
+                    "id": existing_unread.id,
+                    "type": existing_unread.type,
+                    "read": existing_unread.read,
+                    "project_id": existing_unread.project_id,
+                    "video_id": existing_unread.video_id,
+                    "comment_id": existing_unread.comment_id,
+                    "workspace_id": existing_unread.workspace_id,
+                    "workspace_invite_id": existing_unread.workspace_invite_id,
+                    "invite_token": existing_unread.invite_token,
+                    "message": existing_unread.message,
+                    "created_at": existing_unread.created_at.isoformat() if existing_unread.created_at else None,
+                },
+            },
+        )
+        return
+    notification = Notification(
+        user_id=invited_user.id,
+        type="project_invite",
+        project_id=project.id,
+        workspace_id=project.workspace_id,
+        message=msg,
+        read=False,
+    )
+    db.add(notification)
+    db.commit()
+    db.refresh(notification)
+    enqueue_push_notification_job(notification.user_id, notification.id)
+    await notifications_ws_manager.send_to_user(
+        notification.user_id,
+        {
+            "event": "notification.new",
+            "payload": {
+                "id": notification.id,
+                "type": notification.type,
+                "read": notification.read,
+                "project_id": notification.project_id,
+                "video_id": notification.video_id,
+                "comment_id": notification.comment_id,
+                "workspace_id": notification.workspace_id,
+                "workspace_invite_id": notification.workspace_invite_id,
+                "invite_token": notification.invite_token,
+                "message": notification.message,
+                "created_at": notification.created_at.isoformat() if notification.created_at else None,
+            },
+        },
     )
 
 
@@ -374,7 +461,7 @@ def update_retention_policy(
 
 
 @router.post("/{project_id}/collaborators")
-def invite_collaborators(
+async def invite_collaborators(
     project_id: int,
     email_list: CollaboratorEmailList,
     db: Session = Depends(get_db),
@@ -393,10 +480,16 @@ def invite_collaborators(
         if not em:
             continue
         role = (roles_map.get(em.lower()) or "editor").strip() or "editor"
-        collaborator = db.query(User).filter(User.email == em).first()
+        collaborator = db.query(User).filter(func.lower(User.email) == em.lower()).first()
         if collaborator:
             if collaborator in [c.user for c in db_project.collaborators]:
-                raise HTTPException(status_code=400, detail=f"User with email {em} is already a collaborator")
+                await _emit_project_invite_notification(
+                    db,
+                    project=db_project,
+                    inviter=current_user,
+                    invited_user=collaborator,
+                )
+                continue
             new_collaborator = ProjectCollaborator(
                 project_id=project_id,
                 user_id=collaborator.id,
@@ -405,10 +498,16 @@ def invite_collaborators(
             db.add(new_collaborator)
             _ensure_workspace_collaborator(db, db_project, collaborator.id)
             new_collaborators.append(new_collaborator)
+            db.flush()
+            await _emit_project_invite_notification(
+                db,
+                project=db_project,
+                inviter=current_user,
+                invited_user=collaborator,
+            )
         else:
             send_invitation_email(db, em, project_id)
 
-    db.commit()
     return {"added": len(new_collaborators)}
 
 

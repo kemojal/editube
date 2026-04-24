@@ -22,6 +22,8 @@ def _title_for_notification(notification: Notification) -> str:
         return "Review workflow update"
     if notification_type == "workspace_invite":
         return "Workspace invitation"
+    if notification_type == "project_invite":
+        return "Project invitation"
     return "New notification"
 
 
@@ -35,6 +37,8 @@ def _body_for_notification(notification: Notification) -> str:
         return "A review workflow stage has changed."
     if notification_type == "workspace_invite":
         return notification.message or "You were invited to a workspace."
+    if notification_type == "project_invite":
+        return notification.message or "You were invited to a project."
     return "Open the app to view details."
 
 
