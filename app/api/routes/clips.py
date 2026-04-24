@@ -236,6 +236,65 @@ def _normalize_clip_transcript_comments(rows: object, current_user: User) -> lis
     return normalized
 
 
+def _stable_clip_editor_snapshot(payload: dict) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _clip_edit_history_entry(
+    clip: Clip,
+    *,
+    current_user: User,
+    kind: str | None = None,
+    label: str | None = None,
+) -> dict:
+    return {
+        "id": str(uuid4()),
+        "kind": (kind or "autosave").strip()[:32] or "autosave",
+        "label": (label or "").strip()[:160] or None,
+        "author": _clip_transcript_author(current_user),
+        "name": clip.name,
+        "aspect_ratio": clip.aspect_ratio,
+        "cuts": list(clip.cuts or []),
+        "transcript_text": clip.transcript_text,
+        "transcript_highlights": list(clip.transcript_highlights or []),
+        "transcript_comments": list(clip.transcript_comments or []),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _append_clip_edit_history(
+    clip: Clip,
+    *,
+    current_user: User,
+    kind: str | None = None,
+    label: str | None = None,
+) -> None:
+    history = list(clip.edit_history or [])
+    entry = _clip_edit_history_entry(clip, current_user=current_user, kind=kind, label=label)
+    comparable = {
+        "name": entry["name"],
+        "aspect_ratio": entry["aspect_ratio"],
+        "cuts": entry["cuts"],
+        "transcript_text": entry["transcript_text"],
+        "transcript_highlights": entry["transcript_highlights"],
+        "transcript_comments": entry["transcript_comments"],
+    }
+    if history:
+        previous = history[-1]
+        previous_comparable = {
+            "name": previous.get("name"),
+            "aspect_ratio": previous.get("aspect_ratio"),
+            "cuts": previous.get("cuts") or [],
+            "transcript_text": previous.get("transcript_text"),
+            "transcript_highlights": previous.get("transcript_highlights") or [],
+            "transcript_comments": previous.get("transcript_comments") or [],
+        }
+        if _stable_clip_editor_snapshot(previous_comparable) == _stable_clip_editor_snapshot(comparable):
+            return
+    history.append(entry)
+    clip.edit_history = history[-40:]
+
+
 def _extract_youtube_video_id(url: str) -> str | None:
     raw = (url or "").strip()
     if not raw:
@@ -790,6 +849,11 @@ def update_clip(
 ):
     clip = _clip_with_access(clip_id, db, current_user)
     prior_cuts = list(clip.cuts or [])
+    prior_name = clip.name
+    prior_aspect_ratio = clip.aspect_ratio
+    prior_transcript_text = clip.transcript_text
+    prior_transcript_highlights = list(clip.transcript_highlights or [])
+    prior_transcript_comments = list(clip.transcript_comments or [])
     prior_start = float(clip.start_time)
     prior_end = float(clip.end_time)
 
@@ -831,9 +895,25 @@ def update_clip(
     clip.duration_seconds = cuts_total_duration(cuts)
 
     cuts_changed = _cuts_differ(prior_cuts, cuts)
+    metadata_changed = (
+        prior_name != clip.name
+        or prior_aspect_ratio != clip.aspect_ratio
+        or prior_transcript_text != clip.transcript_text
+        or _stable_clip_editor_snapshot(prior_transcript_highlights)
+        != _stable_clip_editor_snapshot(list(clip.transcript_highlights or []))
+        or _stable_clip_editor_snapshot(prior_transcript_comments)
+        != _stable_clip_editor_snapshot(list(clip.transcript_comments or []))
+    )
     if cuts_changed and clip.status == "ready":
         clip.status = "draft"
         clip.storage_path = None
+    if cuts_changed or metadata_changed:
+        _append_clip_edit_history(
+            clip,
+            current_user=current_user,
+            kind=body.history_kind,
+            label=body.history_label,
+        )
 
     db.commit()
     db.refresh(clip)

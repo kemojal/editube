@@ -136,6 +136,20 @@ class ClipTranscriptComment(BaseModel):
     updated_at: datetime | None = None
 
 
+class ClipEditHistoryEntry(BaseModel):
+    id: str
+    kind: str = "autosave"
+    label: str | None = None
+    author: ClipTranscriptAuthor | None = None
+    name: str | None = None
+    aspect_ratio: str | None = None
+    cuts: list[ClipRange] = Field(default_factory=list)
+    transcript_text: str | None = None
+    transcript_highlights: list[ClipTranscriptHighlight] = Field(default_factory=list)
+    transcript_comments: list[ClipTranscriptComment] = Field(default_factory=list)
+    created_at: datetime | None = None
+
+
 class ClipCreate(BaseModel):
     video_id: int
     name: str | None = None
@@ -161,6 +175,8 @@ class ClipUpdate(BaseModel):
     cuts: list[ClipRange] | None = None
     transcript_highlights: list[ClipTranscriptHighlight] | None = None
     transcript_comments: list[ClipTranscriptComment] | None = None
+    history_kind: str | None = None
+    history_label: str | None = None
 
 
 class ClipOut(BaseModel):
@@ -182,6 +198,7 @@ class ClipOut(BaseModel):
     transcript_text: str | None
     transcript_highlights: list[ClipTranscriptHighlight] = Field(default_factory=list)
     transcript_comments: list[ClipTranscriptComment] = Field(default_factory=list)
+    edit_history: list[ClipEditHistoryEntry] = Field(default_factory=list)
     is_ai_suggested: bool
     suggestion_reason: str | None
     hooks_matched: list[str] | None

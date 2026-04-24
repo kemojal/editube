@@ -1773,6 +1773,7 @@ class Clip(Base):
     transcript_text = Column(Text, nullable=True)
     transcript_highlights = Column(JSONB, nullable=False, server_default="[]")
     transcript_comments = Column(JSONB, nullable=False, server_default="[]")
+    edit_history = Column(JSONB, nullable=False, server_default="[]")
     is_ai_suggested = Column(Boolean, nullable=False, server_default="false")
     suggestion_reason = Column(Text, nullable=True)
     hooks_matched = Column(JSONB, nullable=True)
