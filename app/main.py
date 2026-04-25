@@ -17,6 +17,7 @@ from .websocket_manager import notifications_ws_manager, review_room_ws_manager
 from sqlalchemy.orm import joinedload
 
 from .db.models import (
+    Clip,
     ReviewLink,
     ReviewSession,
     ReviewRoomMessage,
@@ -725,6 +726,129 @@ async def team_video_websocket(websocket: WebSocket, video_id: int):
         if "room_id" in locals():
             snapshot = review_room_ws_manager.remove_presence(room_id, user.id)
             review_room_ws_manager.disconnect(room_id, user.id, websocket)
+            await review_room_ws_manager.broadcast(
+                room_id,
+                review_room_ws_manager.add_event(
+                    room_id, {"event": "presence.snapshot", "payload": snapshot}
+                ),
+            )
+    finally:
+        db.close()
+
+
+@app.websocket("/ws/clip-room/{clip_id}")
+async def clip_room_websocket(websocket: WebSocket, clip_id: int):
+    token = websocket.query_params.get("token")
+    if not token:
+        auth_header = websocket.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        await websocket.close(code=1008)
+        return
+
+    session_id_raw = websocket.query_params.get("session_id")
+    if not session_id_raw:
+        await websocket.close(code=1008)
+        return
+    try:
+        session_id = int(session_id_raw)
+    except ValueError:
+        await websocket.close(code=1008)
+        return
+
+    last_seq_raw = websocket.query_params.get("last_seq", "0")
+    try:
+        last_seq = int(last_seq_raw or "0")
+    except ValueError:
+        last_seq = 0
+
+    db = SessionLocal()
+    try:
+        user = authenticate_access_token(db, token, touch_session=True)
+    except Exception:
+        db.close()
+        await websocket.close(code=1008)
+        return
+
+    try:
+        clip = db.query(Clip).filter(Clip.id == clip_id).first()
+        if not clip:
+            await websocket.close(code=1008)
+            return
+        video = db.query(Video).filter(Video.id == clip.video_id).first()
+        if not video:
+            await websocket.close(code=1008)
+            return
+        project = db.query(Project).filter(Project.id == video.project_id).first()
+        if not project or not can_access_project(db, user.id, project):
+            await websocket.close(code=1008)
+            return
+
+        room_id = f"clip-room:{clip_id}"
+        await review_room_ws_manager.connect(room_id, session_id, websocket)
+        base_presence = {
+            "session_id": session_id,
+            "user_id": user.id,
+            "guest_name": user.full_name or user.name or user.email or f"User {user.id}",
+            "guest_avatar_url": getattr(user, "avatar_url", None),
+            "cursor_x": None,
+            "cursor_y": None,
+            "active_range_label": None,
+            "color": None,
+        }
+        presence = review_room_ws_manager.upsert_presence(room_id, session_id, base_presence)
+        await review_room_ws_manager.broadcast(
+            room_id,
+            review_room_ws_manager.add_event(
+                room_id, {"event": "presence.snapshot", "payload": presence}
+            ),
+        )
+        for item in review_room_ws_manager.replay_since(room_id, last_seq)[-200:]:
+            await websocket.send_json(item)
+
+        while True:
+            msg = await websocket.receive_json()
+            event = (msg.get("event") or "").strip()
+            payload = msg.get("payload") or {}
+            if event == "presence.update":
+                merged = {
+                    **base_presence,
+                    **payload,
+                    "session_id": session_id,
+                    "user_id": user.id,
+                    "guest_name": user.full_name or user.name or user.email or f"User {user.id}",
+                    "guest_avatar_url": getattr(user, "avatar_url", None),
+                }
+                snapshot = review_room_ws_manager.upsert_presence(room_id, session_id, merged)
+                await review_room_ws_manager.broadcast(
+                    room_id,
+                    review_room_ws_manager.add_event(
+                        room_id, {"event": "presence.snapshot", "payload": snapshot}
+                    ),
+                )
+            elif event == "presence.heartbeat":
+                snapshot = review_room_ws_manager.heartbeat(room_id, session_id)
+                await review_room_ws_manager.broadcast(
+                    room_id,
+                    review_room_ws_manager.add_event(
+                        room_id, {"event": "presence.snapshot", "payload": snapshot}
+                    ),
+                )
+    except WebSocketDisconnect:
+        if "room_id" in locals():
+            snapshot = review_room_ws_manager.remove_presence(room_id, session_id)
+            review_room_ws_manager.disconnect(room_id, session_id, websocket)
+            await review_room_ws_manager.broadcast(
+                room_id,
+                review_room_ws_manager.add_event(
+                    room_id, {"event": "presence.snapshot", "payload": snapshot}
+                ),
+            )
+    except Exception:
+        if "room_id" in locals():
+            snapshot = review_room_ws_manager.remove_presence(room_id, session_id)
+            review_room_ws_manager.disconnect(room_id, session_id, websocket)
             await review_room_ws_manager.broadcast(
                 room_id,
                 review_room_ws_manager.add_event(

@@ -508,6 +508,8 @@ async def invite_collaborators(
         else:
             send_invitation_email(db, em, project_id)
 
+    db.commit()
+    db.refresh(db_project)
     return {"added": len(new_collaborators)}
 
 

@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+websockets>=16.0
 dnspython>=2.6.0
 email-validator>=2.0.0
 sqlalchemy
