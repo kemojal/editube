@@ -1827,6 +1827,7 @@ class ClipStyle(Base):
     caption_position_y = Column(Float, nullable=True, server_default="85")
     caption_position_x = Column(Float, nullable=True, server_default="50")
     caption_uppercase = Column(Boolean, nullable=False, server_default="false")
+    caption_template_id = Column(String, nullable=True)
     brand_logo_url = Column(String, nullable=True)
     brand_logo_position = Column(String, nullable=True, server_default="top-right")
     brand_logo_scale = Column(Float, nullable=False, server_default="0.12")

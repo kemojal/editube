@@ -53,6 +53,7 @@ class ClipStyleOut(BaseModel):
     caption_position_y: float | None = None
     caption_position_x: float | None = None
     caption_uppercase: bool
+    caption_template_id: str | None = None
     brand_logo_url: str | None = None
     brand_logo_position: str | None = None
     brand_logo_scale: float
@@ -85,6 +86,7 @@ class ClipStyleUpdate(BaseModel):
     caption_position_y: float | None = None
     caption_position_x: float | None = None
     caption_uppercase: bool | None = None
+    caption_template_id: str | None = None
     brand_logo_url: str | None = None
     brand_logo_position: str | None = None
     brand_logo_scale: float | None = None
