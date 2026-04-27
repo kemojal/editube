@@ -1,3 +1,4 @@
+import io
 import os
 
 import cloudinary
@@ -122,6 +123,34 @@ def upload_local_path_to_cloudinary(
     if not url:
         raise RuntimeError("Cloudinary returned no secure_url")
     return str(url)
+
+
+def upload_image_bytes(
+    data: bytes,
+    *,
+    mime_type: str = "image/png",
+    folder: str = "broll",
+    public_id: str = "img",
+) -> str:
+    """Upload raw image bytes (e.g. from Gemini) to Cloudinary. Returns ``secure_url``."""
+    fmt = mime_type.split("/")[-1] if "/" in mime_type else "png"
+    try:
+        result = cloudinary.uploader.upload(
+            io.BytesIO(data),
+            resource_type="image",
+            folder=folder,
+            public_id=public_id,
+            format=fmt,
+        )
+        url = result.get("secure_url")
+        if not url:
+            raise RuntimeError("Cloudinary returned no URL")
+        return str(url)
+    except CloudinaryError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Cloudinary upload failed: {e}",
+        ) from e
 
 
 async def upload_image(image: UploadFile):

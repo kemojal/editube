@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -11,7 +14,8 @@ from app.jobs.ai_jobs import (
     detect_chapters,
     detect_fillers,
 )
-from app.services.ai_client import generate_json
+from app.services.ai_client import generate_broll_image, generate_json
+from app.utils.cloudinary import upload_image_bytes
 from app.utils.security import get_current_user
 from app.services.project_access import can_access_project
 
@@ -322,6 +326,45 @@ def rough_cut(
         {"status": "queued", "brief": body.get("brief", ""), "clip_ids": body.get("clip_ids", [])},
         status="queued",
     )
+
+
+class BrollImageRequest(BaseModel):
+    transcript_text: str
+    start: float
+    end: float
+
+
+@router.post("/{video_id}/ai/generate-broll-image")
+def generate_broll_image_endpoint(
+    video_id: int,
+    body: BrollImageRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+    try:
+        result = generate_broll_image(body.transcript_text)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"AI image generation failed: {exc}") from exc
+    try:
+        image_url = upload_image_bytes(
+            result["image_bytes"],
+            mime_type=result["mime_type"],
+            folder=f"broll/{video_id}",
+            public_id=f"broll_{uuid.uuid4().hex[:8]}",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Image upload failed: {exc}") from exc
+    data = {
+        "image_url": image_url,
+        "prompt": result["prompt"],
+        "keyword": result["keyword"],
+        "start": body.start,
+        "end": body.end,
+    }
+    return _upsert_result(db, video_id, "broll_image", data)
 
 
 @router.get("/{video_id}/ai/results")
