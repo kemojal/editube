@@ -328,6 +328,46 @@ def rough_cut(
     )
 
 
+@router.get("/{video_id}/ai/rough-cut-draft")
+def get_rough_cut_draft(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+    row = (
+        db.query(AiResult)
+        .filter(AiResult.video_id == video_id, AiResult.result_type == "rough_cut_draft")
+        .first()
+    )
+    if row is None:
+        return {
+            "video_id": video_id,
+            "result_type": "rough_cut_draft",
+            "status": "pending",
+            "result_data": None,
+        }
+    return {
+        "video_id": row.video_id,
+        "result_type": row.result_type,
+        "status": row.status,
+        "result_data": row.result_data,
+        "error_message": row.error_message,
+        "updated_at": row.updated_at,
+    }
+
+
+@router.put("/{video_id}/ai/rough-cut-draft")
+def save_rough_cut_draft(
+    video_id: int,
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+    return _upsert_result(db, video_id, "rough_cut_draft", body, status="completed")
+
+
 class BrollImageRequest(BaseModel):
     transcript_text: str
     start: float
