@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -311,20 +313,115 @@ def remove_fillers(
     return _upsert_result(db, video_id, "remove_fillers_job", {"status": "queued"}, status="queued")
 
 
+_FILLERS = {"um", "umm", "uh", "uhh", "ah", "erm"}
+_BAD_TAKE_RE = re.compile(
+    r"\b(cut that|bad take|start over|restart|retake|scratch that|messed up|ignore that|redo that|try again)\b",
+    re.IGNORECASE,
+)
+_SILENCE_THRESHOLD = 0.65
+
+
+def _analyze_segments(segments: list[dict], duration: float) -> dict:
+    """Server-side rough-cut analysis: derive keep_ranges and suggestion list from transcript."""
+    keep: list[dict] = []
+    suggestions: list[dict] = []
+
+    for i, seg in enumerate(segments):
+        start = float(seg.get("start") or 0)
+        end = float(seg.get("end") or start)
+        text = str(seg.get("text") or "").strip()
+        if end <= start:
+            continue
+
+        # Bad-take detection — mark as suggestion, exclude from keep
+        if _BAD_TAKE_RE.search(text):
+            suggestions.append({
+                "id": f"bad-take-{i}",
+                "kind": "bad_take",
+                "title": "Bad take",
+                "detail": text[:90],
+                "start": start,
+                "end": end,
+                "severity": "high",
+            })
+            continue
+
+        # Silence gap before this segment
+        if i > 0:
+            prev_end = float(segments[i - 1].get("end") or 0)
+            gap = start - prev_end
+            if gap >= _SILENCE_THRESHOLD:
+                gap_start = prev_end + 0.08
+                gap_end = start - 0.08
+                if gap_end > gap_start:
+                    suggestions.append({
+                        "id": f"silence-{i}",
+                        "kind": "silence",
+                        "title": "Silence",
+                        "detail": f"{gap:.1f}s",
+                        "start": gap_start,
+                        "end": gap_end,
+                        "severity": "high" if gap > 1.3 else "medium",
+                    })
+
+        keep.append({"start": start, "end": end})
+
+    # Merge adjacent keep ranges
+    merged: list[dict] = []
+    for rng in sorted(keep, key=lambda r: r["start"]):
+        if merged and rng["start"] <= merged[-1]["end"] + 0.03:
+            merged[-1]["end"] = max(merged[-1]["end"], rng["end"])
+        else:
+            merged.append(dict(rng))
+
+    # Filler suggestions (word-level — coarse segment scan)
+    for i, seg in enumerate(segments):
+        words = str(seg.get("text") or "").lower().split()
+        start = float(seg.get("start") or 0)
+        end = float(seg.get("end") or start)
+        span = max(end - start, 0.2) / max(len(words), 1)
+        for j, w in enumerate(words):
+            clean = re.sub(r"[^\w']", "", w)
+            if clean in _FILLERS:
+                ws = start + j * span
+                we = ws + span
+                suggestions.append({
+                    "id": f"filler-{i}-{j}",
+                    "kind": "filler",
+                    "title": "Filler",
+                    "detail": w,
+                    "start": max(0, ws - 0.03),
+                    "end": min(duration, we + 0.03),
+                    "severity": "high" if clean in {"um", "uh"} else "medium",
+                })
+
+    suggestions.sort(key=lambda s: (s["start"], s["end"]))
+    return {"keepRanges": merged, "suggestions": suggestions}
+
+
+class RoughCutRequest(BaseModel):
+    brief: str = ""
+    clip_ids: list[int] = Field(default_factory=list)
+
+
 @router.post("/{video_id}/ai/rough-cut")
 def rough_cut(
     video_id: int,
-    body: dict,
+    body: RoughCutRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _check_video_access(video_id, db, current_user)
+    video = _check_video_access(video_id, db, current_user)
+    tr = db.query(VideoTranscription).filter(VideoTranscription.video_id == video_id).first()
+    segments = list(tr.segments) if tr and tr.segments else []
+    duration = float(getattr(video, "duration", 0) or 0)
+    analysis = _analyze_segments(segments, duration)
     return _upsert_result(
         db,
         video_id,
         "rough_cut",
-        {"status": "queued", "brief": body.get("brief", ""), "clip_ids": body.get("clip_ids", [])},
-        status="queued",
+        {**analysis, "brief": body.brief, "clip_ids": body.clip_ids},
+        status="completed",
     )
 
 
@@ -357,15 +454,31 @@ def get_rough_cut_draft(
     }
 
 
+class RoughCutDraftBody(BaseModel):
+    keepRanges: list[dict[str, Any]] = Field(default_factory=list)
+    markers: list[dict[str, Any]] = Field(default_factory=list)
+    segments: list[dict[str, Any]] = Field(default_factory=list)
+    captionStyle: dict[str, Any] = Field(default_factory=dict)
+    layoutStyle: dict[str, Any] = Field(default_factory=dict)
+    musicStyle: dict[str, Any] = Field(default_factory=dict)
+    brandStyle: dict[str, Any] = Field(default_factory=dict)
+    textOverlay: dict[str, Any] = Field(default_factory=dict)
+    trackState: dict[str, Any] = Field(default_factory=dict)
+    wordHighlights: dict[str, Any] = Field(default_factory=dict)
+    wordFormats: dict[str, Any] = Field(default_factory=dict)
+    mediaName: str | None = None
+    duration: float | None = None
+
+
 @router.put("/{video_id}/ai/rough-cut-draft")
 def save_rough_cut_draft(
     video_id: int,
-    body: dict,
+    body: RoughCutDraftBody,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     _check_video_access(video_id, db, current_user)
-    return _upsert_result(db, video_id, "rough_cut_draft", body, status="completed")
+    return _upsert_result(db, video_id, "rough_cut_draft", body.model_dump(), status="completed")
 
 
 class BrollImageRequest(BaseModel):

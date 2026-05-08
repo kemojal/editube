@@ -263,7 +263,28 @@ def transcribe_video(video_id: int) -> None:
             model = WhisperModel(model_size, device=device, compute_type=compute_type)
             beam = int(os.environ.get("WHISPER_BEAM_SIZE", "1").strip() or "1")
             beam = max(1, min(beam, 5))
-            segments_iter, _info = model.transcribe(str(wav_path), beam_size=beam)
+
+            # Silero VAD (bundled with faster-whisper) filters non-speech before Whisper.
+            # This makes segment start/end times accurate speech boundaries so downstream
+            # silence detection (gap analysis) works on real pauses, not Whisper artifacts.
+            vad_enabled = os.environ.get("WHISPER_VAD_FILTER", "true").strip().lower() not in {"0", "false", "no"}
+            vad_params: dict = {}
+            if vad_enabled:
+                try:
+                    vad_params = {
+                        "threshold": float(os.environ.get("WHISPER_VAD_THRESHOLD", "0.5") or "0.5"),
+                        "min_silence_duration_ms": int(os.environ.get("WHISPER_VAD_MIN_SILENCE_MS", "500") or "500"),
+                        "speech_pad_ms": int(os.environ.get("WHISPER_VAD_SPEECH_PAD_MS", "200") or "200"),
+                    }
+                except (TypeError, ValueError):
+                    vad_params = {}
+
+            segments_iter, _info = model.transcribe(
+                str(wav_path),
+                beam_size=beam,
+                vad_filter=vad_enabled,
+                vad_parameters=vad_params if vad_enabled else None,
+            )
 
             segments: list[dict] = []
             speaker_labels: set[str] = set()
