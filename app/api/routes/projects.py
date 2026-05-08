@@ -28,6 +28,7 @@ from app.db.models import (
     ProjectRetentionPolicy,
     Notification,
     User,
+    Video,
     WorkspaceAsset,
     WorkspaceMember,
 )
@@ -42,6 +43,7 @@ from app.services.project_access import (
 )
 from app.services.project_template_apply import apply_project_template
 from app.services.workspace_bootstrap import ensure_personal_workspace
+from app.services.activity import log_activity
 from app.utils.email import send_invitation_email
 from app.utils.security import get_current_user
 from app.websocket_manager import notifications_ws_manager
@@ -86,15 +88,31 @@ def convert_project_to_response(db_project: Project, db: Session | None = None) 
                 seen.add(u.id)
                 members.append(_user_resp(u))
 
+    thumbnail_url = None
+    latest_video_id = None
+    if db:
+        latest_video = (
+            db.query(Video)
+            .filter(Video.project_id == db_project.id)
+            .order_by(Video.updated_at.desc())
+            .first()
+        )
+        if latest_video:
+            thumbnail_url = latest_video.thumbnail_url
+            latest_video_id = latest_video.id
+
     return ProjectResponse(
         id=db_project.id,
         name=db_project.name,
         description=db_project.description,
         workspace_id=db_project.workspace_id,
+        project_type=db_project.project_type,
         created_at=db_project.created_at.isoformat(),
         updated_at=db_project.updated_at.isoformat(),
         creator=_user_resp(db_project.creator),
         collaborators=members,
+        thumbnail_url=thumbnail_url,
+        latest_video_id=latest_video_id,
     )
 
 
@@ -225,6 +243,7 @@ def create_project(
         description=project.description,
         creator_id=current_user.id,
         workspace_id=ws_id,
+        project_type=project.project_type,
     )
     db.add(db_project)
     db.flush()
@@ -249,30 +268,38 @@ def create_project(
             apply_project_template(db, db_project, tpl, current_user.id)
             db_project.created_from_template_id = tpl.id
 
+    log_activity(db, user_id=current_user.id, project_id=db_project.id, action="project_created")
     db.commit()
     db.refresh(db_project)
     return convert_project_to_response(db_project, db)
 
 
 @router.get("/", response_model=List[ProjectResponse])
-def get_user_projects(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    created_projects = db.query(Project).filter(Project.creator_id == current_user.id).all()
-    collaborated_projects = (
-        db.query(Project).join(ProjectCollaborator).filter(ProjectCollaborator.user_id == current_user.id).all()
-    )
+def get_user_projects(
+    project_type: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    created_q = db.query(Project).filter(Project.creator_id == current_user.id)
+    collab_q = db.query(Project).join(ProjectCollaborator).filter(ProjectCollaborator.user_id == current_user.id)
     ws_ids = [
         r.workspace_id
         for r in db.query(WorkspaceMember)
         .filter(WorkspaceMember.user_id == current_user.id, WorkspaceMember.role != "client")
         .all()
     ]
+    if project_type:
+        created_q = created_q.filter(Project.project_type == project_type)
+        collab_q = collab_q.filter(Project.project_type == project_type)
     ws_projects = (
-        db.query(Project).filter(Project.workspace_id.in_(ws_ids)).all()
+        db.query(Project)
+        .filter(Project.workspace_id.in_(ws_ids), *([] if not project_type else [Project.project_type == project_type]))
+        .all()
         if ws_ids
         else []
     )
     merged: dict[int, Project] = {}
-    for p in created_projects + collaborated_projects + ws_projects:
+    for p in created_q.all() + collab_q.all() + ws_projects:
         merged[p.id] = p
     return [convert_project_to_response(project, db) for project in merged.values()]
 

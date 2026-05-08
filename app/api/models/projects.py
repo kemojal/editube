@@ -28,6 +28,7 @@ class ProjectBase(BaseModel):
 class ProjectCreate(ProjectBase):
     workspace_id: Optional[int] = None
     template_key: Optional[str] = None
+    project_type: Optional[str] = None  # "rough-cut", "review", "repurpose"
 
 class ProjectUpdate(ProjectBase):
     pass
@@ -60,10 +61,13 @@ class ProjectResponse(BaseModel):
     name: str
     description: str | None = None
     workspace_id: int
+    project_type: str | None = None
     created_at: datetime
     updated_at: datetime
     creator: UserResponse
     collaborators: List[UserResponse]
+    thumbnail_url: str | None = None
+    latest_video_id: int | None = None
 
     class Config:
         orm_mode = True

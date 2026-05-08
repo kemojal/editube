@@ -73,6 +73,7 @@ from app.services.youtube_stream_resolve import (
     resolve_youtube_page_to_stream_url,
 )
 from app.utils.security import get_current_user
+from app.services.activity import log_activity
 
 logger = logging.getLogger(__name__)
 
@@ -722,6 +723,14 @@ def create_repurpose_job(
         defaults.aspect_ratio = body.aspect_ratio
         defaults.source_trim_seconds = int(range_end) if range_end is not None else None
 
+    if project_id:
+        log_activity(
+            db,
+            user_id=current_user.id,
+            project_id=project_id,
+            action="repurpose_job_created",
+            meta={"source_title": body.source_title or "", "source_mode": body.source_mode},
+        )
     db.commit()
     db.refresh(job)
     try:

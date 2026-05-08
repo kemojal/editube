@@ -58,6 +58,7 @@ from app.services.comment_workflow import (
 )
 from app.utils.security import get_current_user
 from app.websocket_manager import notifications_ws_manager
+from app.services.activity import log_activity
 
 router = APIRouter(
     prefix="/projects/{project_id}/videos/{video_id}/comments",
@@ -331,6 +332,13 @@ async def add_comment(
     )
     sync_is_resolved_from_status(db_comment)
     db.add(db_comment)
+    log_activity(
+        db,
+        user_id=current_user.id,
+        project_id=project_id,
+        action="comment_added",
+        meta={"text": (comment.text or "")[:120], "video_id": video_id},
+    )
     db.commit()
     db.refresh(db_comment)
     db_comment = (

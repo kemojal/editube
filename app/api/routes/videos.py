@@ -22,6 +22,7 @@ from app.utils.security import get_current_user
 from app.utils.storage import upload_file, delete_file
 from app.utils.cloudinary import upload_file_to_cloudinary_with_meta
 from app.services.transcription_enqueue import prepare_and_enqueue_transcription
+from app.services.activity import log_activity
 
 router = APIRouter(
     prefix="/projects/{project_id}/videos",
@@ -115,6 +116,13 @@ def upload_video(
 
     db_tr = VideoTranscription(video_id=db_video.id, status="pending")
     db.add(db_tr)
+    log_activity(
+        db,
+        user_id=current_user.id,
+        project_id=project_id,
+        action="video_uploaded",
+        meta={"video_name": name, "video_id": db_video.id},
+    )
     db.commit()
 
     try:

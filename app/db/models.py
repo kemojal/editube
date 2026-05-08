@@ -347,6 +347,7 @@ class Project(Base):
     client_name = Column(String, nullable=True)
     client_email = Column(String, nullable=True)
     rate_card_cents = Column(JSONB, nullable=True)
+    project_type = Column(String, nullable=True, index=True)  # "rough-cut", "review", "repurpose"
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
