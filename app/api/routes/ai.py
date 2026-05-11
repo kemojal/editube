@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -455,6 +456,10 @@ def get_rough_cut_draft(
 
 
 class RoughCutDraftBody(BaseModel):
+    """Matches editube-frontend rough-cut `draftPayload` plus forward-compatible extras."""
+
+    model_config = ConfigDict(extra="allow")
+
     keepRanges: list[dict[str, Any]] = Field(default_factory=list)
     markers: list[dict[str, Any]] = Field(default_factory=list)
     segments: list[dict[str, Any]] = Field(default_factory=list)
@@ -463,11 +468,26 @@ class RoughCutDraftBody(BaseModel):
     musicStyle: dict[str, Any] = Field(default_factory=dict)
     brandStyle: dict[str, Any] = Field(default_factory=dict)
     textOverlay: dict[str, Any] = Field(default_factory=dict)
+    lowerThirds: list[dict[str, Any]] = Field(default_factory=list)
     trackState: dict[str, Any] = Field(default_factory=dict)
     wordHighlights: dict[str, Any] = Field(default_factory=dict)
     wordFormats: dict[str, Any] = Field(default_factory=dict)
     mediaName: str | None = None
     duration: float | None = None
+    media: dict[str, Any] | None = None
+    roughCutBrief: str = ""
+    aiAnalysis: dict[str, Any] = Field(default_factory=dict)
+    showFillers: bool | None = None
+    removeSilence: bool | None = None
+    smoothSpeech: bool | None = None
+    timelineZoom: float | None = None
+    timelineViewportStart: float | None = None
+    exportSettings: dict[str, Any] = Field(default_factory=dict)
+    activeTab: str | None = None
+    transcriptOpen: bool | None = None
+    inspectorOpen: bool | None = None
+    updatedAt: str | None = None
+    magneticTimeline: bool | None = None
 
 
 @router.put("/{video_id}/ai/rough-cut-draft")
@@ -478,7 +498,157 @@ def save_rough_cut_draft(
     current_user: User = Depends(get_current_user),
 ):
     _check_video_access(video_id, db, current_user)
-    return _upsert_result(db, video_id, "rough_cut_draft", body.model_dump(), status="completed")
+    return _upsert_result(
+        db,
+        video_id,
+        "rough_cut_draft",
+        body.model_dump(mode="json", exclude_none=False),
+        status="completed",
+    )
+
+
+class RoughCutExportBody(BaseModel):
+    format: str = "mp4"  # "mp4" | "wav"
+    keepRanges: list[dict[str, Any]] = Field(default_factory=list)
+    exportSettings: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/{video_id}/ai/rough-cut-export")
+def start_rough_cut_export(
+    video_id: int,
+    body: RoughCutExportBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+
+    fmt = (body.format or "mp4").lower()
+    if fmt not in ("mp4", "wav"):
+        raise HTTPException(status_code=400, detail="format must be mp4 or wav")
+
+    payload = {
+        "format": fmt,
+        "keepRanges": body.keepRanges,
+        "exportSettings": body.exportSettings,
+        "progress": 0,
+    }
+
+    row = (
+        db.query(AiResult)
+        .filter(AiResult.video_id == video_id, AiResult.result_type == "rough_cut_export")
+        .first()
+    )
+    if row is None:
+        row = AiResult(video_id=video_id, result_type="rough_cut_export")
+        db.add(row)
+
+    row.status = "queued"
+    row.error_message = None
+    row.result_data = payload
+    db.commit()
+    db.refresh(row)
+
+    from app.jobs.queue import enqueue_rough_cut_export_job
+
+    rq_job_id = enqueue_rough_cut_export_job(row.id)
+    pdata = dict(row.result_data or {})
+    if rq_job_id:
+        pdata["rqJobId"] = rq_job_id
+        row.result_data = pdata
+        db.commit()
+    if not rq_job_id:
+        row.status = "failed"
+        msg = (
+            "Background worker unavailable (missing REDIS_URL or enqueue error). "
+            "Configure Redis and rq worker for rendered exports."
+        )
+        row.error_message = msg
+        pdata = dict(row.result_data or {})
+        pdata["error"] = msg
+        pdata["progress"] = 0
+        row.result_data = pdata
+        db.commit()
+
+    db.refresh(row)
+    return {
+        "video_id": row.video_id,
+        "result_type": row.result_type,
+        "status": row.status,
+        "result_data": row.result_data,
+        "error_message": row.error_message,
+        "ai_result_id": row.id,
+    }
+
+
+@router.get("/{video_id}/ai/rough-cut-export")
+def get_rough_cut_export(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+    row = (
+        db.query(AiResult)
+        .filter(AiResult.video_id == video_id, AiResult.result_type == "rough_cut_export")
+        .first()
+    )
+    if row is None:
+        return {
+            "video_id": video_id,
+            "result_type": "rough_cut_export",
+            "status": "idle",
+            "result_data": None,
+        }
+    return {
+        "video_id": row.video_id,
+        "result_type": row.result_type,
+        "status": row.status,
+        "result_data": row.result_data,
+        "error_message": row.error_message,
+        "ai_result_id": row.id,
+    }
+
+
+@router.post("/{video_id}/ai/rough-cut-export/cancel")
+def cancel_rough_cut_export(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Best-effort cancel: remove queued RQ job if still pending; mark AiResult cancelled."""
+    _check_video_access(video_id, db, current_user)
+    row = (
+        db.query(AiResult)
+        .filter(AiResult.video_id == video_id, AiResult.result_type == "rough_cut_export")
+        .first()
+    )
+    if row is None:
+        return {"ok": True, "detail": "no export row"}
+    data = dict(row.result_data or {})
+    rq_job_id = data.get("rqJobId")
+    if isinstance(rq_job_id, str) and rq_job_id.strip():
+        try:
+            from redis import Redis
+            from rq.job import Job
+
+            url = os.environ.get("REDIS_URL", "").strip()
+            if url:
+                conn = Redis.from_url(url)
+                job = Job.fetch(rq_job_id, connection=conn)
+                st = job.get_status()
+                if st in ("queued", "scheduled", "deferred"):
+                    job.cancel()
+        except Exception:
+            pass
+    if row.status in ("queued", "processing"):
+        row.status = "failed"
+        row.error_message = "Export cancelled."
+        pdata = dict(row.result_data or {})
+        pdata["progress"] = 0
+        pdata["error"] = "Export cancelled."
+        row.result_data = pdata
+        db.commit()
+    return {"ok": True, "video_id": video_id}
 
 
 class BrollImageRequest(BaseModel):

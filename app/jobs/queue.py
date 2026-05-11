@@ -8,6 +8,31 @@ import os
 logger = logging.getLogger(__name__)
 
 
+def enqueue_rough_cut_export_job(ai_result_id: int) -> str | None:
+    """Enqueue FFmpeg concat/upload for AiResult rough_cut_export row. Returns RQ job id or None."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; rough-cut export not enqueued for ai_result %s", ai_result_id)
+        return None
+    try:
+        from app.jobs.rough_cut_export import rough_cut_export_job
+        from redis import Redis
+        from rq import Queue
+
+        timeout_sec = max(3600, int(os.environ.get("ROUGH_CUT_EXPORT_TIMEOUT_SEC", "14400") or "14400"))
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=timeout_sec)
+        job = q.enqueue(
+            rough_cut_export_job,
+            ai_result_id,
+            job_timeout=timeout_sec,
+        )
+        return job.get_id() if job else None
+    except Exception as e:
+        logger.exception("Failed to enqueue rough-cut export ai_result=%s: %s", ai_result_id, e)
+        return None
+
+
 def enqueue_transcription_job(video_id: int) -> bool:
     """
     Enqueue transcribe_video for this video. Returns True if a job was queued.
