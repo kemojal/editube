@@ -143,7 +143,19 @@ def _assignee_payload(comment: Comment) -> dict | None:
         name=u.name or (u.email or "User"),
         email=u.email or "",
         avatar_url=getattr(u, "avatar_url", None),
-    ).dict()
+    ).model_dump()
+
+
+def _comment_user_payload(comment: Comment) -> dict | None:
+    if not comment.user_id or not comment.user:
+        return None
+    u = comment.user
+    return CommentUserResponse(
+        id=u.id,
+        name=u.name or (u.email or "User"),
+        email=u.email or "",
+        avatar_url=getattr(u, "avatar_url", None),
+    ).model_dump()
 
 
 def _comment_response(comment: Comment, current_user_id: int, db: Session) -> dict:
@@ -175,7 +187,7 @@ def _comment_response(comment: Comment, current_user_id: int, db: Session) -> di
         "kind": kind,
         "status": status,
         "assignee": _assignee_payload(comment),
-        "user": comment.user if comment.user_id else None,
+        "user": _comment_user_payload(comment),
         "guest_name": comment.guest_name,
         "guest_email": comment.guest_email,
         "guest_avatar_url": getattr(comment, "guest_avatar_url", None),
