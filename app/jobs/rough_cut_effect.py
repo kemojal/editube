@@ -1,0 +1,273 @@
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from app.db.database import SessionLocal
+from app.db.models import AiResult, Video
+from app.utils.cloudinary import cloudinary_credentials_configured, upload_local_path_to_cloudinary
+
+
+FFMPEG_EFFECTS = {"speed", "audio", "adjust"}
+ML_EFFECTS = {"remove_bg", "retouch", "voice_changer", "ai_stylize", "video_enhance", "mask"}
+
+
+def build_ffmpeg_effect_command(
+    input_path: str,
+    output_path: str,
+    *,
+    effect_type: str,
+    clip_target: dict[str, Any],
+    settings: dict[str, Any],
+) -> list[str]:
+    start = _num(clip_target.get("start"), 0)
+    end = _num(clip_target.get("end"), 0)
+    duration = max(0.05, end - start) if end > start else 0
+    cmd = ["ffmpeg", "-y"]
+    if start > 0:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", input_path]
+    if duration:
+        cmd += ["-t", f"{duration:.3f}"]
+
+    vf: list[str] = []
+    af: list[str] = []
+    audio_only = clip_target.get("track") == "audio"
+
+    if effect_type == "speed":
+        rate = max(0.05, _num(settings.get("rate"), 1))
+        if not audio_only:
+            vf.append(f"setpts=PTS/{rate:.5f}")
+        af.extend(_atempo_chain(rate))
+    elif effect_type == "audio":
+        volume = _num(settings.get("volume"), 0)
+        fade_in = max(0, _num(settings.get("fadeIn"), 0))
+        fade_out = max(0, _num(settings.get("fadeOut"), 0))
+        af.append(f"volume={volume:.3f}dB")
+        if fade_in > 0:
+            af.append(f"afade=t=in:st=0:d={fade_in:.3f}")
+        if fade_out > 0 and duration > 0:
+            af.append(f"afade=t=out:st={max(0, duration - fade_out):.3f}:d={fade_out:.3f}")
+    elif effect_type == "adjust":
+        exposure = _num(settings.get("exposure"), 0) / 200
+        contrast = max(0, 1 + _num(settings.get("contrast"), 0) / 100)
+        saturation = max(0, 1 + _num(settings.get("saturation"), 0) / 100)
+        brightness = exposure + _num(settings.get("brilliance"), 0) / 500
+        vf.append(f"eq=brightness={brightness:.4f}:contrast={contrast:.4f}:saturation={saturation:.4f}")
+
+    if vf:
+        cmd += ["-vf", ",".join(vf)]
+    if af:
+        cmd += ["-af", ",".join(af)]
+
+    cmd += [
+        "-map",
+        "0:v?",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
+    return cmd
+
+
+def rough_cut_effect_job(ai_result_id: int) -> None:
+    db = SessionLocal()
+    try:
+        row = db.query(AiResult).filter(AiResult.id == ai_result_id).first()
+        if row is None or row.result_type != "rough_cut_effect":
+            return
+        payload = dict(row.result_data or {})
+        video = db.query(Video).filter(Video.id == row.video_id).first()
+        if video is None:
+            raise RuntimeError("Video not found")
+
+        effect_type = str(payload.get("effectType") or "").strip().lower()
+        clip_target = payload.get("clipTarget") if isinstance(payload.get("clipTarget"), dict) else {}
+        settings = payload.get("settings") if isinstance(payload.get("settings"), dict) else {}
+        clip_key = str(payload.get("clipKey") or "").strip()
+
+        _update_row(db, row, status="processing", progress=8)
+        source = _resolve_media_source(video.file_path)
+
+        if effect_type in ML_EFFECTS:
+            output_url = _run_ml_provider(source, effect_type, clip_target, settings)
+            _complete(db, row, clip_key, effect_type, output_url)
+            return
+
+        if effect_type not in FFMPEG_EFFECTS:
+            raise RuntimeError(f"Unsupported effect type: {effect_type}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / f"rough-cut-effect-{row.id}.mp4"
+            cmd = build_ffmpeg_effect_command(
+                source,
+                str(out),
+                effect_type=effect_type,
+                clip_target=clip_target,
+                settings=settings,
+            )
+            _update_row(db, row, status="processing", progress=20)
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _update_row(db, row, status="processing", progress=84)
+            output_url = _publish_output(out, row.video_id, row.id)
+            _complete(db, row, clip_key, effect_type, output_url)
+    except Exception as exc:
+        if "row" in locals() and row is not None:
+            _fail(db, row, str(exc))
+        else:
+            raise
+    finally:
+        db.close()
+
+
+def _run_ml_provider(source: str, effect_type: str, clip_target: dict[str, Any], settings: dict[str, Any]) -> str:
+    provider_url = os.environ.get("ROUGH_CUT_ML_PROVIDER_URL", "").strip()
+    if not provider_url:
+        raise RuntimeError(f"{effect_type.replace('_', ' ')} requires ROUGH_CUT_ML_PROVIDER_URL.")
+    try:
+        import httpx
+    except Exception as exc:
+        raise RuntimeError("httpx is required for ML rough-cut provider calls.") from exc
+    with httpx.Client(timeout=float(os.environ.get("ROUGH_CUT_ML_PROVIDER_TIMEOUT", "900") or "900")) as client:
+        response = client.post(
+            provider_url,
+            json={
+                "source": source,
+                "effectType": effect_type,
+                "clipTarget": clip_target,
+                "settings": settings,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+    output_url = data.get("outputUrl") or data.get("output_url")
+    if not isinstance(output_url, str) or not output_url:
+        raise RuntimeError("ML provider returned no outputUrl.")
+    return output_url
+
+
+def _complete(db, row: AiResult, clip_key: str, effect_type: str, output_url: str) -> None:
+    _update_row(db, row, status="completed", progress=100, output_url=output_url)
+    _attach_to_draft(db, row.video_id, clip_key, effect_type, {
+        "resultId": row.id,
+        "status": "completed",
+        "progress": 100,
+        "outputUrl": output_url,
+    })
+
+
+def _fail(db, row: AiResult, message: str) -> None:
+    payload = dict(row.result_data or {})
+    payload["status"] = "failed"
+    payload["progress"] = 0
+    payload["error"] = message
+    row.status = "failed"
+    row.error_message = message
+    row.result_data = payload
+    db.commit()
+    clip_key = str(payload.get("clipKey") or "").strip()
+    effect_type = str(payload.get("effectType") or "").strip()
+    if clip_key and effect_type:
+        _attach_to_draft(db, row.video_id, clip_key, effect_type, {
+            "resultId": row.id,
+            "status": "failed",
+            "progress": 0,
+            "error": message,
+        })
+
+
+def _update_row(db, row: AiResult, *, status: str, progress: int, output_url: str | None = None) -> None:
+    payload = dict(row.result_data or {})
+    payload["status"] = status
+    payload["progress"] = progress
+    if output_url:
+        payload["outputUrl"] = output_url
+    row.status = status
+    row.result_data = payload
+    row.error_message = None if status != "failed" else row.error_message
+    db.commit()
+
+
+def _attach_to_draft(db, video_id: int, clip_key: str, effect_type: str, processing: dict[str, Any]) -> None:
+    draft = (
+        db.query(AiResult)
+        .filter(AiResult.video_id == video_id, AiResult.result_type == "rough_cut_draft")
+        .first()
+    )
+    if draft is None:
+        return
+    data = dict(draft.result_data or {})
+    clip_attrs = dict(data.get("clipAttributes") or {})
+    attrs = dict(clip_attrs.get(clip_key) or {})
+    current_processing = dict(attrs.get("processing") or {})
+    current_processing[effect_type] = processing
+    attrs["processing"] = current_processing
+    clip_attrs[clip_key] = attrs
+    data["clipAttributes"] = clip_attrs
+    draft.result_data = data
+    draft.status = "completed"
+    db.commit()
+
+
+def _publish_output(path: Path, video_id: int, result_id: int) -> str:
+    if cloudinary_credentials_configured():
+        return upload_local_path_to_cloudinary(
+            str(path),
+            resource_type="video",
+            folder=f"rough_cut_effects/{video_id}",
+            public_id=f"effect_{result_id}",
+        )
+    uploads = Path(os.environ.get("UPLOADS_DIR", "./uploads")).resolve() / "rough_cut_effects" / str(video_id)
+    uploads.mkdir(parents=True, exist_ok=True)
+    dest = uploads / f"effect_{result_id}.mp4"
+    shutil.copyfile(path, dest)
+    return f"/uploads/rough_cut_effects/{video_id}/{dest.name}"
+
+
+def _resolve_media_source(file_path: str) -> str:
+    value = (file_path or "").strip()
+    if value.startswith(("http://", "https://")):
+        return value
+    if value.startswith("/uploads/"):
+        candidate = Path(os.environ.get("UPLOADS_DIR", "./uploads")).resolve() / value.removeprefix("/uploads/")
+        if candidate.exists():
+            return str(candidate)
+    candidate = Path(value)
+    if candidate.exists():
+        return str(candidate)
+    return value
+
+
+def _atempo_chain(rate: float) -> list[str]:
+    factors: list[float] = []
+    current = rate
+    while current > 2:
+        factors.append(2)
+        current /= 2
+    while current < 0.5:
+        factors.append(0.5)
+        current /= 0.5
+    factors.append(current)
+    return [f"atempo={factor:.5f}" for factor in factors]
+
+
+def _num(value: Any, fallback: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if number == number else fallback

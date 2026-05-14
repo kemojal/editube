@@ -470,6 +470,9 @@ class RoughCutDraftBody(BaseModel):
     textOverlay: dict[str, Any] = Field(default_factory=dict)
     lowerThirds: list[dict[str, Any]] = Field(default_factory=list)
     trackState: dict[str, Any] = Field(default_factory=dict)
+    clipAttributes: dict[str, Any] = Field(default_factory=dict)
+    selectedClipTarget: dict[str, Any] | None = None
+    effectJobs: list[dict[str, Any]] = Field(default_factory=list)
     wordHighlights: dict[str, Any] = Field(default_factory=dict)
     wordFormats: dict[str, Any] = Field(default_factory=dict)
     mediaName: str | None = None
@@ -505,6 +508,132 @@ def save_rough_cut_draft(
         body.model_dump(mode="json", exclude_none=False),
         status="completed",
     )
+
+
+class RoughCutEffectBody(BaseModel):
+    effect_type: str
+    clip_key: str
+    clip_target: dict[str, Any] = Field(default_factory=dict)
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/{video_id}/ai/rough-cut-effect")
+def start_rough_cut_effect(
+    video_id: int,
+    body: RoughCutEffectBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+    effect_type = re.sub(r"[^a-z0-9_-]+", "_", (body.effect_type or "").strip().lower()).strip("_")
+    if not effect_type:
+        raise HTTPException(status_code=400, detail="effect_type is required")
+    if not body.clip_key.strip():
+        raise HTTPException(status_code=400, detail="clip_key is required")
+
+    payload = {
+        "effectType": effect_type,
+        "clipKey": body.clip_key,
+        "clipTarget": body.clip_target,
+        "settings": body.settings,
+        "status": "queued",
+        "progress": 0,
+    }
+    row = AiResult(video_id=video_id, result_type="rough_cut_effect", status="queued", result_data=payload)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    from app.jobs.queue import enqueue_rough_cut_effect_job
+
+    rq_job_id = enqueue_rough_cut_effect_job(row.id)
+    data = dict(row.result_data or {})
+    if rq_job_id:
+        data["rqJobId"] = rq_job_id
+        row.result_data = data
+        db.commit()
+    else:
+        msg = "Background worker unavailable. Configure Redis and an RQ worker for rough-cut effects."
+        row.status = "failed"
+        row.error_message = msg
+        data["status"] = "failed"
+        data["error"] = msg
+        row.result_data = data
+        db.commit()
+    db.refresh(row)
+    return {
+        "video_id": row.video_id,
+        "result_type": row.result_type,
+        "status": row.status,
+        "result_data": row.result_data,
+        "error_message": row.error_message,
+        "ai_result_id": row.id,
+    }
+
+
+@router.get("/{video_id}/ai/rough-cut-effect/{result_id}")
+def get_rough_cut_effect(
+    video_id: int,
+    result_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+    row = (
+        db.query(AiResult)
+        .filter(AiResult.id == result_id, AiResult.video_id == video_id, AiResult.result_type == "rough_cut_effect")
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Effect job not found")
+    return {
+        "video_id": row.video_id,
+        "result_type": row.result_type,
+        "status": row.status,
+        "result_data": row.result_data,
+        "error_message": row.error_message,
+        "ai_result_id": row.id,
+    }
+
+
+@router.post("/{video_id}/ai/rough-cut-effect/{result_id}/cancel")
+def cancel_rough_cut_effect(
+    video_id: int,
+    result_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+    row = (
+        db.query(AiResult)
+        .filter(AiResult.id == result_id, AiResult.video_id == video_id, AiResult.result_type == "rough_cut_effect")
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Effect job not found")
+    data = dict(row.result_data or {})
+    rq_job_id = data.get("rqJobId")
+    if isinstance(rq_job_id, str) and rq_job_id.strip():
+        try:
+            from redis import Redis
+            from rq.job import Job
+
+            url = os.environ.get("REDIS_URL", "").strip()
+            if url:
+                job = Job.fetch(rq_job_id, connection=Redis.from_url(url))
+                if job.get_status() in ("queued", "scheduled", "deferred"):
+                    job.cancel()
+        except Exception:
+            pass
+    if row.status in ("queued", "processing"):
+        row.status = "failed"
+        row.error_message = "Effect cancelled."
+        data["status"] = "failed"
+        data["error"] = "Effect cancelled."
+        data["progress"] = 0
+        row.result_data = data
+        db.commit()
+    return {"ok": True, "video_id": video_id, "ai_result_id": result_id}
 
 
 class RoughCutExportBody(BaseModel):

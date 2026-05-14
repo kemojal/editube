@@ -33,6 +33,31 @@ def enqueue_rough_cut_export_job(ai_result_id: int) -> str | None:
         return None
 
 
+def enqueue_rough_cut_effect_job(ai_result_id: int) -> str | None:
+    """Enqueue rough-cut clip effect processing. Returns RQ job id or None."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; rough-cut effect not enqueued for ai_result %s", ai_result_id)
+        return None
+    try:
+        from app.jobs.rough_cut_effect import rough_cut_effect_job
+        from redis import Redis
+        from rq import Queue
+
+        timeout_sec = max(900, int(os.environ.get("ROUGH_CUT_EFFECT_TIMEOUT_SEC", "7200") or "7200"))
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=timeout_sec)
+        job = q.enqueue(
+            rough_cut_effect_job,
+            ai_result_id,
+            job_timeout=timeout_sec,
+        )
+        return job.get_id() if job else None
+    except Exception as e:
+        logger.exception("Failed to enqueue rough-cut effect ai_result=%s: %s", ai_result_id, e)
+        return None
+
+
 def enqueue_transcription_job(video_id: int) -> bool:
     """
     Enqueue transcribe_video for this video. Returns True if a job was queued.
@@ -410,4 +435,3 @@ def enqueue_watch_folder_sync_job(config_id: int) -> bool:
     except Exception as e:
         logger.exception("Failed to enqueue watch folder sync for config %s: %s", config_id, e)
         return False
-
