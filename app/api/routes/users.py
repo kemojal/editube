@@ -11,6 +11,7 @@ from ..models.users import User as UserSchema, UserCreate, UserUpdate, UserRegis
 from ...db.database import get_db
 from app.db.models import (
     User,
+    UserCaptionFavorite,
     UserSettings,
     UserMFAMethod,
     UserMFARecoveryCode,
@@ -445,6 +446,99 @@ def update_current_user_settings(
     db.commit()
     db.refresh(settings)
     return settings
+
+
+# --- Caption template favorites ----------------------------------------------
+#
+# Caption templates are catalogued client-side (see editube-frontend CAPTION_TEMPLATES).
+# We persist the user's favorited template ids only — never the template config — so
+# adding/changing templates does not require migrations. `template_id` is rate-limited
+# to 80 characters and stripped of whitespace.
+_CAPTION_FAVORITE_ID_MAX = 80
+
+
+def _normalize_caption_template_id(raw: str) -> str:
+    value = (raw or "").strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="template_id is required")
+    if len(value) > _CAPTION_FAVORITE_ID_MAX:
+        raise HTTPException(status_code=400, detail="template_id is too long")
+    return value
+
+
+class CaptionFavoriteCreate(BaseModel):
+    template_id: str
+
+
+class CaptionFavoriteResponse(BaseModel):
+    template_id: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("/me/caption-favorites", response_model=list[CaptionFavoriteResponse])
+def list_caption_favorites(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rows = (
+        db.query(UserCaptionFavorite)
+        .filter(UserCaptionFavorite.user_id == current_user.id)
+        .order_by(UserCaptionFavorite.created_at.desc())
+        .all()
+    )
+    return rows
+
+
+@router.post(
+    "/me/caption-favorites",
+    response_model=CaptionFavoriteResponse,
+    status_code=201,
+)
+def add_caption_favorite(
+    data: CaptionFavoriteCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    template_id = _normalize_caption_template_id(data.template_id)
+    existing = (
+        db.query(UserCaptionFavorite)
+        .filter(
+            UserCaptionFavorite.user_id == current_user.id,
+            UserCaptionFavorite.template_id == template_id,
+        )
+        .first()
+    )
+    if existing:
+        return existing
+    row = UserCaptionFavorite(user_id=current_user.id, template_id=template_id)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@router.delete("/me/caption-favorites/{template_id}", status_code=204)
+def remove_caption_favorite(
+    template_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    normalized = _normalize_caption_template_id(template_id)
+    deleted = (
+        db.query(UserCaptionFavorite)
+        .filter(
+            UserCaptionFavorite.user_id == current_user.id,
+            UserCaptionFavorite.template_id == normalized,
+        )
+        .delete(synchronize_session=False)
+    )
+    if not deleted:
+        # Idempotent: treat missing favorites as already-gone rather than 404'ing
+        # the optimistic toggle.
+        return
+    db.commit()
 
 
 @router.put("/onboarding/profile", response_model=UserResponse)

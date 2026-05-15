@@ -1917,3 +1917,29 @@ class RepurposeUserDefaults(Base):
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 
     user = relationship("User")
+
+
+class UserCaptionFavorite(Base):
+    """User-scoped favorites for caption template ids exposed by the rough-cut editor.
+
+    `template_id` is a free-form slug (matches CAPTION_TEMPLATES in the frontend);
+    we intentionally do not FK to a templates table so built-in/global templates
+    can be referenced without seeding a row per user.
+    """
+
+    __tablename__ = "user_caption_favorites"
+    __table_args__ = (
+        UniqueConstraint("user_id", "template_id", name="uq_user_caption_favorites_user_template"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    template_id = Column(String(80), nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    user = relationship("User")
