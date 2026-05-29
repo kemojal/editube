@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, Query
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload, selectinload
 from typing import List, Optional
 import logging
@@ -62,6 +63,8 @@ def upload_video(
     name: str = Form(...),
     description: Optional[str] = Form(None),
     folder_id: Optional[int] = Form(None),
+    # When set, this upload becomes the next version in that video's chain.
+    version_of: Optional[int] = Form(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -71,6 +74,19 @@ def upload_video(
     if not can_access_project(db, current_user.id, db_project):
         raise HTTPException(status_code=403, detail="Not authorized to upload videos to this project")
     assert_write_project_content(db, current_user, db_project)
+
+    # Resolve the version chain. A new version inherits its predecessor's group
+    # and folder; a fresh upload starts its own chain.
+    base_video: Optional[Video] = None
+    if version_of is not None:
+        base_video = (
+            db.query(Video)
+            .filter(Video.id == version_of, Video.project_id == project_id)
+            .first()
+        )
+        if not base_video:
+            raise HTTPException(status_code=404, detail="Version target video not found in this project")
+        folder_id = base_video.folder_id
 
     if folder_id is not None:
         folder = db.query(Folder).filter(Folder.id == folder_id, Folder.project_id == project_id).first()
@@ -98,8 +114,26 @@ def upload_video(
     file_url = str(upload["url"])
     uploaded_size = int(upload.get("bytes") or incoming_size or 0)
 
-    latest_version = db.query(Video).filter(Video.project_id == project_id).order_by(Video.version.desc()).first()
-    version = 1 if not latest_version else latest_version.version + 1
+    import uuid as _uuid
+
+    if base_video is not None:
+        version_group_id = base_video.version_group_id or _uuid.uuid4().hex
+        # Backfill the base's group if it predates the version_group_id column.
+        if not base_video.version_group_id:
+            base_video.version_group_id = version_group_id
+        latest_in_group = (
+            db.query(Video)
+            .filter(
+                Video.project_id == project_id,
+                Video.version_group_id == version_group_id,
+            )
+            .order_by(Video.version.desc())
+            .first()
+        )
+        version = 1 if not latest_in_group else (latest_in_group.version or 0) + 1
+    else:
+        version_group_id = _uuid.uuid4().hex
+        version = 1
 
     db_video = Video(
         project_id=project_id,
@@ -107,6 +141,7 @@ def upload_video(
         name=name,
         description=description,
         version=version,
+        version_group_id=version_group_id,
         file_path=file_url,
         size_bytes=uploaded_size,
         uploader_id=current_user.id,
@@ -187,20 +222,50 @@ def get_video(
     if not can_access_project(db, current_user.id, db_project):
         raise HTTPException(status_code=403, detail="Not authorized to access this video")
 
-    # Get all versions of this video in the project
-    all_versions = (
-        db.query(Video)
-        .filter(Video.project_id == project_id)
-        .order_by(Video.version.desc())
-        .all()
-    )
+    # All versions in this video's chain (same version_group_id), newest first.
+    # Fall back to just this video when the group is somehow unset.
+    if db_video.version_group_id:
+        all_versions = (
+            db.query(Video)
+            .options(joinedload(Video.uploader))
+            .filter(
+                Video.project_id == project_id,
+                Video.version_group_id == db_video.version_group_id,
+            )
+            .order_by(Video.version.desc())
+            .all()
+        )
+    else:
+        all_versions = [db_video]
+
+    from app.db.models import Comment as _Comment
+
+    version_ids = [v.id for v in all_versions]
+    comment_counts: dict[int, int] = {}
+    if version_ids:
+        rows = (
+            db.query(_Comment.video_id, func.count(_Comment.id))
+            .filter(_Comment.video_id.in_(version_ids))
+            .group_by(_Comment.video_id)
+            .all()
+        )
+        comment_counts = {vid: int(cnt) for vid, cnt in rows}
 
     detail = _video_detail(
         db_video, current_user.id, db=db, db_project=db_project
     )
     detail["project"] = db_project
     detail["versions"] = [
-        {"id": v.id, "version": v.version, "name": v.name, "created_at": v.created_at}
+        {
+            "id": v.id,
+            "version": v.version,
+            "name": v.name,
+            "created_at": v.created_at,
+            "thumbnail_url": v.thumbnail_url,
+            "duration": v.duration,
+            "comment_count": comment_counts.get(v.id, 0),
+            "uploader_name": (v.uploader.name if v.uploader else None),
+        }
         for v in all_versions
     ]
     return detail

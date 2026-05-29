@@ -181,6 +181,7 @@ def get_project_contents(
             name=v.name,
             description=v.description,
             version=v.version,
+            version_group_id=v.version_group_id,
             file_path=v.file_path,
             thumbnail_url=v.thumbnail_url,
             project_id=v.project_id,

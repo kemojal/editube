@@ -40,6 +40,7 @@ class VideoResponse(BaseModel):
     name: str
     description: Optional[str] = None
     version: int
+    version_group_id: Optional[str] = None
     file_path: Optional[str] = None
     thumbnail_url: Optional[str] = None
     project_id: int

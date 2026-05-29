@@ -78,6 +78,10 @@ class CommentResponse(BaseModel):
     likes_count: int = 0
     liked_by_me: bool = False
     replies_count: int = 0
+    # Version-history fields (set when listing with include_prior): a comment
+    # from an older version in the chain is read-only and carries its version.
+    read_only: bool = False
+    source_version: int | None = None
     created_at: datetime
     updated_at: datetime
 

@@ -404,6 +404,9 @@ class Video(Base):
     name = Column(String)
     description = Column(Text)
     version = Column(Integer)
+    # Groups videos that are versions of the same deliverable. `version` is the
+    # per-group ordinal (v1, v2, …). NULL only transiently before backfill.
+    version_group_id = Column(String, nullable=True, index=True)
     file_path = Column(Text, nullable=False)
     ingest_page_url = Column(Text, nullable=True)
     thumbnail_url = Column(String, nullable=True)

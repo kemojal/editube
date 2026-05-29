@@ -247,6 +247,9 @@ def _build_comment_tree(
     current_user: User,
     db: Session,
     db_project: Project,
+    *,
+    current_video_id: int | None = None,
+    version_by_video: dict[int, int] | None = None,
 ) -> List[dict]:
     by_parent: dict[int | None, List[Comment]] = defaultdict(list)
     for c in rows:
@@ -268,6 +271,11 @@ def _build_comment_tree(
             if not ok:
                 continue
             item = _comment_response(c, current_user.id, db)
+            # Comments from an earlier version in the chain are read-only history.
+            if current_video_id is not None and c.video_id != current_video_id:
+                item["read_only"] = True
+                if version_by_video is not None:
+                    item["source_version"] = version_by_video.get(c.video_id)
             nested = build(c.id, c)
             item["replies"] = nested
             item["replies_count"] = len(nested)
@@ -455,14 +463,32 @@ def export_comments_file(
 def get_comments(
     project_id: int,
     video_id: int,
+    include_prior: bool = Query(False),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _, db_project = _check_video_access(project_id, video_id, db, current_user)
+    db_video, db_project = _check_video_access(project_id, video_id, db, current_user)
+
+    # By default, only this video's comments. With include_prior, also pull
+    # read-only comments from earlier versions in the same chain.
+    video_ids = [video_id]
+    version_by_video: dict[int, int] = {}
+    if include_prior and db_video.version_group_id:
+        chain = (
+            db.query(Video)
+            .filter(
+                Video.project_id == project_id,
+                Video.version_group_id == db_video.version_group_id,
+                Video.version <= (db_video.version or 0),
+            )
+            .all()
+        )
+        video_ids = [v.id for v in chain] or [video_id]
+        version_by_video = {v.id: (v.version or 0) for v in chain}
 
     rows = (
         db.query(Comment)
-        .filter(Comment.video_id == video_id)
+        .filter(Comment.video_id.in_(video_ids))
         .options(
             joinedload(Comment.likes),
             joinedload(Comment.user),
@@ -471,7 +497,14 @@ def get_comments(
         .order_by(Comment.created_at.asc())
         .all()
     )
-    return _build_comment_tree(rows, current_user, db, db_project)
+    return _build_comment_tree(
+        rows,
+        current_user,
+        db,
+        db_project,
+        current_video_id=video_id,
+        version_by_video=version_by_video,
+    )
 
 
 @router.put("/{comment_id}", response_model=CommentResponse)
