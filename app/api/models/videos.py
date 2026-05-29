@@ -86,6 +86,7 @@ class VideoVersionSummary(BaseModel):
     name: str
     created_at: datetime
     thumbnail_url: str | None = None
+    file_path: str | None = None
     duration: int | None = None
     comment_count: int = 0
     uploader_name: str | None = None

@@ -262,6 +262,7 @@ def get_video(
             "name": v.name,
             "created_at": v.created_at,
             "thumbnail_url": v.thumbnail_url,
+            "file_path": v.file_path,
             "duration": v.duration,
             "comment_count": comment_counts.get(v.id, 0),
             "uploader_name": (v.uploader.name if v.uploader else None),

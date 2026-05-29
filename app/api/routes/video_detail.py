@@ -42,7 +42,16 @@ def _video_with_project_payload(
     )
     detail["project"] = db_project
     detail["versions"] = [
-        {"id": v.id, "version": v.version, "name": v.name, "created_at": v.created_at}
+        {
+            "id": v.id,
+            "version": v.version,
+            "name": v.name,
+            "created_at": v.created_at,
+            "thumbnail_url": v.thumbnail_url,
+            "file_path": v.file_path,
+            "duration": v.duration,
+            "uploader_name": v.uploader.name if v.uploader else None,
+        }
         for v in all_versions
     ]
     return detail
