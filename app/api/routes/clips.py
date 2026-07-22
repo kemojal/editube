@@ -678,7 +678,7 @@ def create_repurpose_job(
         subtitle_template_id=body.subtitle_template_id,
         aspect_ratio=body.aspect_ratio,
         source_trim_seconds=int(range_end) if range_end is not None else None,
-        status="processing" if video_id is not None else "queued",
+        status=("processing" if video_id is not None else "queued") if body.auto_start else "draft",
     )
     db.add(job)
 
@@ -709,16 +709,43 @@ def create_repurpose_job(
         )
     db.commit()
     db.refresh(job)
-    try:
-        start_repurpose_processing(db, job.id)
-        db.refresh(job)
-    except Exception as exc:  # noqa: BLE001
-        job_id = job.id
-        logger.warning("Failed to start repurpose processing for job %s: %s", job_id, exc)
-        db.rollback()
-        fresh = db.query(RepurposeJob).filter(RepurposeJob.id == job_id).first()
-        if fresh:
-            job = fresh
+    if body.auto_start:
+        try:
+            start_repurpose_processing(db, job.id)
+            db.refresh(job)
+        except Exception as exc:  # noqa: BLE001
+            job_id = job.id
+            logger.warning("Failed to start repurpose processing for job %s: %s", job_id, exc)
+            db.rollback()
+            fresh = db.query(RepurposeJob).filter(RepurposeJob.id == job_id).first()
+            if fresh:
+                job = fresh
+    return _serialize_job(job)
+
+
+@router.post("/repurpose/jobs/{job_id}/start", response_model=RepurposeJobOut)
+def start_deferred_repurpose_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    job = db.query(RepurposeJob).filter(RepurposeJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Clip job not found")
+    if job.project_id is not None:
+        _project_with_write_access(job.project_id, db, current_user)
+    elif job.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to start this clip job")
+    if job.status == "completed" and job.created_clip_ids:
+        return _serialize_job(job)
+    if job.status in ("processing", "queued"):
+        return _serialize_job(job)
+    if job.status == "draft":
+        job.status = "processing" if job.video_id is not None else "queued"
+        job.error_message = None
+        db.commit()
+    start_repurpose_processing(db, job.id)
+    db.refresh(job)
     return _serialize_job(job)
 
 

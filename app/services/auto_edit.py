@@ -293,14 +293,28 @@ def run_post_transcription_auto_edit(
         auto_apply = bool(prefs_data.get("auto_apply"))
 
         duration = float(video_duration or 0)
+        range_start = prefs_data.get("source_range_start_seconds")
+        range_end = prefs_data.get("source_range_end_seconds")
+        source_ranges = []
+        if range_start is not None and range_end is not None and float(range_end) > float(range_start):
+            source_ranges = [{"start": float(range_start), "end": float(range_end)}]
+        scoped_segments = filter_segments_to_ranges(segments, source_ranges) if source_ranges else segments
         analysis = _analyze_segments(
-            segments,
+            scoped_segments,
             duration,
             remove_fillers=options.remove_fillers,
             remove_silences=options.remove_silences,
             remove_bad_takes=options.remove_bad_takes,
             aggressiveness=options.aggressiveness,
         )
+        if source_ranges:
+            scoped_keep_ranges: list[dict[str, float]] = []
+            for keep_range in analysis.get("keepRanges", []):
+                start = max(float(keep_range.get("start", 0)), source_ranges[0]["start"])
+                end = min(float(keep_range.get("end", 0)), source_ranges[0]["end"])
+                if end > start:
+                    scoped_keep_ranges.append({"start": start, "end": end})
+            analysis["keepRanges"] = scoped_keep_ranges
         counts, _removable = _summarize_analysis(analysis)
 
         draft_row = (

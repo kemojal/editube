@@ -112,6 +112,17 @@ class RepurposeJobCreateValidationTests(unittest.TestCase):
         body = RepurposeJobCreate(source_mode="project_video", video_id=1)
         self.assertIsNone(body.clip_count)
 
+    def test_auto_start_defaults_true_and_accepts_deferred(self):
+        from app.api.models.clips import RepurposeJobCreate
+
+        immediate = RepurposeJobCreate(source_mode="project_video", video_id=1)
+        deferred = RepurposeJobCreate(
+            source_mode="project_video", video_id=1, auto_start=False
+        )
+
+        self.assertTrue(immediate.auto_start)
+        self.assertFalse(deferred.auto_start)
+
     def test_clip_count_accepts_bounds(self):
         from app.api.models.clips import RepurposeJobCreate
 
@@ -663,6 +674,46 @@ class CreateRepurposeJobLanguageTests(_SqliteDbTestCase):
             .first()
         )
         self.assertIsNone(vt.language)
+
+
+class DeferredRepurposeJobTests(_SqliteDbTestCase):
+    def test_deferred_job_stays_draft_until_explicit_start(self):
+        from app.api.models.clips import RepurposeJobCreate
+        from app.api.routes import clips as clips_routes
+
+        with mock.patch.object(
+            clips_routes, "can_access_project", return_value=True
+        ), mock.patch.object(
+            clips_routes, "assert_write_project_content", return_value=None
+        ), mock.patch.object(
+            clips_routes, "log_activity", return_value=None
+        ), mock.patch.object(
+            clips_routes, "start_repurpose_processing", return_value=None
+        ) as start_mock:
+            created = clips_routes.create_repurpose_job(
+                body=RepurposeJobCreate(
+                    source_mode="project_video",
+                    project_id=self.project.id,
+                    video_id=self.video.id,
+                    auto_start=False,
+                ),
+                db=self.db,
+                current_user=self.user,
+            )
+
+            self.assertEqual(created.status, "draft")
+            start_mock.assert_not_called()
+
+            started = clips_routes.start_deferred_repurpose_job(
+                job_id=created.id, db=self.db, current_user=self.user
+            )
+            self.assertEqual(started.status, "processing")
+            start_mock.assert_called_once_with(self.db, created.id)
+
+            clips_routes.start_deferred_repurpose_job(
+                job_id=created.id, db=self.db, current_user=self.user
+            )
+            start_mock.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -43,6 +43,39 @@ async def _app_lifespan(app: FastAPI):
     retention_hours_raw = os.getenv("RETENTION_SCAN_INTERVAL_HOURS", "").strip()
     retention_hours = float(retention_hours_raw) if retention_hours_raw else 0.0
     tasks: list[asyncio.Task] = []
+
+    redis_url = (os.getenv("REDIS_URL") or "").strip()
+    if redis_url:
+        from app.services.local_worker_manager import (
+            should_supervise_local_worker,
+            start_local_worker,
+            stop_local_worker,
+        )
+
+        if should_supervise_local_worker(redis_url):
+
+            async def _local_worker_watchdog() -> None:
+                owned_worker = None
+                try:
+                    while True:
+                        if owned_worker is None or owned_worker.poll() is not None:
+                            try:
+                                owned_worker = await asyncio.to_thread(
+                                    start_local_worker, redis_url
+                                )
+                                if owned_worker is not None:
+                                    logger.info(
+                                        "Started supervised local RQ worker (pid=%s)",
+                                        owned_worker.pid,
+                                    )
+                            except Exception:
+                                logger.exception("Could not start supervised local RQ worker")
+                        await asyncio.sleep(15)
+                finally:
+                    await asyncio.to_thread(stop_local_worker, owned_worker)
+
+            tasks.append(asyncio.create_task(_local_worker_watchdog()))
+
     if digest_hours > 0:
 
         async def _mention_digest_loop() -> None:

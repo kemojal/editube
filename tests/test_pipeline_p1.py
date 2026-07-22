@@ -219,6 +219,28 @@ class PostTranscriptionAutoEditHookTests(_SqliteDbTestCase):
         self.assertNotIn("keepRanges", data)
         self.assertIn("aiAnalysis", data)
 
+    def test_selected_source_range_constrains_auto_edit_keep_ranges(self):
+        from app.services.auto_edit import run_post_transcription_auto_edit
+
+        self._set_prefs(
+            enabled=True,
+            auto_apply=True,
+            source_range_start_seconds=3.0,
+            source_range_end_seconds=5.5,
+        )
+        run_post_transcription_auto_edit(
+            self.db,
+            self.video.id,
+            segments=_SEGMENTS,
+            video_duration=7.0,
+            transcription_id=1,
+        )
+
+        ranges = self._ai_result("rough_cut_draft").result_data["keepRanges"]
+        self.assertTrue(ranges)
+        self.assertTrue(all(item["start"] >= 3.0 for item in ranges))
+        self.assertTrue(all(item["end"] <= 5.5 for item in ranges))
+
     def test_existing_user_draft_with_range_edit_version_is_never_clobbered(self):
         from app.services.auto_edit import run_post_transcription_auto_edit
 
@@ -385,6 +407,33 @@ class RepurposePipelineFiltersToKeepRangesTests(_SqliteDbTestCase):
         texts = {s["text"] for s in passed_segments}
         self.assertEqual(texts, {"kept", "also kept"})
         self.assertNotIn("cut away", texts)
+
+    def test_saved_ranges_are_used_when_video_duration_is_unknown(self):
+        job = self._make_job()
+        self.video.duration = None
+        self.db.add(
+            AiResult(
+                video_id=self.video.id,
+                result_type="rough_cut_draft",
+                result_data={"keepRanges": [{"start": 5.0, "end": 10.0}]},
+            )
+        )
+        self.db.commit()
+
+        from app.services.repurpose_pipeline import create_clips_for_repurpose_job
+
+        with mock.patch(
+            "app.services.repurpose_pipeline.suggest_clips",
+            return_value=[_fake_suggestion(5, 10)],
+        ) as suggest_mock, mock.patch(
+            "app.jobs.queue.enqueue_clip_render_job", return_value=None
+        ), mock.patch(
+            "app.services.clip_renderer.fast_thumbnail_for_clip", return_value=None
+        ):
+            create_clips_for_repurpose_job(self.db, job.id)
+
+        passed_segments = suggest_mock.call_args.args[0]
+        self.assertEqual({segment["text"] for segment in passed_segments}, {"also kept"})
 
 
 # --- 4. GET /projects/{id}/pipeline ----------------------------------------

@@ -335,6 +335,8 @@ class AutoEditPrefsBody(AutoEditOptions):
 
     enabled: bool = False
     auto_apply: bool = False
+    source_range_start_seconds: float | None = Field(default=None, ge=0)
+    source_range_end_seconds: float | None = Field(default=None, ge=0)
 
 
 @router.put("/{video_id}/ai/auto-edit-prefs")
@@ -345,13 +347,31 @@ def save_auto_edit_prefs(
     current_user: User = Depends(get_current_user),
 ):
     _check_video_access(video_id, db, current_user)
-    return _upsert_result(
+    result = _upsert_result(
         db,
         video_id,
         "auto_edit_prefs",
         body.model_dump(mode="json"),
         status="completed",
     )
+    if body.enabled:
+        transcription = (
+            db.query(VideoTranscription)
+            .filter(VideoTranscription.video_id == video_id)
+            .first()
+        )
+        if transcription and transcription.status == "completed" and transcription.segments:
+            from app.services.auto_edit import run_post_transcription_auto_edit
+
+            video = db.query(Video).filter(Video.id == video_id).first()
+            run_post_transcription_auto_edit(
+                db,
+                video_id,
+                segments=list(transcription.segments),
+                video_duration=float(video.duration) if video and video.duration else None,
+                transcription_id=transcription.id,
+            )
+    return result
 
 
 @router.get("/{video_id}/ai/auto-edit-prefs")

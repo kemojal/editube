@@ -304,6 +304,7 @@ class RepurposeJobCreate(BaseModel):
     # ("auto"/""/None = auto-detect, normalized via app.utils.language.normalize_language).
     language: str | None = None
     save_as_default: bool = False
+    auto_start: bool = True
 
 
 class RepurposeJobOut(BaseModel):

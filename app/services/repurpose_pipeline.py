@@ -87,6 +87,8 @@ def create_clips_for_completed_repurpose_jobs(
         .all()
     )
     for job in jobs:
+        if job.status == "draft":
+            continue
         if job.status == "completed" and job.created_clip_ids:
             continue
         create_clips_for_repurpose_job(
@@ -105,7 +107,7 @@ def mark_repurpose_jobs_failed(db: Session, video_id: int, message: str) -> None
     try:
         jobs = (
             db.query(RepurposeJob)
-            .filter(RepurposeJob.video_id == video_id)
+            .filter(RepurposeJob.video_id == video_id, RepurposeJob.status != "draft")
             .all()
         )
         for job in jobs:
@@ -363,12 +365,11 @@ def _kept_ranges_for_video(db: Session, video_id: int | None) -> list[dict[str, 
 
 
 def _ranges_are_non_trivial(ranges: list[dict[str, Any]], duration: float | None) -> bool:
-    """False when keepRanges effectively cover the whole video (no real cuts
-    were made, or duration is unknown so triviality can't be verified) —
-    the conservative choice that skips filtering rather than risk mutating
-    segments for no benefit."""
-    if not ranges or not duration or duration <= 0:
+    """False only when keepRanges cover the known full video duration."""
+    if not ranges:
         return False
+    if not duration or duration <= 0:
+        return True
     total = 0.0
     for r in ranges:
         try:
