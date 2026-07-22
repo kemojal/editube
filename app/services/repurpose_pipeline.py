@@ -9,11 +9,15 @@ from typing import Any
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app.db.models import Clip, ClipStyle, ClipTemplate, RepurposeJob, Video, VideoTranscription
+from app.db.models import AiResult, Clip, ClipStyle, ClipTemplate, RepurposeJob, Video, VideoTranscription
+from app.services.auto_edit import filter_segments_to_ranges
 from app.services.clip_analysis import ClipSuggestion, suggest_clips
 from app.services.transcription_enqueue import prepare_and_enqueue_transcription
 
 logger = logging.getLogger(__name__)
+
+_VALID_ASPECT_RATIOS = {"9:16", "1:1", "16:9"}
+_DEFAULT_CLIP_COUNT = 8
 
 _LENGTH_BUCKETS: dict[str, tuple[float, float]] = {
     "lt_30": (8.0, 30.0),
@@ -144,13 +148,28 @@ def create_clips_for_repurpose_job(
         _mark_job_failed(db, job.id, "No transcript segments available for clipping")
         return []
 
+    resolved_duration = video_duration if video_duration is not None else _video_duration(video)
+
+    # Auto-edit integration: if the source video has a rough-cut draft with
+    # non-trivial keepRanges (auto-seeded or user-edited), keep clip
+    # suggestion windows out of the ranges that were cut. No draft, empty
+    # ranges, or ranges spanning the whole video (i.e. effectively no cuts) —
+    # unchanged legacy behavior.
+    kept_ranges = _kept_ranges_for_video(db, job.video_id)
+    if kept_ranges and _ranges_are_non_trivial(kept_ranges, resolved_duration):
+        filtered_segments = filter_segments_to_ranges(usable_segments, kept_ranges)
+        if filtered_segments:
+            usable_segments = filtered_segments
+
     min_duration, max_duration = _duration_bounds(job.clip_length_bucket)
+    clip_count = _clip_count_for_job(job)
+    aspect_ratios = _aspect_ratios_for_job(job)
     suggestions = suggest_clips(
         usable_segments,
         min_duration=min_duration,
         max_duration=max_duration,
-        max_suggestions=8,
-        video_duration=video_duration if video_duration is not None else _video_duration(video),
+        max_suggestions=clip_count,
+        video_duration=resolved_duration,
         focus_prompt=job.clip_anything_prompt if job.clip_mode == "clip_anything" else None,
     )
 
@@ -161,8 +180,10 @@ def create_clips_for_repurpose_job(
         db.commit()
         return []
 
+    # Key includes aspect_ratio so that fanning the same moment out across
+    # multiple aspect ratios doesn't get de-duped against itself.
     existing = {
-        (round(float(c.start_time), 2), round(float(c.end_time), 2))
+        (round(float(c.start_time), 2), round(float(c.end_time), 2), c.aspect_ratio)
         for c in db.query(Clip)
         .filter(Clip.video_id == job.video_id, Clip.user_id == job.user_id)
         .all()
@@ -170,15 +191,16 @@ def create_clips_for_repurpose_job(
     template = _template_for_job(db, job)
     created_ids: list[int] = []
     for suggestion in suggestions:
-        key = (round(float(suggestion.start_time), 2), round(float(suggestion.end_time), 2))
-        if key in existing:
-            continue
-        clip = _clip_from_suggestion(job, suggestion)
-        db.add(clip)
-        db.flush()
-        db.add(_style_for_clip(clip.id, template))
-        created_ids.append(clip.id)
-        existing.add(key)
+        for aspect_ratio in aspect_ratios:
+            key = (round(float(suggestion.start_time), 2), round(float(suggestion.end_time), 2), aspect_ratio)
+            if key in existing:
+                continue
+            clip = _clip_from_suggestion(job, suggestion, aspect_ratio=aspect_ratio)
+            db.add(clip)
+            db.flush()
+            db.add(_style_for_clip(clip.id, template))
+            created_ids.append(clip.id)
+            existing.add(key)
 
     job.created_clip_ids = created_ids
     job.status = "completed"
@@ -237,7 +259,7 @@ def _mark_job_failed(db: Session, job_id: int, message: str) -> None:
         logger.exception("Could not mark repurpose job %s failed", job_id)
 
 
-def _clip_from_suggestion(job: RepurposeJob, suggestion: ClipSuggestion) -> Clip:
+def _clip_from_suggestion(job: RepurposeJob, suggestion: ClipSuggestion, *, aspect_ratio: str) -> Clip:
     start = float(suggestion.start_time)
     end = float(suggestion.end_time)
     return Clip(
@@ -248,7 +270,7 @@ def _clip_from_suggestion(job: RepurposeJob, suggestion: ClipSuggestion) -> Clip
         end_time=end,
         cuts=[{"start": start, "end": end}],
         duration_seconds=float(suggestion.duration),
-        aspect_ratio=job.aspect_ratio or "9:16",
+        aspect_ratio=aspect_ratio,
         virality_score=float(suggestion.virality_score),
         status="draft",
         is_ai_suggested=True,
@@ -318,6 +340,72 @@ def _range_for_job(job: RepurposeJob) -> tuple[float, float | None]:
     if end is not None and end <= start:
         end = None
     return max(0.0, start), end
+
+
+def _kept_ranges_for_video(db: Session, video_id: int | None) -> list[dict[str, Any]] | None:
+    """The source video's rough-cut draft `keepRanges`, if any (auto-seeded
+    by the post-transcription auto-edit hook, or saved by the rough-cut
+    editor). Returns None when there is no draft or no ranges, so callers
+    can treat that as "unchanged legacy behavior"."""
+    if not video_id:
+        return None
+    row = (
+        db.query(AiResult)
+        .filter(AiResult.video_id == video_id, AiResult.result_type == "rough_cut_draft")
+        .first()
+    )
+    if not row or not isinstance(row.result_data, dict):
+        return None
+    ranges = row.result_data.get("keepRanges")
+    if not isinstance(ranges, list) or not ranges:
+        return None
+    return ranges
+
+
+def _ranges_are_non_trivial(ranges: list[dict[str, Any]], duration: float | None) -> bool:
+    """False when keepRanges effectively cover the whole video (no real cuts
+    were made, or duration is unknown so triviality can't be verified) —
+    the conservative choice that skips filtering rather than risk mutating
+    segments for no benefit."""
+    if not ranges or not duration or duration <= 0:
+        return False
+    total = 0.0
+    for r in ranges:
+        try:
+            total += max(0.0, float(r.get("end", 0)) - float(r.get("start", 0)))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return total < max(duration - 0.5, 0.0)
+
+
+def _clip_count_for_job(job: RepurposeJob) -> int:
+    """Number of suggested MOMENTS to clip (persisted in source_meta by the
+    route layer). Falls back to the pipeline's historical default of 8."""
+    meta = job.source_meta if isinstance(job.source_meta, dict) else {}
+    raw = meta.get("clip_count")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_CLIP_COUNT
+    return value if value > 0 else _DEFAULT_CLIP_COUNT
+
+
+def _aspect_ratios_for_job(job: RepurposeJob) -> list[str]:
+    """Aspect ratios to fan each suggested moment out into. `source_meta['aspect_ratios']`
+    (persisted by the route layer when the request supplied `aspect_ratios`) wins;
+    otherwise fall back to the job's single `aspect_ratio` field, as before."""
+    meta = job.source_meta if isinstance(job.source_meta, dict) else {}
+    raw = meta.get("aspect_ratios")
+    if isinstance(raw, list):
+        seen: set[str] = set()
+        out: list[str] = []
+        for ratio in raw:
+            if isinstance(ratio, str) and ratio in _VALID_ASPECT_RATIOS and ratio not in seen:
+                seen.add(ratio)
+                out.append(ratio)
+        if out:
+            return out
+    return [job.aspect_ratio or "9:16"]
 
 
 def _duration_bounds(bucket: str | None) -> tuple[float, float]:

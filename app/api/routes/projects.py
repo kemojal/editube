@@ -19,6 +19,8 @@ from app.api.models.projects import (
 )
 from app.db.database import get_db
 from app.db.models import (
+    AiResult,
+    Clip,
     Folder,
     Project,
     ProjectCollaborator,
@@ -27,8 +29,10 @@ from app.db.models import (
     ProjectArchiveState,
     ProjectRetentionPolicy,
     Notification,
+    RepurposeJob,
     User,
     Video,
+    VideoTranscription,
     WorkspaceAsset,
     WorkspaceMember,
 )
@@ -318,6 +322,119 @@ def get_project(project_id: int, db: Session = Depends(get_db), current_user: Us
     except Exception as e:
         logger.exception("Error retrieving project %s", project_id)
         raise HTTPException(status_code=500, detail="Internal server error") from e
+
+
+def _pipeline_status_for_video(db: Session, video: Video) -> dict:
+    """Read-only pipeline status for one video: transcription / analysis /
+    clips states, derived from cheap existence + status queries. No writes,
+    no heavy computation — safe to poll frequently from the studio shell."""
+    vt = db.query(VideoTranscription).filter(VideoTranscription.video_id == video.id).first()
+    transcription_state = vt.status if vt else "none"
+
+    prefs_row = (
+        db.query(AiResult)
+        .filter(AiResult.video_id == video.id, AiResult.result_type == "auto_edit_prefs")
+        .first()
+    )
+    auto_edit_enabled = bool(
+        isinstance(prefs_row.result_data if prefs_row else None, dict)
+        and prefs_row.result_data.get("enabled")
+    )
+
+    draft_row = (
+        db.query(AiResult)
+        .filter(AiResult.video_id == video.id, AiResult.result_type == "rough_cut_draft")
+        .first()
+    )
+    ai_analysis = (
+        draft_row.result_data.get("aiAnalysis")
+        if draft_row and isinstance(draft_row.result_data, dict)
+        else None
+    )
+    # Only the server-side auto-edit hook (`run_post_transcription_auto_edit`)
+    # stamps `analyzedAt: "transcription:<id>"` on aiAnalysis; a client-format
+    # draft save (rough-cut-draft-state.ts's `aiAnalysis: {showFillers,
+    # removeSilence, smoothSpeech, suggestions}`, no `analyzedAt`) must never
+    # read as "done" here.
+    analyzed_at = ai_analysis.get("analyzedAt") if isinstance(ai_analysis, dict) else None
+    has_analysis = isinstance(analyzed_at, str) and analyzed_at.startswith("transcription:")
+    if has_analysis:
+        analysis_state = "done"
+    elif auto_edit_enabled:
+        analysis_state = "pending"
+    else:
+        analysis_state = "none"
+    # A failed transcription will never produce analysis — don't leave the
+    # strip spinning on "pending" (and therefore polling) forever. A
+    # previously-completed analysis (e.g. from an earlier successful run,
+    # before a later retry failed) stays "done" rather than being erased.
+    if transcription_state == "failed" and analysis_state != "done":
+        analysis_state = "none"
+
+    jobs_exist = (
+        db.query(RepurposeJob.id).filter(RepurposeJob.video_id == video.id).first() is not None
+    )
+    if not jobs_exist:
+        clips_state, ready, total = "none", 0, 0
+    else:
+        total = db.query(Clip).filter(Clip.video_id == video.id).count()
+        ready = db.query(Clip).filter(Clip.video_id == video.id, Clip.status == "ready").count()
+        if total == 0:
+            clips_state = "waiting"
+        elif ready < total:
+            clips_state = "generating"
+        else:
+            clips_state = "done"
+
+    return {
+        "video_id": video.id,
+        "transcription": transcription_state,
+        "analysis": analysis_state,
+        "clips": {"state": clips_state, "ready": ready, "total": total},
+    }
+
+
+@router.get("/{project_id}/pipeline")
+def get_project_pipeline(
+    project_id: int,
+    video_id: int | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Studio pipeline status strip: transcription -> analysis -> clips, for
+    one video in the project (default: the project's most recently updated
+    video). Read-only, cheap queries only."""
+    db_project = db.query(Project).filter(Project.id == project_id).first()
+    if not db_project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not can_access_project(db, current_user.id, db_project):
+        raise HTTPException(status_code=403, detail="Not authorized to access this project")
+
+    if video_id is not None:
+        video = (
+            db.query(Video)
+            .filter(Video.id == video_id, Video.project_id == project_id)
+            .first()
+        )
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found in project")
+    else:
+        video = (
+            db.query(Video)
+            .filter(Video.project_id == project_id)
+            .order_by(Video.updated_at.desc())
+            .first()
+        )
+
+    if video is None:
+        return {
+            "video_id": None,
+            "transcription": "none",
+            "analysis": "none",
+            "clips": {"state": "none", "ready": 0, "total": 0},
+        }
+
+    return _pipeline_status_for_video(db, video)
 
 
 @router.put("/{project_id}", response_model=ProjectResponse)

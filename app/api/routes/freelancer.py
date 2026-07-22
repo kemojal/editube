@@ -121,23 +121,21 @@ def _connect_charges_ready(account: dict) -> bool:
 
 
 def _upload_contract_pdf_bytes(pdf_bytes: bytes, contract_id: int) -> Optional[str]:
-    try:
-        import app.utils.cloudinary  # noqa: F401
-        import cloudinary.uploader
-    except Exception:
-        logger.warning("Cloudinary not available; signed PDF not uploaded")
+    from app.storage import build_key, get_storage, storage_available
+
+    if not storage_available():
+        logger.warning("Storage backend not available; signed PDF not uploaded")
         return None
     try:
         folder = os.environ.get("CLOUDINARY_CONTRACTS_FOLDER", "contracts")
-        r = cloudinary.uploader.upload(
-            io.BytesIO(pdf_bytes),
-            resource_type="raw",
+        key = build_key(
             folder=folder,
-            public_id=f"signed_contract_{contract_id}",
-            format="pdf",
-            overwrite=True,
+            public_id=f"signed_contract_{contract_id}.pdf",
+            content_type="application/pdf",
         )
-        return r.get("secure_url")
+        return get_storage().upload_bytes(
+            pdf_bytes, key=key, content_type="application/pdf"
+        ).url
     except Exception:
         logger.exception("Contract PDF upload failed")
         return None

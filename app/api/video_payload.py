@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import Annotation, Comment, Project, Video, VideoTranscription
 from app.services.project_access import can_moderate_video_comments
@@ -45,7 +46,74 @@ def transcription_to_dict(tr: VideoTranscription | None) -> dict[str, Any] | Non
         "speaker_count": tr.speaker_count if tr.speaker_count is not None else 0,
         "error_message": tr.error_message,
         "updated_at": tr.updated_at,
+        "language": tr.language,
+        "detected_language": tr.detected_language,
     }
+
+
+def video_versions_payload(db: Session, video: Video) -> list[dict[str, Any]]:
+    """versions[] for the player's version switcher (VideoVersionSummary).
+
+    For Review projects (project_type == "review"), all videos in the project
+    count as versions of the deliverable (version control flow). For other
+    workflows, siblings in this video's chain (same version_group_id) count as
+    versions. Newest first, with per-version comment counts batched in one query.
+    """
+    project_type = None
+    if getattr(video, "project", None) is not None:
+        project_type = video.project.project_type
+    elif video.project_id:
+        proj = db.query(Project.project_type).filter(Project.id == video.project_id).first()
+        if proj:
+            project_type = proj[0]
+
+    if project_type == "review":
+        versions = (
+            db.query(Video)
+            .options(joinedload(Video.uploader))
+            .filter(Video.project_id == video.project_id)
+            .order_by(Video.version.desc(), Video.id.desc())
+            .all()
+        )
+    elif video.version_group_id:
+        versions = (
+            db.query(Video)
+            .options(joinedload(Video.uploader))
+            .filter(
+                Video.project_id == video.project_id,
+                Video.version_group_id == video.version_group_id,
+            )
+            .order_by(Video.version.desc())
+            .all()
+        )
+    else:
+        versions = [video]
+
+    version_ids = [v.id for v in versions]
+    comment_counts: dict[int, int] = {}
+    if version_ids:
+        rows = (
+            db.query(Comment.video_id, func.count(Comment.id))
+            .filter(Comment.video_id.in_(version_ids))
+            .group_by(Comment.video_id)
+            .all()
+        )
+        comment_counts = {vid: int(cnt) for vid, cnt in rows}
+
+    return [
+        {
+            "id": v.id,
+            "version": v.version,
+            "name": v.name,
+            "created_at": v.created_at,
+            "thumbnail_url": v.thumbnail_url,
+            "file_path": v.file_path,
+            "duration": v.duration,
+            "comment_count": comment_counts.get(v.id, 0),
+            "uploader_name": v.uploader.name if v.uploader else None,
+        }
+        for v in versions
+    ]
 
 
 def video_detail_dict(

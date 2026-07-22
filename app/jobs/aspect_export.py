@@ -105,14 +105,17 @@ def aspect_export_job(export_id: int) -> None:
                 _fail(db, exp, f"ffmpeg failed: {err}")
                 return
 
-            upload = cloudinary.uploader.upload(
-                str(dst),
-                resource_type="video",
+            from app.storage import build_key, get_storage, guess_content_type
+
+            _ct = guess_content_type(str(dst), resource_type="video")
+            _key = build_key(
                 folder=os.environ.get("CLOUDINARY_ASPECT_FOLDER", "aspect_exports"),
+                filename=dst.name,
+                content_type=_ct,
             )
-            url = upload.get("secure_url")
+            url = get_storage().upload_path(dst, key=_key, content_type=_ct).url
             if not url:
-                _fail(db, exp, "Cloudinary returned no URL.")
+                _fail(db, exp, "Storage returned no URL.")
                 return
 
             exp.status = "completed"

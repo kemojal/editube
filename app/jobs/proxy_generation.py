@@ -123,22 +123,21 @@ def _upload_proxy(proxy_path: str) -> dict:
         size = os.path.getsize(dest)
         return {"url": dest, "bytes": size, "public_id": filename}
 
-    # Default: Cloudinary
+    # Default: configured storage backend (R2 / Cloudinary / local)
     try:
-        import cloudinary
-        import cloudinary.uploader
+        from app.storage import build_key, get_storage, guess_content_type
 
-        result = cloudinary.uploader.upload_large(
-            proxy_path,
-            resource_type="video",
+        _ct = guess_content_type(str(proxy_path), resource_type="video")
+        _key = build_key(
             folder="editube-proxies",
-            chunk_size=6 * 1024 * 1024,
-            timeout=900,
+            filename=os.path.basename(str(proxy_path)),
+            content_type=_ct,
         )
+        result = get_storage().upload_path(proxy_path, key=_key, content_type=_ct)
         return {
-            "url": result.get("secure_url", ""),
-            "bytes": int(result.get("bytes", 0)),
-            "public_id": result.get("public_id", ""),
+            "url": result.url,
+            "bytes": result.bytes,
+            "public_id": result.key,
         }
     except Exception as e:
         raise RuntimeError(f"Proxy upload failed: {e}") from e

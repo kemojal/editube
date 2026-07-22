@@ -31,23 +31,21 @@ def build_review_signoff_pdf_bytes(
 
 
 def upload_review_signoff_pdf(pdf_bytes: bytes, signoff_id: int) -> Optional[str]:
-    try:
-        import app.utils.cloudinary  # noqa: F401
-        import cloudinary.uploader
-    except Exception:
-        logger.warning("Cloudinary not available; review sign-off PDF not uploaded")
+    from app.storage import build_key, get_storage, storage_available
+
+    if not storage_available():
+        logger.warning("Storage backend not available; review sign-off PDF not uploaded")
         return None
     try:
         folder = os.environ.get("CLOUDINARY_REVIEW_SIGNOFFS_FOLDER", "review_signoffs")
-        r = cloudinary.uploader.upload(
-            io.BytesIO(pdf_bytes),
-            resource_type="raw",
+        key = build_key(
             folder=folder,
-            public_id=f"review_signoff_{signoff_id}",
-            format="pdf",
-            overwrite=True,
+            public_id=f"review_signoff_{signoff_id}.pdf",
+            content_type="application/pdf",
         )
-        return r.get("secure_url")
+        return get_storage().upload_bytes(
+            pdf_bytes, key=key, content_type="application/pdf"
+        ).url
     except Exception:
         logger.exception("Review sign-off PDF upload failed")
         return None

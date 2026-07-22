@@ -18,6 +18,7 @@ from sqlalchemy.sql import func
 
 from app.db.database import SessionLocal
 from app.db.models import RepurposeJob, Video, VideoTranscription
+from app.utils.language import normalize_language
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,7 @@ def _job_source_range(job: RepurposeJob | None) -> tuple[float, float | None]:
     return max(0.0, start), end
 
 
-def transcribe_video(video_id: int) -> None:
+def transcribe_video(video_id: int, language: str | None = None) -> None:
     _ensure_worker_logging()
     logger.info("transcribe_video: starting job for video_id=%s", video_id)
     db: Session = SessionLocal()
@@ -150,6 +151,9 @@ def transcribe_video(video_id: int) -> None:
         if not video or not vt:
             logger.error("transcribe_video: missing video or transcription row for id %s", video_id)
             return
+
+        # Prefer the explicit job arg, fall back to whatever was persisted on the row.
+        requested_language = normalize_language(language) or normalize_language(vt.language)
 
         vt.status = "processing"
         vt.error_message = None
@@ -279,12 +283,27 @@ def transcribe_video(video_id: int) -> None:
                 except (TypeError, ValueError):
                     vad_params = {}
 
-            segments_iter, _info = model.transcribe(
+            # Word-level timestamps let downstream analysis (filler/bad-take
+            # suggestion timing in app.services.auto_edit) snap to real word
+            # boundaries instead of faking them via even division. It adds
+            # CPU cost on top of plain segment decoding, so it's gated behind
+            # an env flag (default on).
+            word_timestamps_enabled = os.environ.get(
+                "WHISPER_WORD_TIMESTAMPS", "1"
+            ).strip().lower() not in {"0", "false", "no"}
+
+            segments_iter, info = model.transcribe(
                 str(wav_path),
                 beam_size=beam,
                 vad_filter=vad_enabled,
                 vad_parameters=vad_params if vad_enabled else None,
+                language=requested_language,
+                word_timestamps=word_timestamps_enabled,
             )
+
+            # Persist what Whisper actually detected/used, even in auto mode.
+            vt.detected_language = getattr(info, "language", None)
+            db.commit()
 
             segments: list[dict] = []
             speaker_labels: set[str] = set()
@@ -294,14 +313,31 @@ def transcribe_video(video_id: int) -> None:
                 # We preserve a deterministic speaker tag even before whisperx integration.
                 speaker = "SPEAKER_1"
                 speaker_labels.add(speaker)
-                segments.append(
-                    {
-                        "start": float(seg.start) + range_start,
-                        "end": float(seg.end) + range_start,
-                        "text": (seg.text or "").strip(),
-                        "speaker": speaker,
-                    }
-                )
+                seg_dict: dict = {
+                    "start": float(seg.start) + range_start,
+                    "end": float(seg.end) + range_start,
+                    "text": (seg.text or "").strip(),
+                    "speaker": speaker,
+                }
+
+                seg_words = getattr(seg, "words", None)
+                if seg_words:
+                    words_out: list[dict] = []
+                    for w in seg_words:
+                        word_text = str(getattr(w, "word", "") or "").strip()
+                        if not word_text:
+                            continue
+                        words_out.append(
+                            {
+                                "word": word_text,
+                                "start": round(float(w.start) + range_start, 3),
+                                "end": round(float(w.end) + range_start, 3),
+                            }
+                        )
+                    if words_out:
+                        seg_dict["words"] = words_out
+
+                segments.append(seg_dict)
                 seg_count += 1
                 if seg_count % 50 == 0:
                     try:
@@ -341,6 +377,25 @@ def transcribe_video(video_id: int) -> None:
             vt.error_message = None
             db.commit()
             logger.info("Transcription completed for video %s (%s segments)", video_id, len(nonempty))
+
+            # Server-side auto-edit: if the video has enabled auto-edit prefs,
+            # analyze the transcript and seed/merge keepRanges + aiAnalysis into
+            # the rough_cut_draft *before* the repurpose (clips) chain below, so
+            # clip suggestion windows can read the freshly seeded keepRanges.
+            # This must never fail the transcription job itself.
+            try:
+                from app.services.auto_edit import run_post_transcription_auto_edit
+
+                run_post_transcription_auto_edit(
+                    db,
+                    video_id,
+                    segments=nonempty,
+                    video_duration=video_duration,
+                    transcription_id=vt.id,
+                )
+            except Exception:
+                logger.exception("Post-transcription auto-edit hook failed for video %s", video_id)
+
             try:
                 from app.services.repurpose_pipeline import create_clips_for_completed_repurpose_jobs
 

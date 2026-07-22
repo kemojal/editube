@@ -87,12 +87,16 @@ def delivery_package_job(package_id: int) -> None:
                         zf.write(file, file.relative_to(payload))
 
             digest = _sha256_file(zip_path)
-            upload = cloudinary.uploader.upload(
-                str(zip_path),
-                resource_type="raw",
+            from app.storage import build_key, get_storage
+
+            _key = build_key(
                 folder=os.environ.get("CLOUDINARY_DELIVERY_PACKAGE_FOLDER", "delivery_packages"),
+                filename=zip_path.name,
+                content_type="application/zip",
             )
-            pkg.zip_url = upload.get("secure_url")
+            pkg.zip_url = get_storage().upload_path(
+                zip_path, key=_key, content_type="application/zip"
+            ).url
             pkg.zip_size_bytes = zip_path.stat().st_size
             pkg.checksum_sha256 = digest
             pkg.status = "completed"

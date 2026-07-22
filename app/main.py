@@ -1,5 +1,4 @@
 import asyncio
-import cloudinary
 import logging
 import os
 import re
@@ -141,16 +140,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# cloudinary.config( 
-#   cloud_name = "dtpnbesbx", 
-#   api_key = "811133693665998", 
-#   api_secret = "1YJOBmJ9LN1Aqhyc8AlUoAOHF9A" 
-# )
-cloudinary.config( 
-  cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"), 
-  api_key = os.getenv("CLOUDINARY_API_KEY"), 
-  api_secret = os.getenv("CLOUDINARY_API_SECRET") 
-)
+# Storage backends (R2 / Cloudinary / local) are configured lazily by app.storage;
+# no global cloudinary.config() needed here. See docs/r2-storage-migration-plan.md.
 
 app.include_router(api_router)
 

@@ -18,6 +18,11 @@ from app.jobs.ai_jobs import (
     detect_fillers,
 )
 from app.services.ai_client import generate_broll_image, generate_json
+from app.services.auto_edit import (
+    AutoEditOptions,
+    _analyze_segments,
+    _summarize_analysis,
+)
 from app.utils.cloudinary import upload_image_bytes
 from app.utils.security import get_current_user
 from app.services.project_access import can_access_project
@@ -314,95 +319,66 @@ def remove_fillers(
     return _upsert_result(db, video_id, "remove_fillers_job", {"status": "queued"}, status="queued")
 
 
-_FILLERS = {"um", "umm", "uh", "uhh", "ah", "erm"}
-_BAD_TAKE_RE = re.compile(
-    r"\b(cut that|bad take|start over|restart|retake|scratch that|messed up|ignore that|redo that|try again)\b",
-    re.IGNORECASE,
-)
-_SILENCE_THRESHOLD = 0.65
-
-
-def _analyze_segments(segments: list[dict], duration: float) -> dict:
-    """Server-side rough-cut analysis: derive keep_ranges and suggestion list from transcript."""
-    keep: list[dict] = []
-    suggestions: list[dict] = []
-
-    for i, seg in enumerate(segments):
-        start = float(seg.get("start") or 0)
-        end = float(seg.get("end") or start)
-        text = str(seg.get("text") or "").strip()
-        if end <= start:
-            continue
-
-        # Bad-take detection — mark as suggestion, exclude from keep
-        if _BAD_TAKE_RE.search(text):
-            suggestions.append({
-                "id": f"bad-take-{i}",
-                "kind": "bad_take",
-                "title": "Bad take",
-                "detail": text[:90],
-                "start": start,
-                "end": end,
-                "severity": "high",
-            })
-            continue
-
-        # Silence gap before this segment
-        if i > 0:
-            prev_end = float(segments[i - 1].get("end") or 0)
-            gap = start - prev_end
-            if gap >= _SILENCE_THRESHOLD:
-                gap_start = prev_end + 0.08
-                gap_end = start - 0.08
-                if gap_end > gap_start:
-                    suggestions.append({
-                        "id": f"silence-{i}",
-                        "kind": "silence",
-                        "title": "Silence",
-                        "detail": f"{gap:.1f}s",
-                        "start": gap_start,
-                        "end": gap_end,
-                        "severity": "high" if gap > 1.3 else "medium",
-                    })
-
-        keep.append({"start": start, "end": end})
-
-    # Merge adjacent keep ranges
-    merged: list[dict] = []
-    for rng in sorted(keep, key=lambda r: r["start"]):
-        if merged and rng["start"] <= merged[-1]["end"] + 0.03:
-            merged[-1]["end"] = max(merged[-1]["end"], rng["end"])
-        else:
-            merged.append(dict(rng))
-
-    # Filler suggestions (word-level — coarse segment scan)
-    for i, seg in enumerate(segments):
-        words = str(seg.get("text") or "").lower().split()
-        start = float(seg.get("start") or 0)
-        end = float(seg.get("end") or start)
-        span = max(end - start, 0.2) / max(len(words), 1)
-        for j, w in enumerate(words):
-            clean = re.sub(r"[^\w']", "", w)
-            if clean in _FILLERS:
-                ws = start + j * span
-                we = ws + span
-                suggestions.append({
-                    "id": f"filler-{i}-{j}",
-                    "kind": "filler",
-                    "title": "Filler",
-                    "detail": w,
-                    "start": max(0, ws - 0.03),
-                    "end": min(duration, we + 0.03),
-                    "severity": "high" if clean in {"um", "uh"} else "medium",
-                })
-
-    suggestions.sort(key=lambda s: (s["start"], s["end"]))
-    return {"keepRanges": merged, "suggestions": suggestions}
-
-
-class RoughCutRequest(BaseModel):
+class RoughCutRequest(AutoEditOptions):
     brief: str = ""
     clip_ids: list[int] = Field(default_factory=list)
+
+
+class AutoEditPrefsBody(AutoEditOptions):
+    """Auto-edit prefs captured at project/video creation time (create-project
+    wizard "Auto edit" card). `enabled` gates whether the post-transcription
+    hook (app.services.auto_edit.run_post_transcription_auto_edit) runs
+    analysis at all; `auto_apply` additionally gates whether that analysis's
+    keepRanges get written into the rough-cut draft vs. only surfaced as
+    `aiAnalysis` suggestions for the user to review first.
+    """
+
+    enabled: bool = False
+    auto_apply: bool = False
+
+
+@router.put("/{video_id}/ai/auto-edit-prefs")
+def save_auto_edit_prefs(
+    video_id: int,
+    body: AutoEditPrefsBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+    return _upsert_result(
+        db,
+        video_id,
+        "auto_edit_prefs",
+        body.model_dump(mode="json"),
+        status="completed",
+    )
+
+
+@router.get("/{video_id}/ai/auto-edit-prefs")
+def get_auto_edit_prefs(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+    row = (
+        db.query(AiResult)
+        .filter(AiResult.video_id == video_id, AiResult.result_type == "auto_edit_prefs")
+        .first()
+    )
+    if row is None:
+        return {
+            "video_id": video_id,
+            "result_type": "auto_edit_prefs",
+            "status": "pending",
+            "result_data": AutoEditPrefsBody().model_dump(mode="json"),
+        }
+    return {
+        "video_id": row.video_id,
+        "result_type": row.result_type,
+        "status": row.status,
+        "result_data": row.result_data,
+    }
 
 
 @router.post("/{video_id}/ai/rough-cut")
@@ -416,7 +392,14 @@ def rough_cut(
     tr = db.query(VideoTranscription).filter(VideoTranscription.video_id == video_id).first()
     segments = list(tr.segments) if tr and tr.segments else []
     duration = float(getattr(video, "duration", 0) or 0)
-    analysis = _analyze_segments(segments, duration)
+    analysis = _analyze_segments(
+        segments,
+        duration,
+        remove_fillers=body.remove_fillers,
+        remove_silences=body.remove_silences,
+        remove_bad_takes=body.remove_bad_takes,
+        aggressiveness=body.aggressiveness,
+    )
     return _upsert_result(
         db,
         video_id,
@@ -424,6 +407,133 @@ def rough_cut(
         {**analysis, "brief": body.brief, "clip_ids": body.clip_ids},
         status="completed",
     )
+
+
+@router.post("/{video_id}/ai/review")
+def review_video(
+    video_id: int,
+    body: AutoEditOptions | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Holistic AI review: engagement score + filler/silence/bad-take counts + suggestions."""
+    video = _check_video_access(video_id, db, current_user)
+    tr = db.query(VideoTranscription).filter(VideoTranscription.video_id == video_id).first()
+    segments = list(tr.segments) if tr and tr.segments else []
+    duration = float(getattr(video, "duration", 0) or 0)
+    opts = body or AutoEditOptions()
+
+    if not segments:
+        return _upsert_result(
+            db,
+            video_id,
+            "review",
+            {
+                "needs_transcription": True,
+                "engagement_score": None,
+                "verdict": "Transcribe the video first to run an AI review.",
+                "hook": "",
+                "pacing": "",
+                "strengths": [],
+                "improvements": [],
+                "counts": {"fillers": 0, "silences": 0, "bad_takes": 0},
+                "removable_seconds": 0,
+                "keepRanges": [],
+            },
+        )
+
+    analysis = _analyze_segments(
+        segments,
+        duration,
+        remove_fillers=opts.remove_fillers,
+        remove_silences=opts.remove_silences,
+        remove_bad_takes=opts.remove_bad_takes,
+        aggressiveness=opts.aggressiveness,
+    )
+    counts, removable = _summarize_analysis(analysis)
+
+    comments = (
+        db.query(Comment)
+        .filter(Comment.video_id == video_id)
+        .order_by(Comment.timecode.asc())
+        .limit(60)
+        .all()
+    )
+
+    # Heuristic engagement score — also the LLM fallback when GEMINI_API_KEY is unset.
+    minutes = max(duration / 60.0, 0.5)
+    filler_rate = counts["fillers"] / minutes
+    penalty = (
+        min(filler_rate * 4, 30)
+        + min(counts["silences"] * 2, 20)
+        + min(counts["bad_takes"] * 5, 25)
+    )
+    heuristic_score = int(max(35, round(100 - penalty)))
+
+    fallback = {
+        "engagement_score": heuristic_score,
+        "verdict": "Heuristic estimate (set GEMINI_API_KEY for a full AI review).",
+        "hook": "",
+        "pacing": "",
+        "strengths": [],
+        "improvements": [],
+    }
+
+    context = {
+        "transcript": segments[:400],
+        "comments": [{"timecode": c.timecode, "text": c.text} for c in comments],
+        "stats": {"duration_sec": duration, **counts},
+    }
+    review = generate_json(
+        "You are an expert video editor reviewing a creator's video from its "
+        "transcript. Rate audience engagement 0-100 (hook strength, pacing, "
+        "clarity, retention risk). Be specific and reference timecodes.\n"
+        "Return JSON: {engagement_score:number, verdict:string, hook:string, "
+        'pacing:string, strengths:string[], improvements:[{text:string, '
+        'start:number, severity:"low"|"medium"|"high"}]}\n'
+        f"{context}",
+        fallback=fallback,
+    )
+    if not isinstance(review, dict):
+        review = dict(fallback)
+
+    # Harden the LLM output into a stable shape.
+    try:
+        score = int(round(float(review.get("engagement_score", heuristic_score))))
+    except (TypeError, ValueError):
+        score = heuristic_score
+    review["engagement_score"] = max(0, min(100, score))
+    review["verdict"] = str(review.get("verdict") or "")
+    review["hook"] = str(review.get("hook") or "")
+    review["pacing"] = str(review.get("pacing") or "")
+    review["strengths"] = [str(x) for x in (review.get("strengths") or []) if str(x).strip()][:8]
+
+    improvements = []
+    for it in (review.get("improvements") or [])[:12]:
+        if isinstance(it, dict):
+            text = str(it.get("text") or "").strip()
+            if not text:
+                continue
+            start = it.get("start")
+            try:
+                start = float(start) if start is not None else None
+            except (TypeError, ValueError):
+                start = None
+            improvements.append(
+                {"text": text, "start": start, "severity": it.get("severity") or "medium"}
+            )
+        elif isinstance(it, str) and it.strip():
+            improvements.append({"text": it.strip(), "start": None, "severity": "medium"})
+    review["improvements"] = improvements
+
+    payload = {
+        **review,
+        "needs_transcription": False,
+        "counts": counts,
+        "removable_seconds": round(removable, 1),
+        "keepRanges": analysis.get("keepRanges", []),
+    }
+    return _upsert_result(db, video_id, "review", payload)
 
 
 @router.get("/{video_id}/ai/rough-cut-draft")

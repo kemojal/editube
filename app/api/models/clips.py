@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -290,9 +290,19 @@ class RepurposeJobCreate(BaseModel):
     clip_length_bucket: str = "lt_30"
     subtitle_template_id: int | None = None
     aspect_ratio: str = "9:16"
+    # Multi-aspect fan-out: when provided, wins over `aspect_ratio` and produces
+    # one Clip per suggested moment per aspect ratio. Back-compat: omit/empty to
+    # keep today's single-aspect-ratio behavior.
+    aspect_ratios: list[Literal["9:16", "1:1", "16:9"]] | None = None
+    # Number of suggested MOMENTS to clip (not total clips — total = clip_count *
+    # len(aspect_ratios)). Defaults to 8 (pipeline's prior hardcoded value) when omitted.
+    clip_count: int | None = Field(default=None, ge=1, le=20)
     source_range_start_seconds: float | None = Field(default=None, ge=0, le=43200)
     source_range_end_seconds: float | None = Field(default=None, ge=1, le=43200)
     source_trim_seconds: int | None = Field(default=None, ge=5, le=43200)
+    # Spoken language for transcription seeding on youtube_url/upload sources
+    # ("auto"/""/None = auto-detect, normalized via app.utils.language.normalize_language).
+    language: str | None = None
     save_as_default: bool = False
 
 
@@ -312,6 +322,8 @@ class RepurposeJobOut(BaseModel):
     clip_length_bucket: str
     subtitle_template_id: int | None
     aspect_ratio: str
+    aspect_ratios: list[str] | None = None
+    clip_count: int | None = None
     source_range_start_seconds: float | None = None
     source_range_end_seconds: float | None = None
     source_trim_seconds: int | None

@@ -473,18 +473,30 @@ def get_comments(
     # read-only comments from earlier versions in the same chain.
     video_ids = [video_id]
     version_by_video: dict[int, int] = {}
-    if include_prior and db_video.version_group_id:
-        chain = (
-            db.query(Video)
-            .filter(
-                Video.project_id == project_id,
-                Video.version_group_id == db_video.version_group_id,
-                Video.version <= (db_video.version or 0),
+    if include_prior:
+        if db_project.project_type == "review":
+            chain = (
+                db.query(Video)
+                .filter(
+                    Video.project_id == project_id,
+                    Video.id <= db_video.id,
+                )
+                .all()
             )
-            .all()
-        )
-        video_ids = [v.id for v in chain] or [video_id]
-        version_by_video = {v.id: (v.version or 0) for v in chain}
+            video_ids = [v.id for v in chain] or [video_id]
+            version_by_video = {v.id: (v.version or 0) for v in chain}
+        elif db_video.version_group_id:
+            chain = (
+                db.query(Video)
+                .filter(
+                    Video.project_id == project_id,
+                    Video.version_group_id == db_video.version_group_id,
+                    Video.version <= (db_video.version or 0),
+                )
+                .all()
+            )
+            video_ids = [v.id for v in chain] or [video_id]
+            version_by_video = {v.id: (v.version or 0) for v in chain}
 
     rows = (
         db.query(Comment)

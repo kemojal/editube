@@ -97,7 +97,7 @@ def ingest_upload(
         if not folder:
             raise ValueError(f"Folder {folder_id} not found in project {project_id}")
 
-    # Upload to Cloudinary
+    # Upload to storage (R2 / Cloudinary / local per STORAGE_BACKEND)
     upload_result = upload_file_to_cloudinary_with_meta(video_file)
     file_url = str(upload_result["url"])
     uploaded_size = int(upload_result.get("bytes") or 0)
@@ -161,6 +161,14 @@ def ingest_upload(
                 db.commit()
     except Exception as e:
         logger.warning("Transcription not enqueued for ingested video %s: %s", db_video.id, e)
+
+    # Poster thumbnail (best-effort; replaces Cloudinary URL-derived thumbnails)
+    try:
+        from app.jobs.queue import enqueue_video_thumbnail_job
+
+        enqueue_video_thumbnail_job(db_video.id)
+    except Exception as e:
+        logger.warning("Thumbnail not enqueued for ingested video %s: %s", db_video.id, e)
 
     # Trigger auto-proxy
     if auto_proxy:

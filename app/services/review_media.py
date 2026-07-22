@@ -6,14 +6,23 @@ import hashlib
 import hmac
 import logging
 import os
+import time
 from typing import AsyncIterator
 from urllib.parse import quote
 
 import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
+from sqlalchemy.orm import Session
+
 from app.db.models import Video
 from app.utils.security import SECRET_KEY
+from app.services.youtube_stream_resolve import (
+    STREAM_REFRESH_MIN_REMAINING_SEC,
+    YoutubeStreamResolveError,
+    resolve_youtube_page_to_stream_url,
+    stream_url_expire_at,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +109,33 @@ async def proxy_review_media(
     request: Request,
     video: Video,
     purpose: str,
+    db: Session,
 ) -> StreamingResponse | FileResponse:
     fp = (video.file_path or "").strip()
     if not fp:
         raise HTTPException(status_code=404, detail="Video file not configured")
+
+    ingest_page_url = (video.ingest_page_url or "").strip()
+    if ingest_page_url:
+        expire_at = stream_url_expire_at(fp)
+        if (
+            expire_at is None
+            or expire_at <= time.time() + STREAM_REFRESH_MIN_REMAINING_SEC
+        ):
+            try:
+                fresh_url = resolve_youtube_page_to_stream_url(ingest_page_url)
+            except YoutubeStreamResolveError as exc:
+                logger.warning(
+                    "Review media stream refresh failed for video %s; "
+                    "falling back to stale URL: %s",
+                    video.id,
+                    exc,
+                )
+            else:
+                video.file_path = fresh_url
+                db.commit()
+                db.refresh(video)
+                fp = fresh_url
 
     filename = quote((video.name or "review-video").replace("/", "-"), safe=".-_") + ".mp4"
 

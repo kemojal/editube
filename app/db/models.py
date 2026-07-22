@@ -461,6 +461,10 @@ class VideoTranscription(Base):
     speaker_count = Column(Integer, nullable=True)
     error_message = Column(Text, nullable=True)
     model_name = Column(String, nullable=True)
+    # User-requested spoken language (ISO 639-1, e.g. "en"). NULL = auto-detect.
+    language = Column(String, nullable=True)
+    # Language Whisper actually detected (persisted even in auto-detect mode).
+    detected_language = Column(String, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -1946,3 +1950,229 @@ class UserCaptionFavorite(Base):
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
     user = relationship("User")
+
+
+# ---------------------------------------------------------------------------
+# AI UGC Ads (``aiugc`` schema) — paste a product URL → AI creator-style ad
+# variations. Mirrors the ``repurpose.*`` domain: dedicated Postgres schema,
+# JSONB payloads, and Clip-style render-lifecycle columns on UgcVariation.
+# ---------------------------------------------------------------------------
+
+
+class UgcProduct(Base):
+    """A product/app scraped from a URL, normalized for ad generation."""
+
+    __tablename__ = "ugc_products"
+    __table_args__ = {"schema": "aiugc"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    workspace_id = Column(
+        Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_url = Column(Text, nullable=False)
+    source_type = Column(String, nullable=False, server_default="landing")  # shopify|app_store|play|landing
+    name = Column(String, nullable=True)
+    brand = Column(String, nullable=True)
+    price = Column(String, nullable=True)
+    currency = Column(String, nullable=True)
+    description = Column(Text, nullable=True)
+    benefits = Column(JSONB, nullable=False, server_default="[]")
+    pain_points = Column(JSONB, nullable=False, server_default="[]")
+    use_cases = Column(JSONB, nullable=False, server_default="[]")
+    target_audience = Column(JSONB, nullable=True)
+    reviews = Column(JSONB, nullable=False, server_default="[]")
+    image_urls = Column(JSONB, nullable=False, server_default="[]")
+    raw_scrape = Column(JSONB, nullable=True)
+    status = Column(String, nullable=False, server_default="pending", index=True)  # pending|ready|failed
+    error_message = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    briefs = relationship("UgcBrief", back_populates="product", cascade="all, delete-orphan")
+    campaigns = relationship("UgcCampaign", back_populates="product")
+
+
+class UgcBrief(Base):
+    """AI brief + generated hooks/scripts/CTAs derived from a product."""
+
+    __tablename__ = "ugc_briefs"
+    __table_args__ = {"schema": "aiugc"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    product_id = Column(
+        Integer, ForeignKey("aiugc.ugc_products.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    audience = Column(Text, nullable=True)
+    main_promise = Column(Text, nullable=True)
+    pain_points = Column(JSONB, nullable=False, server_default="[]")
+    objections = Column(JSONB, nullable=False, server_default="[]")
+    benefits = Column(JSONB, nullable=False, server_default="[]")
+    angles = Column(JSONB, nullable=False, server_default="[]")
+    hooks = Column(JSONB, nullable=False, server_default="[]")
+    scripts = Column(JSONB, nullable=False, server_default="[]")
+    ctas = Column(JSONB, nullable=False, server_default="[]")
+    model_meta = Column(JSONB, nullable=True)
+    status = Column(String, nullable=False, server_default="pending", index=True)  # pending|ready|failed
+    error_message = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    product = relationship("UgcProduct", back_populates="briefs")
+
+
+class UgcAvatar(Base):
+    """Creator/persona catalog entry (platform-curated or provider-synced)."""
+
+    __tablename__ = "ugc_avatars"
+    __table_args__ = {"schema": "aiugc"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    provider = Column(String, nullable=False, server_default="stub", index=True)
+    provider_avatar_id = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    thumbnail_url = Column(String, nullable=True)
+    age_range = Column(String, nullable=True)
+    gender_presentation = Column(String, nullable=True)
+    region = Column(String, nullable=True)
+    default_voice_id = Column(String, nullable=True)
+    accent = Column(String, nullable=True)
+    energy = Column(String, nullable=True)
+    is_active = Column(Boolean, nullable=False, server_default="true")
+    is_premium = Column(Boolean, nullable=False, server_default="false")
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+class UgcVoice(Base):
+    """Voice catalog entry (platform-curated or provider-synced)."""
+
+    __tablename__ = "ugc_voices"
+    __table_args__ = {"schema": "aiugc"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    provider = Column(String, nullable=False, server_default="stub", index=True)
+    provider_voice_id = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    gender = Column(String, nullable=True)
+    accent = Column(String, nullable=True)
+    language = Column(String, nullable=True, server_default="en")
+    preview_url = Column(String, nullable=True)
+    is_premium = Column(Boolean, nullable=False, server_default="false")
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+class UgcCampaign(Base):
+    """A generation batch for one product (groups variations)."""
+
+    __tablename__ = "ugc_campaigns"
+    __table_args__ = {"schema": "aiugc"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    workspace_id = Column(
+        Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    product_id = Column(
+        Integer, ForeignKey("aiugc.ugc_products.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    brief_id = Column(
+        Integer, ForeignKey("aiugc.ugc_briefs.id", ondelete="SET NULL"), nullable=True
+    )
+    name = Column(String, nullable=False, server_default="Untitled campaign")
+    platform = Column(String, nullable=False, server_default="tiktok")  # tiktok|reels|shorts|meta
+    default_aspect_ratio = Column(String, nullable=False, server_default="9:16")
+    default_length_sec = Column(Integer, nullable=False, server_default="30")
+    settings = Column(JSONB, nullable=True)
+    status = Column(String, nullable=False, server_default="draft", index=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    product = relationship("UgcProduct", back_populates="campaigns")
+    variations = relationship(
+        "UgcVariation", back_populates="campaign", cascade="all, delete-orphan"
+    )
+
+
+class UgcVariation(Base):
+    """One UGC ad. Render lifecycle mirrors ``repurpose.Clip``."""
+
+    __tablename__ = "ugc_variations"
+    __table_args__ = {"schema": "aiugc"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    campaign_id = Column(
+        Integer, ForeignKey("aiugc.ugc_campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name = Column(String, nullable=False, server_default="UGC ad")
+    angle = Column(String, nullable=True)
+    hook = Column(Text, nullable=True)
+    script = Column(Text, nullable=True)
+    cta = Column(String, nullable=True)
+    caption_style = Column(JSONB, nullable=True)
+    # Provider selection is stored as opaque ids so the pipeline stays
+    # provider-agnostic; the catalog tables are only for the picker UI.
+    provider = Column(String, nullable=False, server_default="stub")
+    provider_avatar_id = Column(String, nullable=True)
+    provider_voice_id = Column(String, nullable=True)
+    avatar_name = Column(String, nullable=True)
+    voice_name = Column(String, nullable=True)
+    aspect_ratio = Column(String, nullable=False, server_default="9:16")
+    length_sec = Column(Integer, nullable=False, server_default="30")
+    music_url = Column(String, nullable=True)
+    brand_logo_url = Column(String, nullable=True)
+    provider_job_id = Column(String, nullable=True)
+    status = Column(String, nullable=False, server_default="draft", index=True)
+    render_progress = Column(Integer, nullable=False, server_default="0")
+    render_error = Column(Text, nullable=True)
+    storage_url = Column(String, nullable=True)
+    thumbnail_url = Column(String, nullable=True)
+    rq_job_id = Column(String, nullable=True)
+    is_ai_generated = Column(Boolean, nullable=False, server_default="true")
+    disclosure_applied = Column(Boolean, nullable=False, server_default="false")
+    completed_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    campaign = relationship("UgcCampaign", back_populates="variations")
+
+
+class UgcPerformance(Base):
+    """Manual or connected ad metrics for a variation (feeds the learner)."""
+
+    __tablename__ = "ugc_performance"
+    __table_args__ = {"schema": "aiugc"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    variation_id = Column(
+        Integer, ForeignKey("aiugc.ugc_variations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source = Column(String, nullable=False, server_default="manual")  # manual|meta|tiktok
+    spend = Column(Float, nullable=True)
+    impressions = Column(Integer, nullable=True)
+    clicks = Column(Integer, nullable=True)
+    ctr = Column(Float, nullable=True)
+    conversions = Column(Integer, nullable=True)
+    cvr = Column(Float, nullable=True)
+    roas = Column(Float, nullable=True)
+    notes = Column(Text, nullable=True)
+    captured_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+class UgcCreditLedger(Base):
+    """Append-only workspace credit ledger. Balance = sum(delta)."""
+
+    __tablename__ = "ugc_credit_ledger"
+    __table_args__ = {"schema": "aiugc"}
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(
+        Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    delta = Column(Integer, nullable=False)  # +grant / -debit
+    reason = Column(String, nullable=False)  # monthly_grant|reserve|debit|refund|topup
+    variation_id = Column(
+        Integer, ForeignKey("aiugc.ugc_variations.id", ondelete="SET NULL"), nullable=True
+    )
+    period = Column(String, nullable=True, index=True)  # YYYY-MM for monthly grant idempotency
+    balance_after = Column(Integer, nullable=False, server_default="0")
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)

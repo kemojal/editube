@@ -58,10 +58,13 @@ def enqueue_rough_cut_effect_job(ai_result_id: int) -> str | None:
         return None
 
 
-def enqueue_transcription_job(video_id: int) -> bool:
+def enqueue_transcription_job(video_id: int, language: str | None = None) -> bool:
     """
     Enqueue transcribe_video for this video. Returns True if a job was queued.
     If REDIS_URL is unset or enqueue fails, returns False (row stays pending).
+
+    `language` is an optional ISO 639-1 code (e.g. "en"); None means auto-detect
+    (the row's own `language` column is also consulted by the worker).
     """
     url = os.environ.get("REDIS_URL", "").strip()
     if not url:
@@ -80,11 +83,39 @@ def enqueue_transcription_job(video_id: int) -> bool:
         q.enqueue(
             transcribe_video,
             video_id,
+            language,
             job_timeout=timeout_sec,
         )
         return True
     except Exception as e:
         logger.exception("Failed to enqueue transcription for video %s: %s", video_id, e)
+        return False
+
+
+def enqueue_video_thumbnail_job(video_id: int) -> bool:
+    """Enqueue ffmpeg poster-frame extraction for a freshly uploaded video.
+
+    Best-effort: replaces Cloudinary's on-the-fly URL thumbnails for R2/local
+    backends. Returns True if a job was queued.
+    """
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; thumbnail job not enqueued for video %s", video_id)
+        return False
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=900)
+        q.enqueue(
+            "app.jobs.thumbnail.video_thumbnail_job",
+            video_id,
+            job_timeout=600,
+        )
+        return True
+    except Exception as e:
+        logger.exception("Failed to enqueue thumbnail for video %s: %s", video_id, e)
         return False
 
 
@@ -435,3 +466,91 @@ def enqueue_watch_folder_sync_job(config_id: int) -> bool:
     except Exception as e:
         logger.exception("Failed to enqueue watch folder sync for config %s: %s", config_id, e)
         return False
+
+
+# --- AI UGC ---------------------------------------------------------------
+
+
+def enqueue_ugc_product_import_job(product_id: int) -> str | None:
+    """Enqueue product-URL extraction. Returns RQ job id or None."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; ugc product import not enqueued for %s", product_id)
+        return None
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=600)
+        job = q.enqueue("app.jobs.ugc_product_import.ugc_product_import_job", product_id, job_timeout=600)
+        return job.id if job else None
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to enqueue ugc product import %s: %s", product_id, e)
+        return None
+
+
+def enqueue_ugc_brief_generate_job(product_id: int) -> str | None:
+    """Enqueue brief + hooks/scripts/CTAs generation. Returns RQ job id or None."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; ugc brief gen not enqueued for product %s", product_id)
+        return None
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=900)
+        job = q.enqueue("app.jobs.ugc_brief_generate.ugc_brief_generate_job", product_id, job_timeout=900)
+        return job.id if job else None
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to enqueue ugc brief gen for product %s: %s", product_id, e)
+        return None
+
+
+def enqueue_ugc_render_job(variation_id: int) -> str | None:
+    """Enqueue UGC variation render. Returns RQ job id or None."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; ugc render not enqueued for variation %s", variation_id)
+        return None
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        timeout_sec = max(600, int(os.environ.get("UGC_RENDER_JOB_TIMEOUT_SEC", "7200") or "7200"))
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=timeout_sec)
+        job = q.enqueue("app.jobs.ugc_render.ugc_render_job", variation_id, job_timeout=timeout_sec)
+        return job.id if job else None
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to enqueue ugc render for variation %s: %s", variation_id, e)
+        return None
+
+
+def enqueue_ugc_variation_generate_job(
+    campaign_id: int, count: int, dimensions: dict | None = None
+) -> str | None:
+    """Enqueue background variation fan-out. Returns RQ job id or None."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; ugc variation gen not enqueued for campaign %s", campaign_id)
+        return None
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=1800)
+        job = q.enqueue(
+            "app.jobs.ugc_variation_generate.ugc_variation_generate_job",
+            campaign_id,
+            count,
+            dimensions,
+            job_timeout=1800,
+        )
+        return job.id if job else None
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to enqueue ugc variation gen for campaign %s: %s", campaign_id, e)
+        return None

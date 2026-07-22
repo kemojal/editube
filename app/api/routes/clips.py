@@ -14,7 +14,6 @@ import logging
 import re
 from typing import List, Optional
 import json
-from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 from uuid import uuid4
 
@@ -67,11 +66,13 @@ from app.services.clip_cuts import (
 from app.services.project_access import can_access_project
 from app.services.project_access import assert_write_project_content
 from app.services.repurpose_pipeline import start_repurpose_processing
+from app.services.youtube_source_video import create_youtube_source_video
 from app.services.youtube_stream_resolve import (
     YoutubeStreamResolveError,
+    extract_youtube_video_id,
     fetch_youtube_page_metadata,
-    resolve_youtube_page_to_stream_url,
 )
+from app.utils.language import normalize_language
 from app.utils.security import get_current_user
 from app.services.activity import log_activity
 
@@ -296,49 +297,12 @@ def _append_clip_edit_history(
     clip.edit_history = history[-40:]
 
 
-def _extract_youtube_video_id(url: str) -> str | None:
-    raw = (url or "").strip()
-    if not raw:
-        return None
-
-    # Mirror reelcut's URL normalization behavior:
-    # users often paste URLs without protocol or with www/mobile host variants.
-    if not re.match(r"^https?://", raw, flags=re.IGNORECASE):
-        raw = f"https://{raw}"
-
-    parsed = urlparse(raw)
-    host = (parsed.netloc or "").lower().split(":")[0]
-    if host.startswith("www."):
-        host = host[4:]
-
-    if host == "youtu.be" or host.endswith(".youtu.be"):
-        candidate = parsed.path.strip("/").split("/")[0]
-        return candidate or None
-
-    if host == "youtube.com" or host.endswith(".youtube.com"):
-        if parsed.path == "/watch":
-            return parse_qs(parsed.query).get("v", [None])[0]
-
-        if (
-            parsed.path.startswith("/shorts/")
-            or parsed.path.startswith("/embed/")
-            or parsed.path.startswith("/live/")
-        ):
-            parts = [p for p in parsed.path.split("/") if p]
-            return parts[1] if len(parts) > 1 else None
-
-    # Last-resort extraction so pasted snippets like "...watch?v=<id>&..." still work.
-    m = re.search(r"(?:v=|/shorts/|/embed/|/live/|youtu\.be/)([A-Za-z0-9_-]{6,})", raw)
-    if m:
-        return m.group(1)
-
-    return None
-
-
 def _serialize_job(job: RepurposeJob) -> RepurposeJobOut:
     source_meta = job.source_meta if isinstance(job.source_meta, dict) else {}
     range_start = source_meta.get("source_range_start_seconds")
     range_end = source_meta.get("source_range_end_seconds")
+    clip_count = source_meta.get("clip_count")
+    aspect_ratios = source_meta.get("aspect_ratios")
     return RepurposeJobOut(
         id=job.id,
         user_id=job.user_id,
@@ -355,6 +319,8 @@ def _serialize_job(job: RepurposeJob) -> RepurposeJobOut:
         clip_length_bucket=job.clip_length_bucket,
         subtitle_template_id=job.subtitle_template_id,
         aspect_ratio=job.aspect_ratio,
+        aspect_ratios=list(aspect_ratios) if isinstance(aspect_ratios, list) else None,
+        clip_count=int(clip_count) if isinstance(clip_count, (int, float)) else None,
         source_range_start_seconds=float(range_start) if range_start is not None else None,
         source_range_end_seconds=float(range_end) if range_end is not None else None,
         source_trim_seconds=job.source_trim_seconds,
@@ -385,11 +351,6 @@ def _source_thumbnail_url(meta: dict | None) -> str | None:
     return value or None
 
 
-def _youtube_thumbnail_url(url: str | None) -> str | None:
-    video_id = _extract_youtube_video_id(url or "")
-    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else None
-
-
 def _source_range_from_body(body: RepurposeJobCreate) -> tuple[float, float | None]:
     start = float(body.source_range_start_seconds or 0)
     end_raw = body.source_range_end_seconds
@@ -406,6 +367,8 @@ def _source_meta_with_range(
     *,
     start: float,
     end: float | None,
+    clip_count: int | None = None,
+    aspect_ratios: list[str] | None = None,
 ) -> dict | None:
     meta = dict(source_meta or {})
     if start > 0:
@@ -416,18 +379,15 @@ def _source_meta_with_range(
         meta["source_range_end_seconds"] = end
     else:
         meta.pop("source_range_end_seconds", None)
+    if clip_count is not None:
+        meta["clip_count"] = clip_count
+    else:
+        meta.pop("clip_count", None)
+    if aspect_ratios:
+        meta["aspect_ratios"] = list(aspect_ratios)
+    else:
+        meta.pop("aspect_ratios", None)
     return meta or None
-
-
-def _resolve_youtube_media_url(url: str) -> str:
-    """
-    Resolve a YouTube page URL to a direct media stream URL using yt-dlp.
-    Mirrors reelcut's URL-import behavior where source ingestion starts from a URL.
-    """
-    try:
-        return resolve_youtube_page_to_stream_url(url)
-    except YoutubeStreamResolveError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _create_source_video(
@@ -439,6 +399,7 @@ def _create_source_video(
     name: str | None,
     ingest_page_url: str | None = None,
     thumbnail_url: str | None = None,
+    language: str | None = None,
 ) -> Video:
     _project_with_write_access(project_id, db, current_user)
 
@@ -466,7 +427,13 @@ def _create_source_video(
 
     vt = db.query(VideoTranscription).filter(VideoTranscription.video_id == video.id).first()
     if vt is None:
-        db.add(VideoTranscription(video_id=video.id, status="pending"))
+        db.add(
+            VideoTranscription(
+                video_id=video.id,
+                status="pending",
+                language=normalize_language(language),
+            )
+        )
     db.commit()
 
     return video
@@ -522,7 +489,7 @@ def fetch_youtube_metadata(
     current_user: User = Depends(get_current_user),  # noqa: ARG001
 ):
     url = body.url.strip()
-    video_id = _extract_youtube_video_id(url)
+    video_id = extract_youtube_video_id(url)
     if not video_id or not re.match(r"^[A-Za-z0-9_-]{6,}$", video_id):
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
@@ -639,6 +606,8 @@ def create_repurpose_job(
         body.source_meta,
         start=range_start,
         end=range_end,
+        clip_count=body.clip_count,
+        aspect_ratios=body.aspect_ratios,
     )
 
     if body.source_mode == "project_video":
@@ -655,17 +624,23 @@ def create_repurpose_job(
             raise HTTPException(status_code=400, detail="project_id is required for youtube source")
         _project_with_write_access(project_id, db, current_user)
         db.rollback()
-        resolved_source_file_url = _resolve_youtube_media_url(body.youtube_url)
-        src_video = _create_source_video(
-            db,
-            current_user=current_user,
-            project_id=project_id,
-            source_url=resolved_source_file_url,
-            name=body.source_title or "YouTube source",
-            ingest_page_url=body.youtube_url.strip(),
-            thumbnail_url=_source_thumbnail_url(source_meta) or _youtube_thumbnail_url(body.youtube_url),
-        )
-        src_video.duration = _source_duration_seconds(source_meta)
+        try:
+            src_video = create_youtube_source_video(
+                db,
+                user=current_user,
+                project_id=project_id,
+                youtube_url=body.youtube_url,
+                name=body.source_title or "YouTube source",
+                language=normalize_language(body.language),
+                thumbnail_url=_source_thumbnail_url(source_meta),
+                duration_seconds=_source_duration_seconds(source_meta),
+                # The repurpose job pipeline (start_repurpose_processing, below)
+                # owns enqueuing transcription on its own schedule.
+                enqueue_transcription=False,
+            )
+        except YoutubeStreamResolveError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        resolved_source_file_url = src_video.file_path
         video_id = src_video.id
     elif body.source_mode == "upload" and not body.source_file_url:
         raise HTTPException(status_code=400, detail="source_file_url is required for upload source")
@@ -679,6 +654,7 @@ def create_repurpose_job(
             source_url=body.source_file_url,
             name=body.source_title or "Uploaded source",
             thumbnail_url=_source_thumbnail_url(source_meta),
+            language=body.language,
         )
         src_video.duration = _source_duration_seconds(source_meta)
         video_id = src_video.id

@@ -1,91 +1,82 @@
-import io
+"""Storage facade (historically Cloudinary-only).
+
+These functions keep their original names/signatures so existing call sites keep
+working, but they now dispatch to the pluggable backend selected by
+``STORAGE_BACKEND`` (see ``app/storage`` and ``docs/r2-storage-migration-plan.md``).
+Cloudinary is one backend among r2/local; nothing here talks to the Cloudinary SDK
+directly anymore.
+"""
+from __future__ import annotations
+
 import os
 from pathlib import Path
 
-import cloudinary
-import cloudinary.uploader
-from cloudinary.exceptions import Error as CloudinaryError
-from dotenv import load_dotenv
 from fastapi import HTTPException, UploadFile, status
 
-load_dotenv()
+from app.storage import build_key, get_storage, guess_content_type, storage_available
 
-cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
-)
+# Default folders (object-key prefixes) for the untagged upload paths. Overridable
+# so operators can organize the bucket; new uploads only.
+_VIDEO_FOLDER = os.getenv("STORAGE_VIDEO_FOLDER", "videos")
+_IMAGE_FOLDER = os.getenv("STORAGE_IMAGE_FOLDER", "images")
 
 
-# Smaller than Cloudinary’s default 20MB so strict nginx limits are less likely per chunk.
-_VIDEO_CHUNK_BYTES = 6 * 1024 * 1024
-_CLOUDINARY_UPLOAD_TIMEOUT = 900  # seconds; large videos + processing need headroom
+def _too_large(err: str) -> bool:
+    e = err.lower()
+    return "413" in e or "entitytoolarge" in e or "too large" in e
+
+
+def _folder_for(resource_type: str) -> str:
+    return _IMAGE_FOLDER if resource_type == "image" else _VIDEO_FOLDER
 
 
 def upload_file_to_cloudinary_with_meta(file: UploadFile, resource_type: str = "video") -> dict:
+    """Upload an ``UploadFile`` (video or image). Returns ``{url, bytes, public_id, resource_type}``."""
+    content_type = file.content_type or guess_content_type(file.filename, resource_type=resource_type)
+    key = build_key(
+        folder=_folder_for(resource_type),
+        filename=file.filename,
+        content_type=content_type,
+    )
     try:
-        stream = file.file
-        if hasattr(stream, "seek"):
-            stream.seek(0)
-        if resource_type == "image":
-            # Regular upload for avatars/images so jpeg/jpg/png/webp are handled correctly.
-            result = cloudinary.uploader.upload(
-                stream,
-                resource_type="image",
-                filename=file.filename or "avatar",
-                timeout=_CLOUDINARY_UPLOAD_TIMEOUT,
-                allowed_formats=["jpg", "jpeg", "png", "webp"],
-            )
-        else:
-            # Chunked upload avoids nginx/Cloudinary 413 on large single-request bodies
-            result = cloudinary.uploader.upload_large(
-                stream,
-                resource_type="video",
-                filename=file.filename or "video",
-                chunk_size=_VIDEO_CHUNK_BYTES,
-                timeout=_CLOUDINARY_UPLOAD_TIMEOUT,
-            )
-        url = result.get("secure_url")
-        if not url:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Cloudinary returned no URL for the upload.",
-            )
-        return {
-            "url": url,
-            "bytes": int(result.get("bytes") or 0),
-            "public_id": result.get("public_id"),
-            "resource_type": result.get("resource_type"),
-        }
-    except CloudinaryError as e:
+        result = get_storage().upload_stream(file.file, key=key, content_type=content_type)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
         err = str(e)
-        # Cloudinary/nginx returns HTML 413; SDK wraps it as Error parsing server response (413)
-        if "413" in err:
+        if _too_large(err):
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=(
-                    "The upload was rejected because the file is too large for Cloudinary "
-                    "(or exceeds the current plan limit). Try a smaller file or check "
-                    "Cloudinary upload limits."
-                ),
+                detail="The upload was rejected because the file is too large.",
             ) from e
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Cloudinary upload failed: {err}",
+            detail=f"Storage upload failed: {err}",
         ) from e
+    if not result.url:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Storage returned no URL for the upload.",
+        )
+    return {
+        "url": result.url,
+        "bytes": result.bytes,
+        "public_id": result.key,
+        "resource_type": resource_type,
+    }
 
 
 def upload_file_to_cloudinary(file: UploadFile, resource_type: str = "video") -> str:
-    result = upload_file_to_cloudinary_with_meta(file, resource_type=resource_type)
-    return str(result["url"])
+    return str(upload_file_to_cloudinary_with_meta(file, resource_type=resource_type)["url"])
 
 
 def cloudinary_credentials_configured() -> bool:
-    return bool(
-        os.getenv("CLOUDINARY_CLOUD_NAME")
-        and os.getenv("CLOUDINARY_API_KEY")
-        and os.getenv("CLOUDINARY_API_SECRET")
-    )
+    """Whether the active storage backend can accept uploads.
+
+    Name kept for backwards-compatibility with existing gate call sites; it now
+    reflects the selected ``STORAGE_BACKEND``, not Cloudinary specifically.
+    """
+    return storage_available()
 
 
 def upload_local_path_to_cloudinary(
@@ -95,35 +86,19 @@ def upload_local_path_to_cloudinary(
     folder: str,
     public_id: str,
 ) -> str:
-    """
-    Upload a file already on disk (e.g. ffmpeg output). Returns ``secure_url``.
-    Uses chunked upload for large videos.
-    """
+    """Upload a file already on disk (e.g. ffmpeg output). Returns the public URL."""
     p = Path(file_path).resolve()
     if not p.is_file():
         raise FileNotFoundError(str(p))
-    folder = folder.strip().strip("/")
-    opts: dict = {
-        "resource_type": resource_type,
-        "folder": folder,
-        "public_id": public_id.strip().strip("/"),
-        "timeout": _CLOUDINARY_UPLOAD_TIMEOUT,
-    }
+    content_type = guess_content_type(p.name, resource_type=resource_type)
+    key = build_key(folder=folder, public_id=public_id, filename=p.name, content_type=content_type)
     try:
-        if resource_type == "video" and p.stat().st_size > _VIDEO_CHUNK_BYTES:
-            result = cloudinary.uploader.upload_large(
-                str(p),
-                chunk_size=_VIDEO_CHUNK_BYTES,
-                **opts,
-            )
-        else:
-            result = cloudinary.uploader.upload(str(p), **opts)
-    except CloudinaryError as e:
-        raise RuntimeError(f"Cloudinary upload failed: {e}") from e
-    url = result.get("secure_url")
-    if not url:
-        raise RuntimeError("Cloudinary returned no secure_url")
-    return str(url)
+        result = get_storage().upload_path(p, key=key, content_type=content_type)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Storage upload failed: {e}") from e
+    if not result.url:
+        raise RuntimeError("Storage returned no URL")
+    return str(result.url)
 
 
 def upload_image_bytes(
@@ -133,43 +108,37 @@ def upload_image_bytes(
     folder: str = "broll",
     public_id: str = "img",
 ) -> str:
-    """Upload raw image bytes (e.g. from Gemini) to Cloudinary. Returns ``secure_url``."""
-    fmt = mime_type.split("/")[-1] if "/" in mime_type else "png"
+    """Upload raw image bytes (e.g. from Gemini). Returns the public URL."""
+    key = build_key(folder=folder, public_id=public_id, content_type=mime_type)
     try:
-        result = cloudinary.uploader.upload(
-            io.BytesIO(data),
-            resource_type="image",
-            folder=folder,
-            public_id=public_id,
-            format=fmt,
-        )
-        url = result.get("secure_url")
-        if not url:
-            raise RuntimeError("Cloudinary returned no URL")
-        return str(url)
-    except CloudinaryError as e:
+        result = get_storage().upload_bytes(data, key=key, content_type=mime_type)
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Cloudinary upload failed: {e}",
+            detail=f"Storage upload failed: {e}",
         ) from e
+    if not result.url:
+        raise RuntimeError("Storage returned no URL")
+    return str(result.url)
 
 
 async def upload_image(image: UploadFile):
+    """Upload an image ``UploadFile``. Returns the public URL."""
+    content_type = image.content_type or guess_content_type(image.filename, resource_type="image")
+    key = build_key(folder=_IMAGE_FOLDER, filename=image.filename, content_type=content_type)
     try:
-        upload_result = cloudinary.uploader.upload(
-            image.file,
-            resource_type="image",
-            allowed_formats=["jpg", "jpeg", "png", "webp"],
-        )
-        return upload_result["secure_url"]
-    except CloudinaryError as e:
+        result = get_storage().upload_stream(image.file, key=key, content_type=content_type)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
         err = str(e)
-        if "413" in err:
+        if _too_large(err):
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail="Image/video file is too large for Cloudinary.",
+                detail="Image/video file is too large.",
             ) from e
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error uploading image: {err}",
         ) from e
+    return result.url

@@ -18,6 +18,28 @@ class VideoStatusUpdate(BaseModel):
     status: str  # in_progress, in_review, approved, needs_changes
 
 
+class YoutubeVideoCreate(BaseModel):
+    """POST /projects/{project_id}/videos/youtube — create a source video from a YouTube URL."""
+
+    url: str
+    name: Optional[str] = None
+    # Spoken language for transcription, ISO 639-1 (e.g. "en"). "auto"/""/absent = auto-detect.
+    language: Optional[str] = None
+
+
+class VideoFromUploadCreate(BaseModel):
+    """POST /projects/{project_id}/videos/from-upload — register an already-uploaded
+    file (via stateless POST /upload/video) as a project video."""
+
+    file_path: str
+    name: str
+    description: Optional[str] = None
+    folder_id: Optional[int] = None
+    # Spoken language for transcription, ISO 639-1 (e.g. "en"). "auto"/""/absent = auto-detect.
+    language: Optional[str] = None
+    size_bytes: Optional[int] = None
+
+
 class VideoTranscriptionNested(BaseModel):
     """Transcript row for a video (from video_transcriptions table)."""
 
@@ -27,6 +49,10 @@ class VideoTranscriptionNested(BaseModel):
     speaker_count: Optional[int] = None
     error_message: Optional[str] = None
     updated_at: Optional[datetime] = None
+    # User-requested spoken language (ISO 639-1). None = auto-detect.
+    language: Optional[str] = None
+    # Language Whisper actually detected (persisted even in auto-detect mode).
+    detected_language: Optional[str] = None
 
     class Config:
         orm_mode = True

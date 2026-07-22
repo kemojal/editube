@@ -917,7 +917,7 @@ async def review_media_proxy(
     ):
         status, headers = await head_upstream_video(fp)
         return Response(status_code=status, headers=headers)
-    return await proxy_review_media(request=request, video=video, purpose=purpose)
+    return await proxy_review_media(request=request, video=video, purpose=purpose, db=db)
 
 
 @public_router.get("/{token}/download-url")
@@ -2217,17 +2217,36 @@ def public_download_allowed(
 def list_review_versions(token: str, db: Session = Depends(get_db)):
     link = _get_link_or_404(token, db)
     _assert_link_usable(link)
-    if not link.version_group_id:
-        return {"ok": True, "items": []}
-    peers = (
-        db.query(ReviewLink)
-        .filter(
-            ReviewLink.version_group_id == link.version_group_id,
-            ReviewLink.revoked_at.is_(None),
+    is_review = False
+    if getattr(link, "project", None) is not None and link.project.project_type == "review":
+        is_review = True
+    elif link.project_id:
+        proj = db.query(Project.project_type).filter(Project.id == link.project_id).first()
+        if proj and proj[0] == "review":
+            is_review = True
+
+    if is_review:
+        peers = (
+            db.query(ReviewLink)
+            .filter(
+                ReviewLink.project_id == link.project_id,
+                ReviewLink.revoked_at.is_(None),
+            )
+            .order_by(ReviewLink.created_at.asc())
+            .all()
         )
-        .order_by(ReviewLink.created_at.asc())
-        .all()
-    )
+    elif link.version_group_id:
+        peers = (
+            db.query(ReviewLink)
+            .filter(
+                ReviewLink.version_group_id == link.version_group_id,
+                ReviewLink.revoked_at.is_(None),
+            )
+            .order_by(ReviewLink.created_at.asc())
+            .all()
+        )
+    else:
+        peers = []
     items = [
         {
             "id": row.id,

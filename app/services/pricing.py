@@ -12,6 +12,7 @@ class PlanSpec:
     included_storage_bytes: int
     storage_addon_tb_price_usd: int | None
     grace_days: int
+    ugc_credits_monthly: int = 0  # AI UGC render credits granted per calendar month
 
 
 TB_IN_BYTES: Final[int] = 1024 * 1024 * 1024 * 1024
@@ -36,6 +37,7 @@ PLAN_SPECS: Final[dict[str, PlanSpec]] = {
         included_storage_bytes=10 * GB_IN_BYTES,
         storage_addon_tb_price_usd=None,
         grace_days=7,
+        ugc_credits_monthly=3,
     ),
     "pro": PlanSpec(
         key="pro",
@@ -44,6 +46,7 @@ PLAN_SPECS: Final[dict[str, PlanSpec]] = {
         included_storage_bytes=2 * TB_IN_BYTES,
         storage_addon_tb_price_usd=8,
         grace_days=7,
+        ugc_credits_monthly=50,
     ),
     "scale": PlanSpec(
         key="scale",
@@ -52,6 +55,7 @@ PLAN_SPECS: Final[dict[str, PlanSpec]] = {
         included_storage_bytes=5 * TB_IN_BYTES,
         storage_addon_tb_price_usd=6,
         grace_days=7,
+        ugc_credits_monthly=200,
     ),
     "enterprise": PlanSpec(
         key="enterprise",
@@ -60,6 +64,7 @@ PLAN_SPECS: Final[dict[str, PlanSpec]] = {
         included_storage_bytes=20 * TB_IN_BYTES,
         storage_addon_tb_price_usd=None,
         grace_days=7,
+        ugc_credits_monthly=1000,
     ),
 }
 
