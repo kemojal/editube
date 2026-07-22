@@ -770,6 +770,11 @@ class RoughCutExportBody(BaseModel):
     format: str = "mp4"  # "mp4" | "wav"
     keepRanges: list[dict[str, Any]] = Field(default_factory=list)
     exportSettings: dict[str, Any] = Field(default_factory=dict)
+    # When true, the rendered output registers as the NEXT VERSION of this
+    # video (same version_group_id, version = max+1) once the export
+    # completes. Back-compat default off — existing callers keep getting
+    # only a downloadUrl.
+    register_as_version: bool = False
 
 
 @router.post("/{video_id}/ai/rough-cut-export")
@@ -809,7 +814,7 @@ def start_rough_cut_export(
 
     from app.jobs.queue import enqueue_rough_cut_export_job
 
-    rq_job_id = enqueue_rough_cut_export_job(row.id)
+    rq_job_id = enqueue_rough_cut_export_job(row.id, register_as_version=body.register_as_version)
     pdata = dict(row.result_data or {})
     if rq_job_id:
         pdata["rqJobId"] = rq_job_id

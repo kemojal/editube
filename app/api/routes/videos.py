@@ -8,6 +8,7 @@ from app.db.models import Project, Video, VideoTranscription, User, Folder
 from app.services.project_access import assert_write_project_content, can_access_project
 from app.services.storage_policy import assert_storage_upload_allowed
 from app.api.video_payload import video_detail_dict, video_versions_payload
+from app.services.video_versions import resolve_version_chain
 from app.api.models.videos import (
     VideoCreate,
     VideoUpdate,
@@ -208,20 +209,9 @@ def upload_video(
     import uuid as _uuid
 
     if base_video is not None:
-        version_group_id = base_video.version_group_id or _uuid.uuid4().hex
-        # Backfill the base's group if it predates the version_group_id column.
-        if not base_video.version_group_id:
-            base_video.version_group_id = version_group_id
-        latest_in_group = (
-            db.query(Video)
-            .filter(
-                Video.project_id == project_id,
-                Video.version_group_id == version_group_id,
-            )
-            .order_by(Video.version.desc())
-            .first()
-        )
-        version = 1 if not latest_in_group else (latest_in_group.version or 0) + 1
+        # Shared with register_video_version (app/services/video_versions.py)
+        # so there is one implementation of the group/version math.
+        version_group_id, version = resolve_version_chain(db, base_video)
     else:
         version_group_id = _uuid.uuid4().hex
         version = 1

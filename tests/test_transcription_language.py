@@ -23,7 +23,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import Comment, Annotation, Project, User, Video, VideoTranscription
+from app.db.models import Comment, Annotation, Folder, Project, User, Video, VideoTranscription
 from app.utils.language import normalize_language
 
 
@@ -57,7 +57,15 @@ class NormalizeLanguageTests(unittest.TestCase):
 class _SqliteDbTestCase(unittest.TestCase):
     """Shared in-memory sqlite setup for route/service-level tests."""
 
-    tables = [User.__table__, Project.__table__, Video.__table__, VideoTranscription.__table__, Comment.__table__, Annotation.__table__]
+    tables = [
+        User.__table__,
+        Project.__table__,
+        Folder.__table__,
+        Video.__table__,
+        VideoTranscription.__table__,
+        Comment.__table__,
+        Annotation.__table__,
+    ]
 
     def setUp(self) -> None:
         engine = create_engine("sqlite://")
@@ -315,6 +323,76 @@ class UploadVideoLanguageTests(_SqliteDbTestCase):
         )
         self.assertIsNone(vt.language)
         enqueue_mock.assert_called_once_with(created.id, language=None)
+
+
+class UploadVideoVersionOfTests(_SqliteDbTestCase):
+    """Route-level: POST /projects/{project_id}/videos with a real `version_of`
+    id goes through the refactored `resolve_version_chain` call in
+    `upload_video` end-to-end (D6 follow-up #1)."""
+
+    def test_upload_video_with_version_of_inherits_group_backfills_base_and_folder(self):
+        from app.api.routes import videos as videos_routes
+
+        folder = Folder(project_id=self.project.id, name="Main Cuts", created_by=self.user.id)
+        self.db.add(folder)
+        self.db.flush()
+
+        # Base video predates version_group_id (like a legacy row) and lives
+        # in a folder — the new version must inherit both.
+        self.video.folder_id = folder.id
+        self.db.commit()
+        self.assertIsNone(self.video.version_group_id)
+
+        fake_upload = {"url": "https://cdn.test/video-v2.mp4", "bytes": 5555}
+
+        with mock.patch.object(
+            videos_routes, "can_access_project", return_value=True
+        ), mock.patch.object(
+            videos_routes, "assert_write_project_content", return_value=None
+        ), mock.patch.object(
+            videos_routes, "assert_storage_upload_allowed", return_value=None
+        ), mock.patch.object(
+            videos_routes, "upload_file_to_cloudinary_with_meta", return_value=fake_upload
+        ), mock.patch.object(
+            videos_routes, "log_activity", return_value=None
+        ), mock.patch(
+            "app.jobs.queue.enqueue_transcription_job", return_value=True
+        ), mock.patch(
+            "app.jobs.queue.enqueue_video_thumbnail_job", return_value=True
+        ), mock.patch(
+            "app.services.proxy_service.auto_proxy_on_upload", return_value=None
+        ):
+            fake_video_file = mock.MagicMock()
+            result = videos_routes.upload_video(
+                project_id=self.project.id,
+                video_file=fake_video_file,
+                name="Hero Cut v2",
+                description=None,
+                folder_id=None,
+                version_of=self.video.id,
+                language=None,
+                db=self.db,
+                current_user=self.user,
+            )
+
+        # Response carries the resolved version and inherited folder.
+        self.assertEqual(result["version"], 2)
+        self.assertEqual(result["folder_id"], folder.id)
+
+        new_video = (
+            self.db.query(Video)
+            .filter(Video.project_id == self.project.id, Video.name == "Hero Cut v2")
+            .first()
+        )
+        self.assertIsNotNone(new_video)
+        self.assertEqual(new_video.version, 2)
+        self.assertEqual(new_video.folder_id, folder.id)
+
+        # Base video's version_group_id was backfilled in place, and the new
+        # version inherited that same (backfilled) group id.
+        self.db.refresh(self.video)
+        self.assertIsNotNone(self.video.version_group_id)
+        self.assertEqual(new_video.version_group_id, self.video.version_group_id)
 
 
 class _FakeQuery:

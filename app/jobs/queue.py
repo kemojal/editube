@@ -8,7 +8,7 @@ import os
 logger = logging.getLogger(__name__)
 
 
-def enqueue_rough_cut_export_job(ai_result_id: int) -> str | None:
+def enqueue_rough_cut_export_job(ai_result_id: int, *, register_as_version: bool = False) -> str | None:
     """Enqueue FFmpeg concat/upload for AiResult rough_cut_export row. Returns RQ job id or None."""
     url = os.environ.get("REDIS_URL", "").strip()
     if not url:
@@ -25,6 +25,7 @@ def enqueue_rough_cut_export_job(ai_result_id: int) -> str | None:
         job = q.enqueue(
             rough_cut_export_job,
             ai_result_id,
+            register_as_version=register_as_version,
             job_timeout=timeout_sec,
         )
         return job.get_id() if job else None

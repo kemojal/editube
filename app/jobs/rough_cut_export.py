@@ -197,7 +197,7 @@ def _load_transcription_segments(db: Session, video_id: int) -> list[dict[str, A
     return out
 
 
-def rough_cut_export_job(ai_result_id: int) -> None:
+def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -> None:
     db: Session = SessionLocal()
     try:
         row = db.query(AiResult).filter(AiResult.id == ai_result_id).first()
@@ -340,6 +340,8 @@ def rough_cut_export_job(ai_result_id: int) -> None:
                     folder="rough-cut-exports",
                     public_id=f"w_{video_id}_{public_hint}",
                 )
+                # WAV is an audio-only download, not a playable video — never
+                # register it as a version even if register_as_version was set.
                 row.result_data = _merge_result_payload(
                     row.result_data,
                     {
@@ -455,6 +457,7 @@ def rough_cut_export_job(ai_result_id: int) -> None:
                     folder="rough-cut-exports",
                     public_id=f"mp4audio_{video_id}_{uuid.uuid4().hex[:10]}",
                 )
+                final_path = mp4_out
 
             meta = {
                 "progress": 100,
@@ -464,6 +467,37 @@ def rough_cut_export_job(ai_result_id: int) -> None:
                 "captionEntries": len(subtitle_entries),
                 "shortsExport": shorts_export,
             }
+
+            if register_as_version and video is not None:
+                try:
+                    from app.services.video_versions import register_video_version
+
+                    try:
+                        export_size_bytes = final_path.stat().st_size
+                    except OSError:
+                        export_size_bytes = None
+                    new_video = register_video_version(
+                        db,
+                        video,
+                        name=f"{video.name} (edited)",
+                        file_path=url,
+                        size_bytes=export_size_bytes,
+                    )
+                    db.commit()
+                    meta["versionVideoId"] = new_video.id
+                except Exception:  # noqa: BLE001
+                    # Registration must never fail the export. `meta` is still
+                    # just a local dict at this point (nothing committed yet) —
+                    # db.rollback() only undoes the failed registration's
+                    # uncommitted Video insert. The downloadUrl write into
+                    # row.result_data and its commit happen unconditionally
+                    # below, regardless of this failure.
+                    db.rollback()
+                    logger.exception(
+                        "rough_cut_export_job: failed to register export as version for video_id=%s",
+                        video_id,
+                    )
+
             row.result_data = _merge_result_payload(row.result_data, meta)
             row.status = "completed"
             db.commit()
