@@ -936,8 +936,17 @@ async def queue_health():
 
 
 @app.get("/")
-async def read_item():
-    return {"hello word"}
+async def read_root():
+    """
+    Backend root. If you are seeing this in a browser, you are likely hitting the API 
+    port (8000) instead of the frontend port (3000/3002).
+    """
+    return {
+        "name": "Editube API",
+        "status": "online",
+        "frontend_url": os.getenv("FRONTEND_BASE_URL", "http://localhost:3000"),
+        "message": "Welcome to Editube API. Use /docs for API documentation."
+    }
 
 if __name__ == "__main__":
     import uvicorn

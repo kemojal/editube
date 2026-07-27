@@ -194,6 +194,21 @@ rq worker -u "$REDIS_URL" default
 
 Registered job callables include string paths such as **`app.jobs.youtube_publish.youtube_publish_job`**, **`app.jobs.aspect_export.aspect_export_job`**, and **`app.jobs.chapter_synthesis.chapter_synthesis_job`** (see `app/jobs/queue.py`).
 
+## Google Drive import (create-project wizard source)
+
+Lets a user connect Google Drive and pick a video in the **New project** modal. Design + rationale: `docs/google-drive-import-plan.md`.
+
+**Scope choice matters.** We request only **`drive.file`** (non-sensitive), which grants access solely to files the user picks through the **Google Picker**. The broader `drive.readonly` needed for an in-app Drive file browser is a **restricted** scope requiring an annual third-party **CASA** security assessment, so it is deliberately avoided.
+
+1. **Google Cloud Console:** enable **Google Picker API** + **Google Drive API**. Add `https://www.googleapis.com/auth/drive.file` to the OAuth consent screen. Create a browser **API key** restricted to your frontend origins. Note your **project number** (IAM & Admin > Settings) — that is the Picker `appId`. Add the backend callback to authorized redirect URIs, e.g. `http://127.0.0.1:8000/users/google/drive/callback`.
+2. **Env:** `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` (shared with Google login), `TOKEN_ENCRYPTION_KEY`, `GOOGLE_DRIVE_REDIRECT_URI`, `GOOGLE_PICKER_API_KEY`, `GOOGLE_PICKER_APP_ID`. Optional: `DRIVE_IMPORT_MAX_FILE_SIZE_MB` (default 10240), `DRIVE_IMPORT_JOB_TIMEOUT_SEC` (default 3600). The frontend needs **no** new env — the Picker key and appId are served by `GET /users/google/drive/picker-token`.
+3. **Connect:** `POST /users/google/drive/authorize-url` → the frontend opens it in a **popup**. The callback returns a small HTML page that `postMessage`s the result to `window.opener` and closes, so the wizard's in-progress draft survives (a top-level redirect would destroy it). Tokens land in **`user_google_drive_connections`** (Alembic revision `d5e6f7a8b9c0`), refresh token Fernet-encrypted. Uniqueness is `(user_id, google_sub)`, so a user can connect several Google accounts.
+4. **Pick + validate:** `POST /users/google/drive/resolve` runs every gate *before* any bytes move — not a video/audio file, Google-native Docs, dangling shortcut, trashed, `canDownload: false`, size ceiling, and the workspace storage cap. Drive's `videoMediaMetadata.durationMillis` and `thumbnailLink` come back immediately, so the wizard's trim step is usable while the transfer runs.
+5. **Import:** `POST /users/google/drive/imports` creates a **`drive_imports`** row and enqueues **`app.jobs.drive_import.drive_import_job`**, which streams the file (8 MB chunks) to a temp file, `ffprobe`s duration when Drive omits it, uploads via the configured storage backend, and writes `file_path`. Progress: download maps to 0–90%, storage upload to 90–100%. Poll `GET /users/google/drive/imports/{id}`; `POST .../cancel` stops the worker between chunks when the user removes the file or discards the wizard.
+6. **Attach:** the resulting `file_path` goes through the existing `POST /projects/{id}/videos/from-upload` — identical to a local upload, so transcription/thumbnail/proxy enqueue unchanged.
+
+Failure modes worth knowing: a revoked/expired refresh token sets the connection `status='revoked'` and the import `error_code='reauth_required'`, and the UI offers **Reconnect** instead of Retry. `error_code='queue_unavailable'` means `REDIS_URL` is unset or no RQ worker is running.
+
 ## Docker and Dokploy (Hetzner)
 
 Production container image: **[`Dockerfile`](Dockerfile)** at this repo root (use this folder as the Git repo root when you split from a monorepo).

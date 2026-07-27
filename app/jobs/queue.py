@@ -446,6 +446,30 @@ def enqueue_clip_render_job(clip_id: int) -> str | None:
         return None
 
 
+def enqueue_drive_import_job(import_id: int) -> str | None:
+    """Enqueue a Google Drive file pull into our storage. Returns RQ job id or None."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; drive import not enqueued for %s", import_id)
+        return None
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        timeout_sec = max(600, int(os.environ.get("DRIVE_IMPORT_JOB_TIMEOUT_SEC", "3600") or "3600"))
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=timeout_sec)
+        job = q.enqueue(
+            "app.jobs.drive_import.drive_import_job",
+            import_id,
+            job_timeout=timeout_sec,
+        )
+        return job.get_id() if job else None
+    except Exception as e:
+        logger.exception("Failed to enqueue drive import %s: %s", import_id, e)
+        return None
+
+
 def enqueue_watch_folder_sync_job(config_id: int) -> bool:
     """Enqueue watch folder sync processing."""
     url = os.environ.get("REDIS_URL", "").strip()

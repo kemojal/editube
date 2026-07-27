@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Float, String, ForeignKey, Text, Boolean, ARRAY, UniqueConstraint
+from sqlalchemy import Column, Integer, BigInteger, Float, String, ForeignKey, Text, Boolean, ARRAY, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, NUMRANGE
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql.sqltypes import TIMESTAMP
@@ -46,6 +46,11 @@ class User(Base):
         "UserYoutubeConnection",
         back_populates="user",
         uselist=False,
+        cascade="all, delete-orphan",
+    )
+    google_drive_connections = relationship(
+        "UserGoogleDriveConnection",
+        back_populates="user",
         cascade="all, delete-orphan",
     )
     workspace_memberships = relationship(
@@ -1461,6 +1466,80 @@ class UserYoutubeConnection(Base):
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 
     user = relationship("User", back_populates="youtube_connection")
+
+
+class UserGoogleDriveConnection(Base):
+    """Google Drive OAuth tokens, scoped to ``drive.file``.
+
+    Deliberately NOT folded into ``user_youtube_connections``: that table has a
+    UNIQUE ``user_id`` (one Google account per user, forever), while Drive users
+    routinely have a personal and a brand/client account. Uniqueness here is
+    ``(user_id, google_sub)`` so several accounts can coexist.
+
+    ``drive.file`` only ever grants access to files the user explicitly picked
+    through the Google Picker, so this connection cannot enumerate or read the
+    rest of their Drive. See ``docs/google-drive-import-plan.md`` §1.
+    """
+
+    __tablename__ = "user_google_drive_connections"
+    __table_args__ = (
+        UniqueConstraint("user_id", "google_sub", name="uq_google_drive_conn_user_sub"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    google_sub = Column(String, nullable=False)
+    email = Column(String, nullable=True)
+    picture_url = Column(String, nullable=True)
+    refresh_token_encrypted = Column(Text, nullable=False)
+    # Access token is short-lived and re-mintable from the refresh token, so it
+    # is stored plaintext — same convention as UserYoutubeConnection.
+    access_token = Column(Text, nullable=True)
+    access_expires_at = Column(TIMESTAMP, nullable=True)
+    scopes = Column(Text, nullable=True)
+    status = Column(String, server_default="active", nullable=False)  # active | revoked
+    is_default = Column(Boolean, server_default="false", nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", back_populates="google_drive_connections")
+
+
+class DriveImport(Base):
+    """One Google Drive file being pulled into our storage.
+
+    Project-independent on purpose: the create-project wizard only creates the
+    project at submit, so this mirrors the stateless ``POST /upload/video``
+    contract and produces a ``file_path`` the wizard hands to
+    ``POST /projects/{id}/videos/from-upload``.
+    """
+
+    __tablename__ = "drive_imports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    connection_id = Column(
+        Integer, ForeignKey("user_google_drive_connections.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    drive_file_id = Column(String, nullable=False, index=True)
+    file_name = Column(String, nullable=True)
+    mime_type = Column(String, nullable=True)
+    # BigInteger: Integer overflows at ~2.1 GB and video files routinely exceed it.
+    total_bytes = Column(BigInteger, server_default="0", nullable=False)
+    bytes_transferred = Column(BigInteger, server_default="0", nullable=False)
+    progress_percent = Column(Integer, server_default="0", nullable=False)
+    duration_seconds = Column(Integer, nullable=True)
+    thumbnail_url = Column(String, nullable=True)
+    # queued | downloading | uploading | completed | failed | canceled
+    status = Column(String, server_default="queued", nullable=False, index=True)
+    file_path = Column(Text, nullable=True)
+    error_code = Column(String, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User")
+    connection = relationship("UserGoogleDriveConnection")
 
 
 # =====================================================================
