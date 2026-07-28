@@ -202,7 +202,7 @@ class PostTranscriptionAutoEditHookTests(_SqliteDbTestCase):
         self.assertEqual(data["aiAnalysis"]["analyzedAt"], "transcription:42")
         self.assertIn("suggestions", data["aiAnalysis"])
         self.assertEqual(
-            data["aiAnalysis"]["counts"], {"fillers": 1, "silences": 1, "bad_takes": 1}
+            data["aiAnalysis"]["counts"], {"fillers": 1, "silences": 1, "bad_takes": 1, "repeats": 0}
         )
         self.assertEqual(data["aiAnalysis"]["options"]["aggressiveness"], "balanced")
 

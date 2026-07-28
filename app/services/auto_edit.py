@@ -47,6 +47,112 @@ _SILENCE_THRESHOLD_BY_AGGRESSIVENESS: dict[str, float] = {
 }
 
 
+def _normalize_token(word: str) -> str:
+    """Lowercase, punctuation-free form used for repetition comparison."""
+    return re.sub(r"[^\w']", "", word).lower()
+
+
+def _segment_word_times(seg: dict) -> list[tuple[str, float, float]] | None:
+    """Per-word (text, start, end) for a segment, or None if untimed.
+
+    Prefers real Whisper word timestamps (`app.jobs.transcription` persists
+    `words: [{word,start,end}]` per segment when available); falls back to an
+    even division of the segment. Repetition cuts are sub-word-accurate edits,
+    so a bad estimate is worse than none — the fallback is only trusted because
+    it is the same one the filler pass has always used.
+    """
+    text = str(seg.get("text") or "")
+    tokens = text.split()
+    if not tokens:
+        return None
+    start = float(seg.get("start") or 0)
+    end = float(seg.get("end") or start)
+    if end <= start:
+        return None
+
+    seg_words = seg.get("words")
+    if isinstance(seg_words, list) and len(seg_words) == len(tokens):
+        timed: list[tuple[str, float, float]] = []
+        for token, raw in zip(tokens, seg_words):
+            try:
+                timed.append((token, float(raw.get("start")), float(raw.get("end"))))
+            except (TypeError, ValueError, AttributeError):
+                timed = []
+                break
+        if timed:
+            return timed
+
+    span = (end - start) / len(tokens)
+    return [(token, start + i * span, start + (i + 1) * span) for i, token in enumerate(tokens)]
+
+
+def _detect_repeats_in_segment(seg: dict, index: int) -> list[dict]:
+    """Consecutive repeated words and phrases inside one segment.
+
+    A speaker restarting a phrase ("I want to — I want to build this") leaves
+    the same tokens twice in a row. The *last* utterance is the one that leads
+    into the surviving sentence, so every repetition before it is proposed for
+    removal. Phrases are scanned longest-first, which stops "we should we
+    should" from being reported as two separate word repeats.
+    """
+    timed = _segment_word_times(seg)
+    if not timed or len(timed) < 2:
+        return []
+
+    tokens = [_normalize_token(word) for word, _, _ in timed]
+    suggestions: list[dict] = []
+    taken: set[int] = set()
+
+    # Phrases (longest first), then single words for whatever is left.
+    for size in range(min(6, len(tokens) // 2), 0, -1):
+        position = 0
+        while position + size * 2 <= len(tokens):
+            window = range(position, position + size * 2)
+            first = tokens[position : position + size]
+            second = tokens[position + size : position + size * 2]
+            if any(t in taken for t in window) or not all(first) or first != second:
+                position += 1
+                continue
+
+            start = timed[position][1]
+            end = timed[position + size - 1][2]
+            if end > start:
+                suggestions.append({
+                    "id": f"repeat-{index}-{position}-{size}",
+                    "kind": "repeat",
+                    "title": "Repeated phrase" if size > 1 else "Repeated word",
+                    "detail": " ".join(word for word, _, _ in timed[position : position + size]),
+                    "start": start,
+                    "end": end,
+                    "severity": "medium" if size == 1 else "high",
+                })
+                taken.update(window)
+            position += size * 2
+
+    return suggestions
+
+
+def _duplicate_segment_indices(segments: list[dict]) -> dict[int, str]:
+    """Indices of segments whose text repeats the segment right before them.
+
+    Maps index → the duplicated text. Only the *earlier* copy is flagged: when
+    a speaker delivers the same sentence twice, the later take is the one they
+    meant to keep.
+    """
+    duplicates: dict[int, str] = {}
+    previous_key: str | None = None
+    previous_index: int | None = None
+    for i, seg in enumerate(segments):
+        text = str(seg.get("text") or "").strip()
+        key = " ".join(_normalize_token(w) for w in text.split()).strip()
+        # Single words and very short interjections repeat legitimately.
+        if key and len(key.split()) >= 3 and key == previous_key and previous_index is not None:
+            duplicates[previous_index] = text
+        previous_key = key or None
+        previous_index = i
+    return duplicates
+
+
 def _analyze_segments(
     segments: list[dict],
     duration: float,
@@ -54,6 +160,7 @@ def _analyze_segments(
     remove_fillers: bool = True,
     remove_silences: bool = True,
     remove_bad_takes: bool = True,
+    remove_repeats: bool = True,
     aggressiveness: Aggressiveness = "balanced",
 ) -> dict:
     """Server-side rough-cut analysis: derive keep_ranges and suggestion list from transcript.
@@ -71,6 +178,10 @@ def _analyze_segments(
     keep: list[dict] = []
     suggestions: list[dict] = []
 
+    # A sentence delivered twice in a row: the earlier copy leaves keep_ranges
+    # entirely, the way a bad take does.
+    duplicate_segments = _duplicate_segment_indices(segments) if remove_repeats else {}
+
     for i, seg in enumerate(segments):
         start = float(seg.get("start") or 0)
         end = float(seg.get("end") or start)
@@ -85,6 +196,18 @@ def _analyze_segments(
                 "kind": "bad_take",
                 "title": "Bad take",
                 "detail": text[:90],
+                "start": start,
+                "end": end,
+                "severity": "high",
+            })
+            continue
+
+        if i in duplicate_segments:
+            suggestions.append({
+                "id": f"repeat-segment-{i}",
+                "kind": "repeat",
+                "title": "Repeated sentence",
+                "detail": duplicate_segments[i][:90],
                 "start": start,
                 "end": end,
                 "severity": "high",
@@ -163,6 +286,16 @@ def _analyze_segments(
                         "severity": "high" if clean in {"um", "uh"} else "medium",
                     })
 
+    # Word/phrase repeats inside surviving segments. A segment already dropped
+    # whole (bad take, duplicate sentence) has nothing left to deduplicate.
+    if remove_repeats:
+        for i, seg in enumerate(segments):
+            if i in duplicate_segments:
+                continue
+            if remove_bad_takes and _BAD_TAKE_RE.search(str(seg.get("text") or "")):
+                continue
+            suggestions.extend(_detect_repeats_in_segment(seg, i))
+
     suggestions.sort(key=lambda s: (s["start"], s["end"]))
     return {"keepRanges": merged, "suggestions": suggestions}
 
@@ -177,15 +310,21 @@ class AutoEditOptions(BaseModel):
     remove_fillers: bool = True
     remove_silences: bool = True
     remove_bad_takes: bool = True
+    remove_repeats: bool = True
     aggressiveness: Aggressiveness = "balanced"
 
 
-_REVIEW_KIND_MAP = {"filler": "fillers", "silence": "silences", "bad_take": "bad_takes"}
+_REVIEW_KIND_MAP = {
+    "filler": "fillers",
+    "silence": "silences",
+    "bad_take": "bad_takes",
+    "repeat": "repeats",
+}
 
 
 def _summarize_analysis(analysis: dict) -> tuple[dict, float]:
-    """Group suggestions into {fillers,silences,bad_takes} counts + removable seconds."""
-    counts = {"fillers": 0, "silences": 0, "bad_takes": 0}
+    """Group suggestions into {fillers,silences,bad_takes,repeats} counts + removable seconds."""
+    counts = {"fillers": 0, "silences": 0, "bad_takes": 0, "repeats": 0}
     removable = 0.0
     for s in analysis.get("suggestions", []):
         key = _REVIEW_KIND_MAP.get(s.get("kind"))
@@ -288,6 +427,7 @@ def run_post_transcription_auto_edit(
             remove_fillers=prefs_data.get("remove_fillers", True),
             remove_silences=prefs_data.get("remove_silences", True),
             remove_bad_takes=prefs_data.get("remove_bad_takes", True),
+            remove_repeats=prefs_data.get("remove_repeats", True),
             aggressiveness=prefs_data.get("aggressiveness", "balanced"),
         )
         auto_apply = bool(prefs_data.get("auto_apply"))
@@ -305,6 +445,7 @@ def run_post_transcription_auto_edit(
             remove_fillers=options.remove_fillers,
             remove_silences=options.remove_silences,
             remove_bad_takes=options.remove_bad_takes,
+            remove_repeats=options.remove_repeats,
             aggressiveness=options.aggressiveness,
         )
         if source_ranges:

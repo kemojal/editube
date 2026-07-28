@@ -145,6 +145,81 @@ class CategoryFlagTests(unittest.TestCase):
         self.assertAlmostEqual(total_span, 6.0, places=3)
 
 
+class RepetitionDetectionTests(unittest.TestCase):
+    """Repeated words, phrases and whole sentences — the "repetitive flow" pass."""
+
+    def test_detects_a_repeated_phrase_using_word_timestamps(self) -> None:
+        seg = {
+            "start": 0.0,
+            "end": 3.5,
+            "text": "I want to I want to build this",
+            "words": [
+                {"word": "I", "start": 0.0, "end": 0.3},
+                {"word": "want", "start": 0.3, "end": 0.6},
+                {"word": "to", "start": 0.6, "end": 0.9},
+                {"word": "I", "start": 1.2, "end": 1.5},
+                {"word": "want", "start": 1.5, "end": 1.8},
+                {"word": "to", "start": 1.8, "end": 2.1},
+                {"word": "build", "start": 2.1, "end": 2.6},
+                {"word": "this", "start": 2.6, "end": 3.0},
+            ],
+        }
+        analysis = _analyze_segments([seg], duration=3.5)
+        repeats = [s for s in analysis["suggestions"] if s["kind"] == "repeat"]
+        self.assertEqual(len(repeats), 1)
+        # The *first* utterance is dropped; the second leads into "build this".
+        self.assertAlmostEqual(repeats[0]["start"], 0.0, places=3)
+        self.assertAlmostEqual(repeats[0]["end"], 0.9, places=3)
+        self.assertEqual(repeats[0]["detail"], "I want to")
+
+    def test_detects_a_repeated_word(self) -> None:
+        seg = {"start": 0.0, "end": 2.0, "text": "the the cat sat down"}
+        repeats = [
+            s for s in _analyze_segments([seg], duration=2.0)["suggestions"] if s["kind"] == "repeat"
+        ]
+        self.assertEqual(len(repeats), 1)
+        self.assertEqual(repeats[0]["detail"], "the")
+
+    def test_drops_the_earlier_of_two_identical_sentences(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "This is the important part."},
+            {"start": 2.0, "end": 4.0, "text": "This is the important part."},
+            {"start": 4.0, "end": 6.0, "text": "And then we move on."},
+        ]
+        analysis = _analyze_segments(segments, duration=6.0)
+        repeats = [s for s in analysis["suggestions"] if s["kind"] == "repeat"]
+        self.assertEqual([r["title"] for r in repeats], ["Repeated sentence"])
+        self.assertAlmostEqual(repeats[0]["start"], 0.0, places=3)
+        # The earlier copy is gone from keepRanges; the later one survives.
+        self.assertTrue(all(r["start"] >= 2.0 for r in analysis["keepRanges"]))
+
+    def test_ignores_a_short_repeated_interjection(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Right."},
+            {"start": 1.0, "end": 2.0, "text": "Right."},
+        ]
+        analysis = _analyze_segments(segments, duration=2.0)
+        self.assertEqual([s for s in analysis["suggestions"] if s["kind"] == "repeat"], [])
+
+    def test_remove_repeats_false_suppresses_the_whole_category(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "the the cat sat down"},
+            {"start": 2.0, "end": 4.0, "text": "This is the important part."},
+            {"start": 4.0, "end": 6.0, "text": "This is the important part."},
+        ]
+        analysis = _analyze_segments(segments, duration=6.0, remove_repeats=False)
+        self.assertEqual([s for s in analysis["suggestions"] if s["kind"] == "repeat"], [])
+        # ...and nothing is dropped from keepRanges either.
+        self.assertAlmostEqual(sum(r["end"] - r["start"] for r in analysis["keepRanges"]), 6.0, places=3)
+
+    def test_does_not_scan_a_segment_it_already_dropped(self) -> None:
+        segments = [{"start": 0.0, "end": 2.0, "text": "no no scratch that let me restart"}]
+        analysis = _analyze_segments(segments, duration=2.0)
+        kinds = [s["kind"] for s in analysis["suggestions"]]
+        self.assertIn("bad_take", kinds)
+        self.assertNotIn("repeat", kinds)
+
+
 class SummarizeAnalysisTests(unittest.TestCase):
     def test_counts_and_removable_seconds(self) -> None:
         analysis = {
@@ -153,17 +228,18 @@ class SummarizeAnalysisTests(unittest.TestCase):
                 {"kind": "filler", "start": 2.0, "end": 2.4},
                 {"kind": "silence", "start": 3.0, "end": 4.0},
                 {"kind": "bad_take", "start": 5.0, "end": 7.0},
+                {"kind": "repeat", "start": 7.0, "end": 7.5},
                 {"kind": "broll", "start": 8.0, "end": 9.0},  # ignored
             ]
         }
         counts, removable = _summarize_analysis(analysis)
-        self.assertEqual(counts, {"fillers": 2, "silences": 1, "bad_takes": 1})
-        # 0.3 + 0.4 + 1.0 + 2.0 = 3.7 (broll excluded)
-        self.assertAlmostEqual(removable, 3.7, places=5)
+        self.assertEqual(counts, {"fillers": 2, "silences": 1, "bad_takes": 1, "repeats": 1})
+        # 0.3 + 0.4 + 1.0 + 2.0 + 0.5 = 4.2 (broll excluded)
+        self.assertAlmostEqual(removable, 4.2, places=5)
 
     def test_handles_missing_suggestions_key(self) -> None:
         counts, removable = _summarize_analysis({})
-        self.assertEqual(counts, {"fillers": 0, "silences": 0, "bad_takes": 0})
+        self.assertEqual(counts, {"fillers": 0, "silences": 0, "bad_takes": 0, "repeats": 0})
         self.assertEqual(removable, 0.0)
 
 
@@ -287,7 +363,7 @@ class RoughCutEndpointOptionsTests(unittest.TestCase):
             )
 
         data = result["result_data"]
-        self.assertEqual(data["counts"], {"fillers": 1, "silences": 1, "bad_takes": 1})
+        self.assertEqual(data["counts"], {"fillers": 1, "silences": 1, "bad_takes": 1, "repeats": 0})
 
     def test_review_endpoint_with_options_body_filters_counts(self) -> None:
         from app.api.routes import ai as ai_routes
@@ -303,7 +379,7 @@ class RoughCutEndpointOptionsTests(unittest.TestCase):
             )
 
         data = result["result_data"]
-        self.assertEqual(data["counts"], {"fillers": 1, "silences": 1, "bad_takes": 0})
+        self.assertEqual(data["counts"], {"fillers": 1, "silences": 1, "bad_takes": 0, "repeats": 0})
 
 
 if __name__ == "__main__":

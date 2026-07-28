@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from .routes import users, projects, videos, video_detail, comments, notifications, activity_feeds, upload, annotations, google_account_integration, youtube_oauth, google_drive, folders, billing, review_links, review_workflows, ai, creator, freelancer, suggestions, community_forum, workspaces, public_workspace, project_tasks, delivery, security_audit, editor_integrations, proxy, watch_folder, ingest, clips, ugc
+from .routes import users, projects, videos, video_detail, comments, notifications, activity_feeds, upload, annotations, google_account_integration, youtube_oauth, google_drive, folders, billing, review_links, review_workflows, ai, creator, freelancer, suggestions, community_forum, workspaces, public_workspace, project_tasks, delivery, security_audit, editor_integrations, proxy, watch_folder, ingest, clips, ugc, ai_media
 # , 
 # analytics
 # google_account_integration
@@ -28,6 +28,7 @@ api_router.include_router(billing.router)
 api_router.include_router(review_links.auth_router)
 api_router.include_router(review_links.public_router)
 api_router.include_router(ai.router)
+api_router.include_router(ai_media.router)
 api_router.include_router(creator.router)
 api_router.include_router(freelancer.router)
 api_router.include_router(freelancer.public_router)

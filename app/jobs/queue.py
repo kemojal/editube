@@ -28,7 +28,7 @@ def enqueue_rough_cut_export_job(ai_result_id: int, *, register_as_version: bool
             register_as_version=register_as_version,
             job_timeout=timeout_sec,
         )
-        return job.get_id() if job else None
+        return job.id if job else None
     except Exception as e:
         logger.exception("Failed to enqueue rough-cut export ai_result=%s: %s", ai_result_id, e)
         return None
@@ -53,9 +53,35 @@ def enqueue_rough_cut_effect_job(ai_result_id: int) -> str | None:
             ai_result_id,
             job_timeout=timeout_sec,
         )
-        return job.get_id() if job else None
+        return job.id if job else None
     except Exception as e:
         logger.exception("Failed to enqueue rough-cut effect ai_result=%s: %s", ai_result_id, e)
+        return None
+
+
+def enqueue_generated_media_job(media_id: int) -> str | None:
+    """Enqueue AI media generation. Returns the RQ job id, or None if unqueued.
+
+    Video jobs poll a long-running operation for minutes, so the timeout is
+    generous — it must outlast `AI_VIDEO_TIMEOUT_SEC` or the worker would be
+    killed mid-poll and leave the row stuck in `running`.
+    """
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; generation not enqueued for media %s", media_id)
+        return None
+    try:
+        from app.jobs.ai_media_generation import generate_media_job
+        from redis import Redis
+        from rq import Queue
+
+        timeout_sec = max(1200, int(os.environ.get("AI_MEDIA_JOB_TIMEOUT_SEC", "1800") or "1800"))
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=timeout_sec)
+        job = q.enqueue(generate_media_job, media_id, job_timeout=timeout_sec)
+        return job.id if job else None
+    except Exception as e:
+        logger.exception("Failed to enqueue generated media=%s: %s", media_id, e)
         return None
 
 
@@ -464,7 +490,7 @@ def enqueue_drive_import_job(import_id: int) -> str | None:
             import_id,
             job_timeout=timeout_sec,
         )
-        return job.get_id() if job else None
+        return job.id if job else None
     except Exception as e:
         logger.exception("Failed to enqueue drive import %s: %s", import_id, e)
         return None
