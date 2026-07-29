@@ -1,6 +1,7 @@
 import unittest
 
 from app.jobs.mask_track import (
+    _box_left_frame,
     bbox_to_transform,
     keyframe_stride,
     transform_to_bbox,
@@ -42,6 +43,59 @@ class KeyframeStrideTests(unittest.TestCase):
 
     def test_stride_is_never_zero(self):
         self.assertGreaterEqual(keyframe_stride(total_frames=0), 1)
+
+
+class BoxLeftFrameTests(unittest.TestCase):
+    """Guards the single condition that stops mask tracking: is the box gone
+    from the frame? Assert the requirement (trackable vs. gone), not the
+    implementation's arithmetic."""
+
+    SIZE = (1920, 1080)  # (frame_w, frame_h)
+
+    def test_box_fully_inside_the_frame_is_not_left(self):
+        self.assertFalse(_box_left_frame((100, 100, 200, 200), self.SIZE))
+
+    def test_box_clipped_at_left_edge_is_still_trackable(self):
+        # Subject half out of frame on the left is still trackable.
+        self.assertFalse(_box_left_frame((-50, 400, 100, 100), self.SIZE))
+
+    def test_box_clipped_at_right_edge_is_still_trackable(self):
+        self.assertFalse(_box_left_frame((1870, 400, 100, 100), self.SIZE))
+
+    def test_box_clipped_at_top_edge_is_still_trackable(self):
+        self.assertFalse(_box_left_frame((800, -50, 100, 100), self.SIZE))
+
+    def test_box_clipped_at_bottom_edge_is_still_trackable(self):
+        self.assertFalse(_box_left_frame((800, 1030, 100, 100), self.SIZE))
+
+    def test_box_beyond_left_edge_by_more_than_its_own_size_is_gone(self):
+        # width=100; left edge at -250 puts the box's right edge at -150,
+        # which is more than one box-width (100) past the frame boundary.
+        self.assertTrue(_box_left_frame((-250, 400, 100, 100), self.SIZE))
+
+    def test_box_beyond_right_edge_by_more_than_its_own_size_is_gone(self):
+        self.assertTrue(_box_left_frame((2070, 400, 100, 100), self.SIZE))
+
+    def test_box_beyond_top_edge_by_more_than_its_own_size_is_gone(self):
+        self.assertTrue(_box_left_frame((800, -250, 100, 100), self.SIZE))
+
+    def test_box_beyond_bottom_edge_by_more_than_its_own_size_is_gone(self):
+        self.assertTrue(_box_left_frame((800, 1230, 100, 100), self.SIZE))
+
+    def test_exact_boundary_is_not_yet_gone(self):
+        # width=100; right edge exactly at -width (-100) means the box's
+        # trailing edge is exactly one box-width outside — the boundary
+        # itself is still considered trackable, only strictly more is "gone".
+        self.assertFalse(_box_left_frame((-200, 400, 100, 100), self.SIZE))
+
+    def test_just_past_the_exact_boundary_is_gone(self):
+        self.assertTrue(_box_left_frame((-200.01, 400, 100, 100), self.SIZE))
+
+    def test_zero_size_box_is_treated_as_gone(self):
+        # A tracker never legitimately reports a zero-size box for a live
+        # target; this only guards against a degenerate/corrupt bbox so the
+        # job fails safe (stops) rather than tracking a phantom point.
+        self.assertTrue(_box_left_frame((800, 400, 0, 0), self.SIZE))
 
 
 if __name__ == "__main__":
