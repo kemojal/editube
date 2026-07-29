@@ -29,7 +29,7 @@ from typing import Any
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from app.services.mask_geometry import VIEWBOX, expansion_radius, mask_is_inert, mask_polygons
-from app.services.mask_text import DEFAULT_MASK_FONT_ID, render_text_layer
+from app.services.mask_text import DEFAULT_MASK_FONT_ID, render_text_layer, viewbox_rotation_affine
 
 logger = logging.getLogger(__name__)
 
@@ -361,15 +361,18 @@ def render_matte_frame(
                 if layout.font_fallback:
                     font_warnings.add(layout.requested_font_id)
                 if layout.rotation % 360 != 0:
-                    # SVG's rotate() is clockwise on a y-down axis; PIL's
-                    # Image.rotate is counter-clockwise, hence the negation.
-                    # Rotating the rendered layer (rather than the glyphs) is
-                    # what the browser does too -- the <text> sits inside a
-                    # rotate() group.
-                    layer = layer.rotate(
-                        -layout.rotation,
+                    # Rotate the rendered layer -- the browser rotates its
+                    # <text> group the same way. It must be a VIEWBOX-space
+                    # rotation, like every polygon shape's `_rotate_points`,
+                    # NOT `Image.rotate`'s pixel-space one: those differ
+                    # whenever sx != sy. See `viewbox_rotation_affine`.
+                    layer = layer.transform(
+                        size,
+                        Image.AFFINE,
+                        viewbox_rotation_affine(
+                            layout.rotation, (layout.centre_x * sx, layout.centre_y * sy), sx, sy
+                        ),
                         resample=Image.BICUBIC,
-                        center=(layout.centre_x * sx, layout.centre_y * sy),
                     )
             # Mirrors mask-svg-defs.tsx: strokes/shapes paint white into this
             # layer (the mask's `op` -- add/subtract/intersect -- is applied

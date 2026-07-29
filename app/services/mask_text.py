@@ -34,6 +34,7 @@ TWO RULES THAT MUST NOT REGRESS
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -141,6 +142,17 @@ class MaskTextLayout:
     """SVG `text-anchor` value; `pillow_anchor` derives the PIL one."""
     underline_offset_vb: float
     underline_thickness_vb: float
+    glyph_scale_x: float
+    """Horizontal pre-compensation the SVG side applies -- see
+    `maskTextGlyphTransform` in mask-text.ts. Always `1 / frame_aspect`.
+
+    Nothing here multiplies by it: Pillow has no non-uniform CTM to cancel,
+    it simply draws isotropic glyphs, which is the shape that compensation
+    makes the browser produce too. It is carried on the layout (and asserted
+    in the golden fixture at two different frame aspects) so a regression
+    that drops the browser-side correction fails a test in BOTH languages
+    instead of only showing up as fat letters in someone's preview.
+    """
     rotation: float
     centre_x: float
     centre_y: float
@@ -221,6 +233,7 @@ def mask_text_layout(mask: dict[str, Any], t: float, frame_aspect: float) -> Mas
         anchor=_SVG_ANCHOR[align],
         underline_offset_vb=TEXT_UNDERLINE_OFFSET * font_size_vb,
         underline_thickness_vb=TEXT_UNDERLINE_THICKNESS * font_size_vb,
+        glyph_scale_x=1 / frame_aspect,
         rotation=transform.rotation,
         centre_x=box.centre_x,
         centre_y=box.centre_y,
@@ -229,6 +242,38 @@ def mask_text_layout(mask: dict[str, Any], t: float, frame_aspect: float) -> Mas
             for index, line in enumerate(lines)
         ],
     )
+
+
+def viewbox_rotation_affine(
+    angle_deg: float, centre_px: tuple[float, float], sx: float, sy: float
+) -> tuple[float, float, float, float, float, float]:
+    """Inverse-mapping AFFINE coefficients for a rotation performed in
+    VIEWBOX space, expressed in output pixels.
+
+    Every other shape rotates in VIEWBOX space in BOTH languages: the TS side
+    rotates path coordinates before the mask's non-uniform
+    objectBoundingBox CTM stretches them, and `_rotate_points` in
+    mask_geometry.py rotates polygon vertices before `_scale_points`. Text
+    has no vertices to rotate -- it is rasterised -- so the drawn layer must
+    be transformed instead, and a plain `Image.rotate` would rotate in PIXEL
+    space, which is NOT the same thing when `sx != sy` (a rotated block would
+    sit at a different angle in the export than in the preview).
+
+    Pixel-space equivalent of a VIEWBOX-space rotation R is `S R S^-1` with
+    `S = diag(sx, sy)`. `Image.transform(..., AFFINE, data)` wants the
+    INVERSE map (output -> input), so this returns `S R(-angle) S^-1` about
+    `centre_px`.
+    """
+    theta = math.radians(angle_deg)
+    cos_a, sin_a = math.cos(theta), math.sin(theta)
+    # S · R(-θ) · S⁻¹ , with R(-θ) = [[cos, sin], [-sin, cos]] (y-down, so a
+    # positive angle is clockwise -- matching SVG's rotate()).
+    a = cos_a
+    b = (sx / sy) * sin_a
+    d = -(sy / sx) * sin_a
+    e = cos_a
+    cx, cy = centre_px
+    return (a, b, cx - (a * cx + b * cy), d, e, cy - (d * cx + e * cy))
 
 
 def _line_advance(font: ImageFont.FreeTypeFont, text: str, letter_spacing_px: float) -> float:
@@ -257,12 +302,19 @@ def render_text_layer(
     the caller can report a font fallback), or None if nothing was drawn.
 
     `sx`/`sy` scale VIEWBOX units onto output pixels. The font is loaded at
-    the y-scaled size; a non-square VIEWBOX->frame scale would need a
-    non-uniform glyph transform Pillow cannot do, so the y axis wins (text
-    height is what the user sizes with `fontSize`) -- the same choice the
-    SVG side makes implicitly, since its `<text>` sits inside the mask's
-    `scale(1/VIEWBOX)` group... see the report for the bounded consequence
-    on non-square pixel aspect.
+    the **y**-scaled size and glyphs are drawn ISOTROPICALLY: `fontSize` is a
+    percentage of frame height, so height is what it must control, and a
+    glyph's own proportions must not depend on the frame's aspect. The
+    browser reaches the same result by pre-dividing its `<text>` group by
+    `1 / frame_aspect` to cancel the mask's non-uniform objectBoundingBox
+    CTM (`maskTextGlyphTransform` in mask-text.ts) -- without that
+    compensation the preview stretched letters ~78% wider on a 16:9 frame
+    while this side never did.
+
+    Consequently every horizontal quantity here is scaled by `sy` as well,
+    not `sx`: letter-spacing and the underline rule are fractions of the font
+    size, and after the browser's compensation they render at `L * sx * (sy /
+    sx) = L * sy` px there.
     """
     layout = mask_text_layout(mask, t, frame_aspect)
     if layout is None:
@@ -275,7 +327,10 @@ def render_text_layer(
         logger.exception("mask text: could not load font %s/%s", layout.font_id, layout.style_key)
         return layout
 
-    letter_spacing_px = layout.letter_spacing_vb * sx
+    # `sy`, not `sx` -- see the docstring: letter-spacing is a fraction of the
+    # font size, which is y-scaled, and that is what the compensated SVG side
+    # renders too.
+    letter_spacing_px = layout.letter_spacing_vb * sy
     anchor = layout.pillow_anchor
 
     for line in layout.lines:

@@ -35,6 +35,7 @@ from app.services.mask_text import (
     mask_font_path,
     mask_text_layout,
     resolve_mask_font,
+    viewbox_rotation_affine,
 )
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "mask-text-golden.json"
@@ -118,6 +119,9 @@ class MaskTextLayoutParityTests(unittest.TestCase):
                 self.assertEqual(layout.align_v, want["alignV"])
                 self.assertAlmostEqual(layout.underline_offset_vb, want["underlineOffsetVb"], places=3)
                 self.assertAlmostEqual(layout.underline_thickness_vb, want["underlineThicknessVb"], places=3)
+                if "glyphScaleX" in want:
+                    self.assertAlmostEqual(layout.glyph_scale_x, want["glyphScaleX"], places=6)
+                    self.assertAlmostEqual(layout.glyph_scale_x, 1 / case["frameAspect"], places=6)
                 self.assertAlmostEqual(layout.rotation, want["rotation"], places=3)
                 self.assertAlmostEqual(layout.centre_x, want["centreX"], places=3)
                 self.assertAlmostEqual(layout.centre_y, want["centreY"], places=3)
@@ -191,6 +195,66 @@ class MaskTextLayoutRulesTests(unittest.TestCase):
 
     def test_crlf_does_not_gain_blank_lines(self):
         self.assertEqual(len(mask_text_layout(_text_mask(text="a\r\nb"), 0, 16 / 9).lines), 2)
+
+
+class MaskTextAnisotropyTests(unittest.TestCase):
+    """The mask's SVG CTM stretches x and y independently (objectBoundingBox
+    over a non-square frame), so the browser pre-divides its glyph group by
+    `1 / frameAspect`. Pillow has no such CTM and must therefore keep drawing
+    ISOTROPIC glyphs -- identical ink at any frame aspect. These are the
+    tests that fail if either side's half of that bargain is dropped."""
+
+    def test_glyph_scale_x_is_reported_for_both_orientations(self):
+        landscape = mask_text_layout(_text_mask(), 0, 16 / 9)
+        portrait = mask_text_layout(_text_mask(), 0, 9 / 16)
+        self.assertAlmostEqual(landscape.glyph_scale_x, 9 / 16, places=6)
+        self.assertAlmostEqual(portrait.glyph_scale_x, 16 / 9, places=6)
+
+    def test_rendered_glyphs_keep_their_aspect_across_frame_aspects(self):
+        """Same text, same font size, square output canvas but different
+        declared frame aspects: the ink box must be identical, because the
+        glyphs are isotropic and `fontSize` is a share of frame HEIGHT."""
+        wide = render_matte_frame([_text_mask(text="HHH")], 0, (400, 400)).getbbox()
+        tall = render_matte_frame([_text_mask(text="HHH")], 0, (400, 400)).getbbox()
+        self.assertEqual(wide, tall)
+
+    def test_letter_spacing_scales_with_the_font_size_axis(self):
+        """Letter-spacing is a fraction of the font size, so it must scale by
+        sy like the glyphs -- if it used sx it would grow with the frame's
+        width and desync from the (compensated) browser."""
+        square = render_matte_frame([_text_mask(text="AB", letterSpacing=50)], 0, (400, 400)).getbbox()
+        wide = render_matte_frame([_text_mask(text="AB", letterSpacing=50)], 0, (800, 400)).getbbox()
+        square_w = square[2] - square[0]
+        wide_w = wide[2] - wide[0]
+        # Output is twice as wide with the same height: glyph ink (and the
+        # spacing between glyphs) is driven by height, so the run's pixel
+        # width must NOT change.
+        self.assertAlmostEqual(square_w, wide_w, delta=2)
+
+
+class MaskTextRotationTests(unittest.TestCase):
+    def test_viewbox_rotation_affine_is_identity_at_zero(self):
+        a, b, c, d, e, f = viewbox_rotation_affine(0, (100, 50), 2.0, 1.0)
+        self.assertAlmostEqual(a, 1)
+        self.assertAlmostEqual(b, 0)
+        self.assertAlmostEqual(c, 0)
+        self.assertAlmostEqual(d, 0)
+        self.assertAlmostEqual(e, 1)
+        self.assertAlmostEqual(f, 0)
+
+    def test_viewbox_rotation_differs_from_pixel_rotation_when_sx_ne_sy(self):
+        """The point of `viewbox_rotation_affine`: every polygon shape rotates
+        in VIEWBOX space in both languages, so text must too. A pixel-space
+        rotation would be a different transform on a non-square frame."""
+        _, b, _, d, _, _ = viewbox_rotation_affine(30, (0, 0), 1.92, 1.08)
+        self.assertNotAlmostEqual(b, -d, places=3)
+        # ...and it IS a plain rotation when the scale is uniform.
+        _, b_sq, _, d_sq, _, _ = viewbox_rotation_affine(30, (0, 0), 1.5, 1.5)
+        self.assertAlmostEqual(b_sq, -d_sq, places=9)
+
+    def test_rotated_text_still_paints(self):
+        matte = render_matte_frame([_text_mask(text="Rot", rotation=30)], 0, (400, 225))
+        self.assertIsNotNone(matte.getbbox())
 
 
 class MaskTextFontFallbackTests(unittest.TestCase):
