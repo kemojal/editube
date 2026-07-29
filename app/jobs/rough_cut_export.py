@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.db.database import SessionLocal
 from app.db.models import AiResult, Video, VideoTranscription
+from app.services.mask_matte import render_matte_video
 from app.utils.cloudinary import cloudinary_credentials_configured, upload_local_path_to_cloudinary
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,32 @@ def _fps_filter_part(settings: dict[str, Any], source_video: str) -> str:
     if fr in ("24", "30", "60"):
         return f",fps={fr}"
     return ""
+
+
+def _resolve_numeric_fps(settings: dict[str, Any], source_video: str) -> float:
+    """Resolves the export frame rate as a float, for the matte renderer.
+
+    Mirrors `_fps_filter_part`'s resolution logic (explicit rate, else probe
+    the source, else fall back) but returns a number instead of an ffmpeg
+    filter fragment, since `render_matte_video` needs a concrete fps to
+    iterate frames by.
+    """
+    fr = str(settings.get("frameRate") or "source").lower().strip()
+    if fr in ("24", "30", "60"):
+        return float(fr)
+    probed = _ffprobe_avg_frame_rate(source_video)
+    if probed:
+        try:
+            if "/" in probed:
+                num, den = probed.split("/", 1)
+                den_f = float(den)
+                if den_f:
+                    return float(num) / den_f
+            else:
+                return float(probed)
+        except (ValueError, ZeroDivisionError):
+            pass
+    return 30.0
 
 
 def _remap_segments_to_export_timeline(
@@ -248,6 +275,14 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
             raise RuntimeError("Cloudinary credentials are required to finish exports (CLOUDINARY_* env).")
 
         fps_extra = _fps_filter_part(settings, media_src) if want_mp4_video else ""
+        masks = payload.get("masks") if isinstance(payload.get("masks"), list) else []
+        matte_fps = _resolve_numeric_fps(settings, media_src) if (want_mp4_video and masks) else 30.0
+        scale_w, scale_h = (0, 0)
+        if want_mp4_video and masks:
+            try:
+                scale_w, scale_h = (int(p) for p in scale.split(":", 1))
+            except (ValueError, AttributeError):
+                scale_w, scale_h = (1920, 1080)
 
         segments = _load_transcription_segments(db, video_id)
         subtitle_entries = _remap_segments_to_export_timeline(segments, normalized) if include_captions else []
@@ -291,35 +326,98 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                         f"pad={scale}:(ow-iw)/2:(oh-ih)/2"
                         f"{fps_extra}"
                     )
-                    _run_ffmpeg(
-                        [
-                            "ffmpeg",
-                            "-y",
-                            "-ss",
-                            str(start),
-                            "-i",
-                            media_src,
-                            "-t",
-                            str(dur),
-                            "-vf",
-                            vf,
-                            "-c:v",
-                            "libx264",
-                            "-preset",
-                            "veryfast",
-                            "-crf",
-                            str(crf),
-                            "-pix_fmt",
-                            "yuv420p",
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-movflags",
-                            "+faststart",
-                            str(v_out),
-                        ]
-                    )
+
+                    matte_path: Path | None = None
+                    if masks:
+                        try:
+                            matte_path = render_matte_video(
+                                masks,
+                                duration=dur,
+                                fps=matte_fps,
+                                size=(scale_w, scale_h),
+                                out_path=tmp_path / f"matte{index:03d}.mkv",
+                            )
+                        except Exception:
+                            # A masking bug must never fail the whole export —
+                            # fall back to the unmasked segment.
+                            logger.exception(
+                                "rough_cut_export_job: matte render failed for range %s, exporting without mask",
+                                index,
+                            )
+                            matte_path = None
+
+                    if matte_path is not None:
+                        filter_complex = (
+                            f"[0:v]{vf}[base];"
+                            f"[base][1:v]alphamerge[m];"
+                            f"color=black:s={scale}[bg];"
+                            f"[bg][m]overlay=shortest=1[v]"
+                        )
+                        _run_ffmpeg(
+                            [
+                                "ffmpeg",
+                                "-y",
+                                "-ss",
+                                str(start),
+                                "-i",
+                                media_src,
+                                "-i",
+                                str(matte_path),
+                                "-t",
+                                str(dur),
+                                "-filter_complex",
+                                filter_complex,
+                                "-map",
+                                "[v]",
+                                "-map",
+                                "0:a?",
+                                "-c:v",
+                                "libx264",
+                                "-preset",
+                                "veryfast",
+                                "-crf",
+                                str(crf),
+                                "-pix_fmt",
+                                "yuv420p",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "192k",
+                                "-movflags",
+                                "+faststart",
+                                str(v_out),
+                            ]
+                        )
+                    else:
+                        _run_ffmpeg(
+                            [
+                                "ffmpeg",
+                                "-y",
+                                "-ss",
+                                str(start),
+                                "-i",
+                                media_src,
+                                "-t",
+                                str(dur),
+                                "-vf",
+                                vf,
+                                "-c:v",
+                                "libx264",
+                                "-preset",
+                                "veryfast",
+                                "-crf",
+                                str(crf),
+                                "-pix_fmt",
+                                "yuv420p",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "192k",
+                                "-movflags",
+                                "+faststart",
+                                str(v_out),
+                            ]
+                        )
                     vid_parts.append(v_out)
 
                 progress = min(72, int(8 + ((index + 1) / max(total, 1)) * 64))

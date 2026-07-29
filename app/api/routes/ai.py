@@ -770,6 +770,9 @@ class RoughCutExportBody(BaseModel):
     format: str = "mp4"  # "mp4" | "wav"
     keepRanges: list[dict[str, Any]] = Field(default_factory=list)
     exportSettings: dict[str, Any] = Field(default_factory=dict)
+    # Source-clip masks (Task 13). Sanitized server-side in
+    # app.services.mask_matte before ever reaching Pillow/ffmpeg.
+    masks: list[dict[str, Any]] = Field(default_factory=list)
     # When true, the rendered output registers as the NEXT VERSION of this
     # video (same version_group_id, version = max+1) once the export
     # completes. Back-compat default off — existing callers keep getting
@@ -794,6 +797,7 @@ def start_rough_cut_export(
         "format": fmt,
         "keepRanges": body.keepRanges,
         "exportSettings": body.exportSettings,
+        "masks": body.masks,
         "progress": 0,
     }
 
