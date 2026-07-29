@@ -10,11 +10,14 @@ exercised by reasoning / manual QA, not by the automated suite.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import math
 import os
+import socket
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from app.db.database import SessionLocal
 from app.db.models import AiResult, Video
@@ -71,6 +74,54 @@ def keyframe_stride(total_frames: int, budget: int = DEFAULT_KEYFRAME_BUDGET) ->
     if total <= 0:
         return 1
     return max(1, math.ceil(total / budget))
+
+
+class UnsafeMediaSourceError(RuntimeError):
+    """Raised when a media source fails the SSRF allowlist. Never includes
+    the rejected URL/host in its message -- callers must not echo the
+    resolved source back to the client (I7)."""
+
+
+_ALLOWED_SCHEMES = {"http", "https"}
+
+
+def _is_disallowed_host(hostname: str) -> bool:
+    """True if `hostname` resolves to (or literally is) a loopback,
+    link-local, private, or otherwise non-public address -- the classes an
+    SSRF probe targets (e.g. cloud metadata at 169.254.169.254, internal
+    services on 10.x/192.168.x, or the worker's own loopback)."""
+    candidates: list[str] = [hostname]
+    try:
+        # Resolve DNS names too -- a public-looking hostname can still
+        # resolve to an internal address ("DNS rebinding").
+        infos = socket.getaddrinfo(hostname, None)
+        candidates.extend(sorted({info[4][0] for info in infos}))
+    except socket.gaierror:
+        pass
+
+    for candidate in candidates:
+        try:
+            ip = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            return True
+    return False
+
+
+def _assert_media_source_safe(source: str) -> None:
+    """Guards `cv2.VideoCapture(source)` against SSRF (I7): only http(s)
+    URLs to public hosts are allowed. Local filesystem paths (no scheme --
+    already resolved by `_resolve_media_source` from trusted server-side
+    state, never directly from client input) pass through untouched."""
+    if "://" not in source:
+        return
+    parsed = urlparse(source)
+    if parsed.scheme.lower() not in _ALLOWED_SCHEMES:
+        raise UnsafeMediaSourceError("Unsupported media source scheme.")
+    hostname = parsed.hostname
+    if not hostname or _is_disallowed_host(hostname):
+        raise UnsafeMediaSourceError("Media source host is not allowed.")
 
 
 def _resolve_media_source(video: Video, explicit_source_url: str | None) -> str:
@@ -154,6 +205,26 @@ def _update_progress(db, ai_result_id: int, *, progress: int) -> None:
     db.commit()
 
 
+def _make_keyframe(frame_idx: int, fps: float, clip_start: float, bbox: tuple[float, float, float, float], frame_size: tuple[int, int]) -> dict[str, Any]:
+    """Builds a wire-shape keyframe for the frontend's `MaskKeyframe` contract:
+    `t` (CLIP-relative seconds), `x`/`y`/`width`/`height` (percent-of-frame,
+    from `bbox_to_transform`), and `rotation` (always 0.0 — CSRT tracks an
+    axis-aligned box and never estimates rotation, so we emit it explicitly
+    rather than omitting it and letting the frontend read `undefined`).
+    `frame`/`time` (source-absolute) are kept alongside for debugging only;
+    the frontend never reads them.
+    """
+    transform = bbox_to_transform(bbox, frame_size)
+    source_time = frame_idx / fps if fps > 0 else 0.0
+    return {
+        "frame": frame_idx,
+        "time": source_time,
+        "t": source_time - clip_start,
+        "rotation": 0.0,
+        **transform,
+    }
+
+
 def _track_direction(
     cv2,
     cap,
@@ -165,10 +236,14 @@ def _track_direction(
     stride: int,
     step: int,  # +1 forward, -1 backward
     total_frames: int,
+    clip_start: float,
+    clip_end_frame: int,
     db,
     ai_result_id: int,
 ) -> tuple[list[dict[str, Any]], int | None]:
-    """Track from `start_frame_idx` in `step` direction. Returns
+    """Track from `start_frame_idx` in `step` direction, bounded at
+    `clip_end_frame` going forward and at `clip_start`'s frame going
+    backward (never past the source video's own bounds either). Returns
     (keyframes, lost_at_frame_or_None). Never emits keyframes past the loss
     point. Re-checks cancellation every `_CANCEL_CHECK_STRIDE` frames."""
     keyframes: list[dict[str, Any]] = []
@@ -182,10 +257,13 @@ def _track_direction(
         return keyframes, frame_idx
     tracker.init(frame, bbox)
 
+    lower_bound = max(0, round(clip_start * fps)) if fps > 0 else 0
+    upper_bound = min(total_frames - 1, clip_end_frame)
+
     frames_seen = 0
     while True:
         next_idx = frame_idx + step
-        if next_idx < 0 or next_idx >= total_frames:
+        if next_idx < lower_bound or next_idx > upper_bound:
             break
 
         frames_seen += 1
@@ -211,8 +289,7 @@ def _track_direction(
             return keyframes, frame_idx
 
         if frame_idx % stride == 0:
-            transform = bbox_to_transform(bbox, frame_size)
-            keyframes.append({"frame": frame_idx, "time": frame_idx / fps if fps > 0 else 0.0, **transform})
+            keyframes.append(_make_keyframe(frame_idx, fps, clip_start, bbox, frame_size))
 
     return keyframes, None
 
@@ -222,6 +299,10 @@ def mask_track_job(ai_result_id: int) -> None:
     try:
         row = db.query(AiResult).filter(AiResult.id == ai_result_id).first()
         if row is None or row.result_type != "mask_track":
+            return
+
+        if row.status not in ("queued", "processing"):
+            # Already cancelled/failed before the worker picked it up.
             return
 
         payload = dict(row.result_data or {})
@@ -237,16 +318,29 @@ def mask_track_job(ai_result_id: int) -> None:
 
         mask = payload.get("mask") if isinstance(payload.get("mask"), dict) else {}
         direction = str(payload.get("direction") or "both").strip().lower()
+        # `anchorTime`/`clipStart`/`clipEnd` are all CLIP-relative seconds, as
+        # sent by the frontend (see MaskTrackBody in app/api/routes/ai.py).
+        # The source video frame index is `(clip_start + anchor_time) * fps`.
+        # Every keyframe's `t` emitted below is likewise clip-relative
+        # (`source_frame / fps - clip_start`) -- this convention must not
+        # drift, since the frontend's MaskKeyframe.t is defined as
+        # clip-relative seconds.
         anchor_time = float(payload.get("anchorTime") or 0.0)
+        clip_start = float(payload.get("clipStart") or 0.0)
+        clip_end = float(payload.get("clipEnd") or 0.0)
         source_url = payload.get("sourceUrl")
 
         media_src = _resolve_media_source(video, source_url)
+        # SSRF guard (I7): reject non-http(s) schemes and private/loopback/
+        # link-local hosts before ever handing the source to OpenCV. Do not
+        # echo `media_src` in any error raised from here on.
+        _assert_media_source_safe(media_src)
 
         import cv2
 
         cap = cv2.VideoCapture(media_src)
         if not cap.isOpened():
-            raise RuntimeError(f"Could not open media source for tracking: {media_src}")
+            raise RuntimeError("Could not open media source for tracking.")
 
         try:
             frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -257,17 +351,22 @@ def mask_track_job(ai_result_id: int) -> None:
                 raise RuntimeError("Could not read frame dimensions from media source")
             frame_size = (frame_w, frame_h)
 
-            anchor_frame = max(0, int(round(anchor_time * fps)))
+            # Source-absolute frame index for the clip-relative anchor time.
+            anchor_frame = max(0, int(round((clip_start + anchor_time) * fps)))
             anchor_frame = min(anchor_frame, max(0, total_frames - 1))
             stride = keyframe_stride(total_frames)
 
+            # Bound the pass at the clip's own range so tracking never wanders
+            # into footage outside the keep-range the user is masking.
+            clip_end_frame = (
+                min(total_frames - 1, int(round(clip_end * fps)) - 1)
+                if clip_end > clip_start
+                else total_frames - 1
+            )
+            clip_end_frame = max(anchor_frame, clip_end_frame)
+
             initial_bbox = transform_to_bbox(mask, frame_size)
-            anchor_transform = bbox_to_transform(initial_bbox, frame_size)
-            anchor_keyframe = {
-                "frame": anchor_frame,
-                "time": anchor_frame / fps if fps > 0 else anchor_time,
-                **anchor_transform,
-            }
+            anchor_keyframe = _make_keyframe(anchor_frame, fps, clip_start, initial_bbox, frame_size)
 
             lost_at: int | None = None
             keyframes: list[dict[str, Any]] = [anchor_keyframe]
@@ -283,6 +382,8 @@ def mask_track_job(ai_result_id: int) -> None:
                     stride=stride,
                     step=1,
                     total_frames=total_frames,
+                    clip_start=clip_start,
+                    clip_end_frame=clip_end_frame,
                     db=db,
                     ai_result_id=ai_result_id,
                 )
@@ -302,6 +403,8 @@ def mask_track_job(ai_result_id: int) -> None:
                     stride=stride,
                     step=-1,
                     total_frames=total_frames,
+                    clip_start=clip_start,
+                    clip_end_frame=clip_end_frame,
                     db=db,
                     ai_result_id=ai_result_id,
                 )
@@ -326,7 +429,9 @@ def mask_track_job(ai_result_id: int) -> None:
         final_payload["progress"] = 100
         if lost_at is not None:
             final_payload["status"] = "partial"
-            final_payload["lostAt"] = lost_at
+            # Clip-relative seconds, matching the frontend's `formatMinSec`
+            # rendering of `lostAt` -- NOT a source-absolute frame index.
+            final_payload["lostAt"] = (lost_at / fps if fps > 0 else 0.0) - clip_start
             row.status = "partial"
         else:
             final_payload["status"] = "completed"

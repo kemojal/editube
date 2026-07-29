@@ -1,7 +1,11 @@
+import math
 import unittest
 
 from app.jobs.mask_track import (
+    UnsafeMediaSourceError,
+    _assert_media_source_safe,
     _box_left_frame,
+    _make_keyframe,
     bbox_to_transform,
     keyframe_stride,
     transform_to_bbox,
@@ -96,6 +100,75 @@ class BoxLeftFrameTests(unittest.TestCase):
         # target; this only guards against a degenerate/corrupt bbox so the
         # job fails safe (stops) rather than tracking a phantom point.
         self.assertTrue(_box_left_frame((800, 400, 0, 0), self.SIZE))
+
+
+class EmittedKeyframeWireShapeTests(unittest.TestCase):
+    """Guards the C1/C2 regression: the frontend's `MaskKeyframe` reads `t`
+    (clip-relative seconds) and `rotation`, and does bare arithmetic on them
+    (`keyframe.t`, `keyframe.rotation - rotationDeg`) with no defensive
+    checks, so a missing/NaN field silently propagates to a rendered
+    `M NaN,NaN` mask path. Every emitted keyframe must carry exactly the
+    keys the frontend consumes, all finite."""
+
+    SIZE = (1920, 1080)
+    EXPECTED_KEYS = {"t", "x", "y", "width", "height", "rotation"}
+
+    def test_emitted_keyframe_has_exactly_the_expected_keys(self):
+        kf = _make_keyframe(90, 30.0, 0.0, (100, 100, 200, 200), self.SIZE)
+        self.assertTrue(self.EXPECTED_KEYS.issubset(kf.keys()))
+        for key in self.EXPECTED_KEYS:
+            self.assertTrue(math.isfinite(kf[key]), f"{key} is not finite: {kf[key]!r}")
+
+    def test_rotation_is_explicit_zero_not_omitted(self):
+        kf = _make_keyframe(0, 30.0, 0.0, (0, 0, 100, 100), self.SIZE)
+        self.assertIn("rotation", kf)
+        self.assertEqual(kf["rotation"], 0.0)
+
+    def test_t_is_clip_relative_not_source_absolute(self):
+        # Source frame 90 at 30fps is 3.0s source-absolute; with a clip that
+        # starts 2.0s into the source, the clip-relative `t` must be 1.0s.
+        kf = _make_keyframe(90, 30.0, clip_start=2.0, bbox=(0, 0, 100, 100), frame_size=self.SIZE)
+        self.assertAlmostEqual(kf["t"], 1.0, places=6)
+        self.assertAlmostEqual(kf["time"], 3.0, places=6)
+
+
+class MediaSourceSsrfGuardTests(unittest.TestCase):
+    """I7: the tracking endpoint's `source_url` reaches `cv2.VideoCapture`
+    directly, so it must be scheme- and host-allowlisted."""
+
+    def test_local_filesystem_path_passes_through(self):
+        _assert_media_source_safe("/uploads/videos/abc.mp4")
+
+    def test_https_public_looking_host_passes(self):
+        _assert_media_source_safe("https://example.com/video.mp4")
+
+    def test_rejects_non_http_scheme(self):
+        with self.assertRaises(UnsafeMediaSourceError):
+            _assert_media_source_safe("file:///etc/passwd")
+
+    def test_rejects_rtsp_scheme(self):
+        with self.assertRaises(UnsafeMediaSourceError):
+            _assert_media_source_safe("rtsp://example.com/stream")
+
+    def test_rejects_link_local_metadata_host(self):
+        with self.assertRaises(UnsafeMediaSourceError):
+            _assert_media_source_safe("http://169.254.169.254/latest/meta-data/")
+
+    def test_rejects_loopback_host(self):
+        with self.assertRaises(UnsafeMediaSourceError):
+            _assert_media_source_safe("http://127.0.0.1:8000/internal")
+
+    def test_rejects_private_network_host(self):
+        with self.assertRaises(UnsafeMediaSourceError):
+            _assert_media_source_safe("http://10.0.0.5/video.mp4")
+
+    def test_error_message_never_echoes_the_source(self):
+        try:
+            _assert_media_source_safe("http://169.254.169.254/secret")
+        except UnsafeMediaSourceError as exc:
+            self.assertNotIn("169.254.169.254", str(exc))
+        else:
+            self.fail("expected UnsafeMediaSourceError")
 
 
 if __name__ == "__main__":
