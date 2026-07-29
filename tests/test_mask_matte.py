@@ -3,8 +3,10 @@ import unittest
 
 from app.services.mask_matte import (
     MAX_MASKS,
+    MAX_MATTE_FRAMES,
     MAX_POINTS_PER_STROKE,
     render_matte_frame,
+    render_matte_video,
     sanitize_mask,
     sanitize_masks,
 )
@@ -28,6 +30,43 @@ def circle(**overrides):
     }
     mask.update(overrides)
     return mask
+
+
+def brush(strokes, **overrides):
+    mask = {
+        "id": "m1",
+        "shape": "brush",
+        "enabled": True,
+        "op": "add",
+        "space": "clip",
+        "invert": False,
+        "x": 0,
+        "y": 0,
+        "width": 100,
+        "height": 100,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "strokes": strokes,
+    }
+    mask.update(overrides)
+    return mask
+
+
+class RenderMatteVideoFrameCapTests(unittest.TestCase):
+    """I8: an unbounded/hostile `duration` must fail loudly rather than
+    pinning the worker rasterising frames until the multi-hour job timeout."""
+
+    def test_rejects_duration_that_would_exceed_the_frame_cap(self):
+        huge_duration = (MAX_MATTE_FRAMES + 100) / 30.0
+        with self.assertRaises(RuntimeError):
+            render_matte_video(
+                [circle()],
+                duration=huge_duration,
+                fps=30.0,
+                size=(64, 64),
+                out_path=None,  # never reached -- the cap check raises first
+            )
 
 
 class RenderMatteFrameTests(unittest.TestCase):
@@ -67,6 +106,20 @@ class RenderMatteFrameTests(unittest.TestCase):
         edge_values = {soft.getpixel((x, 100)) for x in range(40, 160)}
         self.assertTrue(any(0 < value < 255 for value in edge_values))
         self.assertNotEqual(hard.tobytes(), soft.tobytes())
+
+    def test_eraser_stroke_only_erases_itself_not_the_whole_mask(self):
+        # I5 regression: one eraser dab must not wipe every other stroke in
+        # the same brush mask. A normal stroke on the left, an erase stroke
+        # on the right; the normal stroke's paint must survive.
+        strokes = [
+            {"points": [0.15, 0.5, 0.35, 0.5], "size": 20, "erase": False},
+            {"points": [0.65, 0.5, 0.85, 0.5], "size": 20, "erase": True},
+        ]
+        image = render_matte_frame([brush(strokes)], 0.0, self.SIZE)
+        # Centre of the normal stroke: (0.25 * 200, 0.5 * 200) = (50, 100).
+        self.assertEqual(image.getpixel((50, 100)), 255)
+        # Centre of the erase stroke never painted: still background black.
+        self.assertEqual(image.getpixel((150, 100)), 0)
 
     def test_inert_masks_render_nothing_rather_than_blacking_the_frame(self):
         image = render_matte_frame([{"shape": "brush", "enabled": True, "op": "add"}], 0.0, self.SIZE)

@@ -41,6 +41,13 @@ MAX_POINTS_PER_STROKE = 4000  # flat [x0, y0, x1, y1, ...] pairs -> 2000 points
 MAX_PATH_POINTS = 500
 MAX_KEYFRAMES = 200
 
+# I8: `duration` is caller-supplied (derived from a keep-range) and was
+# never clamped against the probed source duration, so a hostile/malformed
+# payload (e.g. `end: 1e9`) could pin a worker rasterising matte frames
+# until the multi-hour job timeout. This is the hard ceiling on top of
+# whatever the caller passes in.
+MAX_MATTE_FRAMES = 216_000  # 1hr @ 60fps
+
 _VALID_OPS = {"add", "subtract", "intersect"}
 _VALID_SHAPES = {
     "rectangle",
@@ -218,50 +225,72 @@ def render_matte_frame(masks: list[dict[str, Any]], t: float, size: tuple[int, i
     matte = Image.new("L", size, 0)
 
     for mask in masks:
-        polys = mask_polygons(mask, t, frame_aspect)
-        if not polys:
-            continue
-
-        layer = Image.new("L", size, 0)
-        draw = ImageDraw.Draw(layer)
-        any_erase = False
-        for poly in polys:
-            pts = _scale_points(poly.points, sx, sy)
-            if len(pts) < 2:
+        # I11: one mask with a rendering bug (bad geometry, PIL error, ...)
+        # must not silently drop the entire mask stack for the frame -- skip
+        # only this mask and keep compositing the rest.
+        try:
+            polys = mask_polygons(mask, t, frame_aspect)
+            if not polys:
                 continue
-            if poly.stroke_width > 0:
-                stroke_w = max(1, round(poly.stroke_width * ((sx + sy) / 2)))
-                draw.line(pts, fill=255, width=stroke_w, joint="curve")
-                # Round the caps so strokes don't look chopped at the ends.
-                r = stroke_w / 2
-                for px, py in (pts[0], pts[-1]):
-                    draw.ellipse([px - r, py - r, px + r, py + r], fill=255)
-            elif len(pts) >= 3:
-                draw.polygon(pts, fill=255)
-            if poly.erase:
-                any_erase = True
 
-        feather = float(mask.get("feather") or 0)
-        if feather > 0:
-            radius = feather * ((sx + sy) / 2) * (VIEWBOX / 1000) / 10
-            if radius > 0:
-                layer = layer.filter(ImageFilter.GaussianBlur(radius=radius))
+            layer = Image.new("L", size, 0)
+            draw = ImageDraw.Draw(layer)
+            # Mirrors mask-svg-defs.tsx: strokes/shapes paint white into this
+            # layer (the mask's `op` -- add/subtract/intersect -- is applied
+            # afterwards when compositing `layer` onto `matte` below, same as
+            # every other shape). Erase strokes are the one exception: they
+            # always paint black, cutting a hole in *this layer only* -- a
+            # single eraser dab must not wipe strokes painted before or after
+            # it, let alone the whole mask (the I5 bug: the old code
+            # subtracted the entire layer from the matte whenever any stroke
+            # in it had `erase`, deleting every other stroke too).
+            for poly in polys:
+                pts = _scale_points(poly.points, sx, sy)
+                if len(pts) < 2:
+                    continue
+                color = 0 if poly.erase else 255
+                if poly.stroke_width > 0:
+                    stroke_w = max(1, round(poly.stroke_width * ((sx + sy) / 2)))
+                    draw.line(pts, fill=color, width=stroke_w, joint="curve")
+                    # Round the caps so strokes don't look chopped at the ends.
+                    r = stroke_w / 2
+                    for px, py in (pts[0], pts[-1]):
+                        draw.ellipse([px - r, py - r, px + r, py + r], fill=color)
+                elif len(pts) >= 3:
+                    draw.polygon(pts, fill=color)
 
-        if mask.get("invert"):
-            layer = ImageChops.invert(layer)
+            feather = float(mask.get("feather") or 0)
+            if feather > 0:
+                # Matches the TS reference (`mask-svg-defs.tsx`'s
+                # `feGaussianBlur` stdDeviation): scales with the mask's own
+                # footprint rather than a fixed fraction of the viewBox, so
+                # preview and export feather by comparable amounts instead of
+                # ~10x apart. Note: the TS side blurs isotropically off the
+                # mask's *base* spec width/height, not the per-frame sampled
+                # transform -- so under a keyframed size change (mask
+                # growing/shrinking over time) this still won't be
+                # pixel-exact between preview and export; it fixes the
+                # order-of-magnitude mismatch, not full parity.
+                base_w = float(mask.get("width") or 0)
+                base_h = float(mask.get("height") or 0)
+                shorter = min(base_w, base_h) if base_w > 0 and base_h > 0 else 0.0
+                radius = (feather / 100.0) * shorter * (VIEWBOX / 100.0) * 0.25 * ((sx + sy) / 2)
+                if radius > 0:
+                    layer = layer.filter(ImageFilter.GaussianBlur(radius=radius))
 
-        if any_erase and mask.get("shape") == "brush":
-            # Eraser strokes always cut a hole, regardless of the mask's op.
-            matte = ImageChops.subtract(matte, layer)
+            if mask.get("invert"):
+                layer = ImageChops.invert(layer)
+
+            op = mask.get("op", "add")
+            if op == "subtract":
+                matte = ImageChops.subtract(matte, layer)
+            elif op == "intersect":
+                matte = ImageChops.darker(matte, layer)
+            else:  # "add"
+                matte = ImageChops.lighter(matte, layer)
+        except Exception:
+            logger.exception("render_matte_frame: skipping mask %r at t=%s due to render error", mask.get("id"), t)
             continue
-
-        op = mask.get("op", "add")
-        if op == "subtract":
-            matte = ImageChops.subtract(matte, layer)
-        elif op == "intersect":
-            matte = ImageChops.darker(matte, layer)
-        else:  # "add"
-            matte = ImageChops.lighter(matte, layer)
 
     return matte
 
@@ -287,6 +316,11 @@ def render_matte_video(
     duration = max(0.04, float(duration) if duration and math.isfinite(duration) else 0.04)
     width, height = size
     frame_count = max(1, round(duration * fps))
+    if frame_count > MAX_MATTE_FRAMES:
+        raise RuntimeError(
+            f"Matte segment would render {frame_count} frames, exceeding the "
+            f"{MAX_MATTE_FRAMES}-frame cap (duration={duration:.1f}s @ {fps:.2f}fps)."
+        )
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -324,6 +358,13 @@ def render_matte_video(
             raise RuntimeError((stderr or b"").decode("utf-8", "replace")[-4000:])
     except Exception:
         proc.kill()
+        # Reap the killed process -- `kill()` alone leaves it a zombie /
+        # its pipes open until someone waits on it, leaking FDs across a
+        # long-running worker.
+        try:
+            proc.communicate(timeout=30)
+        except Exception:
+            logger.exception("render_matte_video: failed to reap killed ffmpeg process")
         raise
 
     return out_path
