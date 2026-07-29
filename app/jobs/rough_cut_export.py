@@ -144,6 +144,28 @@ def _normalize_ranges(raw: object, max_end: float | None = None) -> list[tuple[f
     return out
 
 
+def _masked_filter_complex(vf: str, scale_w: int, scale_h: int) -> str:
+    """Builds the `-filter_complex` for a masked export segment.
+
+    Trap: `scale`/`pad` (baked into `vf`) genuinely take colon-separated
+    "W:H" ("1920:1080"); ffmpeg's `color` source does NOT -- it wants
+    "WxH" ("1920x1080") and silently mis-parses the colon form
+    ("No option name near '1080'"), which used to fail every masked
+    export outright (this is not caught by the matte fail-open guard --
+    that only wraps `render_matte_video`, not this ffmpeg invocation).
+    Pass `color` its size as `f"{scale_w}x{scale_h}"`, built from the
+    already-int scale_w/scale_h rather than string-munging the colon-form
+    `scale` string, so the two forms cannot drift back together.
+    """
+    color_size = f"{scale_w}x{scale_h}"
+    return (
+        f"[0:v]{vf}[base];"
+        f"[base][1:v]alphamerge[m];"
+        f"color=black:s={color_size}[bg];"
+        f"[bg][m]overlay=shortest=1[v]"
+    )
+
+
 def _fps_filter_part(settings: dict[str, Any], source_video: str) -> str:
     """Return ffmpeg vf fragment e.g. ',fps=30' or ',fps=30000/1001' or empty."""
     fr = str(settings.get("frameRate") or "source").lower().strip()
@@ -395,12 +417,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                             mask_render_failed_for_segment = True
 
                     if matte_path is not None:
-                        filter_complex = (
-                            f"[0:v]{vf}[base];"
-                            f"[base][1:v]alphamerge[m];"
-                            f"color=black:s={scale}[bg];"
-                            f"[bg][m]overlay=shortest=1[v]"
-                        )
+                        filter_complex = _masked_filter_complex(vf, scale_w, scale_h)
                         _run_ffmpeg(
                             [
                                 "ffmpeg",
