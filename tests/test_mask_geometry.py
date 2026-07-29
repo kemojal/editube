@@ -87,7 +87,7 @@ def _sha256(path: Path) -> str:
 
 # Shapes whose golden `pathTokens` are groups of 5: M(x,y) H(x) V(y) H(x),
 # i.e. an axis-aligned, unrounded rectangle's 4 corners.
-RECT_GROUP_SHAPES = {"split", "filmstrip", "text"}
+RECT_GROUP_SHAPES = {"split", "filmstrip"}
 
 
 def _decode_rect_groups(tokens: list[float]) -> list[tuple[float, float]]:
@@ -169,9 +169,13 @@ class MaskGeometryParityTests(unittest.TestCase):
     def _case(self, name):
         return next(c for c in self.cases if c["name"] == name)
 
-    def test_fixture_covers_every_shape(self):
+    def test_fixture_covers_every_pathed_shape(self):
+        # Eight, not nine: `text` is rasterised, not pathed -- it produces no
+        # polygon at all (see `mask_polygons`), so its cross-language parity
+        # lives in tests/test_mask_text.py against mask-text-golden.json.
         shapes = {case["mask"]["shape"] for case in self.cases}
-        self.assertGreaterEqual(len(shapes), 9)
+        self.assertGreaterEqual(len(shapes), 8)
+        self.assertNotIn("text", shapes)
 
     def test_sampled_transform_matches_typescript(self):
         for case in self.cases:
@@ -234,13 +238,6 @@ class MaskGeometryParityTests(unittest.TestCase):
         want_flat = _decode_rect_groups(case["expect"]["pathTokens"])
         polys = mask_polygons(case["mask"], case["t"], case["frameAspect"])
         self.assertEqual(len(polys), 1)
-        got_flat = [p for poly in polys for p in poly.points]
-        _assert_points_almost_equal(self, got_flat, want_flat)
-
-        # text: bar + stem, each an unrounded rect group, two MaskPolygons.
-        case = self._case("text-t")
-        want_flat = _decode_rect_groups(case["expect"]["pathTokens"])
-        polys = mask_polygons(case["mask"], case["t"], case["frameAspect"])
         got_flat = [p for poly in polys for p in poly.points]
         _assert_points_almost_equal(self, got_flat, want_flat)
 

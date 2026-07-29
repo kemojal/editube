@@ -29,6 +29,7 @@ from typing import Any
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from app.services.mask_geometry import VIEWBOX, expansion_radius, mask_is_inert, mask_polygons
+from app.services.mask_text import DEFAULT_MASK_FONT_ID, render_text_layer
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,11 @@ MAX_KEYFRAMES = 200
 # until the multi-hour job timeout. This is the hard ceiling on top of
 # whatever the caller passes in.
 MAX_MATTE_FRAMES = 216_000  # 1hr @ 60fps
+
+MAX_TEXT_LENGTH = 500  # mirrors MASK_TEXT_MAX_LENGTH in mask-types.ts
+
+_VALID_TEXT_ALIGNS = {"left", "center", "right"}
+_VALID_TEXT_VALIGNS = {"top", "middle", "bottom"}
 
 _VALID_OPS = {"add", "subtract", "intersect"}
 _VALID_SHAPES = {
@@ -219,6 +225,25 @@ def sanitize_mask(raw: Any) -> dict[str, Any] | None:
         "expansion": _clamp(_finite(raw.get("expansion")), -100, 100),
     }
 
+    if shape == "text":
+        # Mirrors the frontend sanitiser's text block (mask-sanitize.ts).
+        # Masks arrive straight from a request body, so every one of these is
+        # clamped/defaulted here too -- a NaN fontSize or a 10MB `text` must
+        # not reach Pillow. Ranges match the TS side exactly.
+        raw_text = raw.get("text")
+        out["text"] = str(raw_text)[:MAX_TEXT_LENGTH] if isinstance(raw_text, str) else "Text"
+        font_id = raw.get("fontId")
+        out["fontId"] = font_id.strip()[:64] if isinstance(font_id, str) and font_id.strip() else DEFAULT_MASK_FONT_ID
+        out["fontSize"] = _clamp(_finite(raw.get("fontSize"), 20), 0.5, 200)
+        out["bold"] = bool(raw.get("bold", False))
+        out["underline"] = bool(raw.get("underline", False))
+        out["italic"] = bool(raw.get("italic", False))
+        out["letterSpacing"] = _clamp(_finite(raw.get("letterSpacing")), -50, 200)
+        out["lineSpacing"] = _clamp(_finite(raw.get("lineSpacing"), 120), 10, 400)
+        out["align"] = raw.get("align") if raw.get("align") in _VALID_TEXT_ALIGNS else "center"
+        out["alignV"] = raw.get("alignV") if raw.get("alignV") in _VALID_TEXT_VALIGNS else "middle"
+        out["zoom"] = _clamp(_finite(raw.get("zoom"), 100), 1, 400)
+
     keyframes = raw.get("keyframes")
     if _looks_like_legacy_keyframe_array(keyframes):
         migrated = _migrate_legacy_keyframes(keyframes)
@@ -280,15 +305,27 @@ def _scale_points(points: list[tuple[float, float]], sx: float, sy: float) -> li
     return [(x * sx, y * sy) for x, y in points]
 
 
-def render_matte_frame(masks: list[dict[str, Any]], t: float, size: tuple[int, int]) -> Image.Image:
+def render_matte_frame(
+    masks: list[dict[str, Any]],
+    t: float,
+    size: tuple[int, int],
+    font_warnings: set[str] | None = None,
+) -> Image.Image:
     """Renders a single grayscale matte frame at time `t` for output `size`.
 
     White = keep, black = hide. If every mask is inert (disabled, degenerate,
     or an empty payload) the result is fully white — "no masking" — never a
     black frame; a black start would blank the whole video for every export
     where masking is simply absent.
+
+    `font_warnings`, if given, collects the ids of any text-mask fonts this
+    repo does not ship. The vendored default is substituted so the export
+    still renders, but never silently: `render_matte_video` hands the set up
+    to the export job, which surfaces it in the job's warnings.
     """
     masks = sanitize_masks(masks)
+    if font_warnings is None:
+        font_warnings = set()
     width, height = size
     frame_aspect = width / height if height else 1.0
 
@@ -305,12 +342,35 @@ def render_matte_frame(masks: list[dict[str, Any]], t: float, size: tuple[int, i
         # must not silently drop the entire mask stack for the frame -- skip
         # only this mask and keep compositing the rest.
         try:
-            polys = mask_polygons(mask, t, frame_aspect)
-            if not polys:
+            is_text = mask.get("shape") == "text"
+            polys = [] if is_text else mask_polygons(mask, t, frame_aspect)
+            if not polys and not is_text:
                 continue
 
             layer = Image.new("L", size, 0)
             draw = ImageDraw.Draw(layer)
+
+            if is_text:
+                # Text rasterises glyphs rather than filling a polygon. It
+                # always paints WHITE into its own layer, exactly like every
+                # shape above -- the mask's op/invert are applied when this
+                # layer is composited onto the matte below.
+                layout = render_text_layer(draw, mask, t, frame_aspect, sx, sy, 255)
+                if layout is None:
+                    continue
+                if layout.font_fallback:
+                    font_warnings.add(layout.requested_font_id)
+                if layout.rotation % 360 != 0:
+                    # SVG's rotate() is clockwise on a y-down axis; PIL's
+                    # Image.rotate is counter-clockwise, hence the negation.
+                    # Rotating the rendered layer (rather than the glyphs) is
+                    # what the browser does too -- the <text> sits inside a
+                    # rotate() group.
+                    layer = layer.rotate(
+                        -layout.rotation,
+                        resample=Image.BICUBIC,
+                        center=(layout.centre_x * sx, layout.centre_y * sy),
+                    )
             # Mirrors mask-svg-defs.tsx: strokes/shapes paint white into this
             # layer (the mask's `op` -- add/subtract/intersect -- is applied
             # afterwards when compositing `layer` onto `matte` below, same as
@@ -400,6 +460,7 @@ def render_matte_video(
     fps: float,
     size: tuple[int, int],
     out_path: Path,
+    font_warnings: set[str] | None = None,
 ) -> Path | None:
     """Renders a grayscale FFV1/MKV matte video for a keep-range segment.
 
@@ -449,7 +510,7 @@ def render_matte_video(
         assert proc.stdin is not None
         for i in range(frame_count):
             t = i / fps
-            frame = render_matte_frame(clean, t, size)
+            frame = render_matte_frame(clean, t, size, font_warnings)
             proc.stdin.write(frame.tobytes())
         proc.stdin.close()
         _, stderr = proc.communicate(timeout=7200)

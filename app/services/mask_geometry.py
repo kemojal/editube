@@ -204,6 +204,12 @@ def _resolve_box(mask: dict[str, Any], transform: MaskTransform, frame_aspect: f
     )
 
 
+def resolve_box(mask: dict[str, Any], transform: MaskTransform, frame_aspect: float) -> _Box:
+    """Public alias of `_resolve_box` for the text layer, which lays glyphs
+    out inside the very same box every parametric shape uses."""
+    return _resolve_box(mask, transform, frame_aspect)
+
+
 def maskIsInert(mask: dict[str, Any]) -> bool:  # noqa: N802 - kept for direct TS-name grep-ability
     return mask_is_inert(mask)
 
@@ -219,6 +225,9 @@ def mask_is_inert(mask: dict[str, Any]) -> bool:
         path = mask.get("path")
         points = path["points"] if path else []
         return len(points) < 3
+    if shape == "text":
+        # An empty textarea paints nothing -- it must not black out the frame.
+        return not str(mask.get("text") or "").strip()
     if shape == "split":
         return False
     return mask["width"] <= 0 or mask["height"] <= 0
@@ -375,34 +384,6 @@ def _heart_points(box: _Box) -> list[tuple[float, float]]:
     return points
 
 
-def _text_polygons(box: _Box, roundness: float) -> list[MaskPolygon]:
-    stem_width = box.width * 0.26
-    bar_height = box.height * 0.24
-    bar_box = _Box(
-        centre_x=box.centre_x,
-        centre_y=box.top + bar_height / 2,
-        width=box.width,
-        height=bar_height,
-        left=box.left,
-        top=box.top,
-    )
-    stem_left = box.centre_x - stem_width / 2
-    stem_top = box.top + bar_height
-    stem_height = box.height - bar_height
-    stem_box = _Box(
-        centre_x=box.centre_x,
-        centre_y=stem_top + stem_height / 2,
-        width=stem_width,
-        height=stem_height,
-        left=stem_left,
-        top=stem_top,
-    )
-    return [
-        MaskPolygon(points=_rounded_rectangle_points(bar_box, roundness)),
-        MaskPolygon(points=_rounded_rectangle_points(stem_box, roundness)),
-    ]
-
-
 def freehand_project(transform: MaskTransform):
     scale_x = transform.width / 100
     scale_y = transform.height / 100
@@ -519,7 +500,12 @@ def mask_polygons(mask: dict[str, Any], t: float, frame_aspect: float) -> list[M
     elif shape == "heart":
         polys = [MaskPolygon(points=_heart_points(box))]
     elif shape == "text":
-        polys = _text_polygons(box, mask.get("roundness", 0))
+        # Text has no polygon: it is RASTERISED, not outlined -- the browser
+        # emits <text>/<tspan> and this repo draws with Pillow, both laid out
+        # by `mask_text.mask_text_layout`. `mask_matte.render_matte_frame`
+        # special-cases the shape; every polygon consumer correctly gets
+        # nothing here.
+        polys = []
     elif shape == "brush":
         polys = _brush_polygons(mask, transform)
     elif shape == "pen":

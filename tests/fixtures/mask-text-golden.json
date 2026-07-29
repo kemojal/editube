@@ -1,0 +1,302 @@
+{
+  "version": 1,
+  "_note": "Shared text-mask layout fixture. Generated once and then hand-maintained; both mask-text.ts (preview) and app/services/mask_text.py (export) must reproduce every value. `expect: null` means the mask paints nothing.",
+  "cases": [
+    {
+      "name": "text-single-default",
+      "mask": {
+        "id": "t",
+        "shape": "text",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "expansion": 0,
+        "text": "Hi",
+        "fontId": "vera-sans",
+        "fontSize": 20,
+        "bold": false,
+        "underline": false,
+        "italic": false,
+        "letterSpacing": 0,
+        "lineSpacing": 120,
+        "align": "center",
+        "alignV": "middle",
+        "zoom": 100
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "fontId": "vera-sans",
+        "requestedFontId": "vera-sans",
+        "fontFallback": false,
+        "styleKey": "regular",
+        "fontFile": "Vera.ttf",
+        "underline": false,
+        "fontSizeVb": 200.0,
+        "lineStep": 240.0,
+        "letterSpacingVb": 0.0,
+        "anchor": "middle",
+        "pillowAnchor": "ms",
+        "align": "center",
+        "alignV": "middle",
+        "underlineOffsetVb": 20.8008,
+        "underlineThicknessVb": 13.9648,
+        "rotation": 0,
+        "centreX": 500.0,
+        "centreY": 500.0,
+        "lines": [
+          {
+            "text": "Hi",
+            "x": 500.0,
+            "baselineY": 560.0
+          }
+        ]
+      }
+    },
+    {
+      "name": "text-multiline-large-styled",
+      "mask": {
+        "id": "t",
+        "shape": "text",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 10,
+        "y": -5,
+        "width": 60,
+        "height": 50,
+        "rotation": 12,
+        "feather": 0,
+        "roundness": 0,
+        "expansion": 0,
+        "text": "Line one\nLine two\nThird",
+        "fontId": "vera-sans",
+        "fontSize": 12,
+        "bold": true,
+        "underline": true,
+        "italic": true,
+        "letterSpacing": 10,
+        "lineSpacing": 150,
+        "align": "left",
+        "alignV": "top",
+        "zoom": 125
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "fontId": "vera-sans",
+        "requestedFontId": "vera-sans",
+        "fontFallback": false,
+        "styleKey": "boldItalic",
+        "fontFile": "VeraBI.ttf",
+        "underline": true,
+        "fontSizeVb": 150.0,
+        "lineStep": 225.0,
+        "letterSpacingVb": 15.0,
+        "anchor": "start",
+        "pillowAnchor": "ls",
+        "align": "left",
+        "alignV": "top",
+        "underlineOffsetVb": 15.6006,
+        "underlineThicknessVb": 10.4736,
+        "rotation": 12,
+        "centreX": 600.0,
+        "centreY": 450.0,
+        "lines": [
+          {
+            "text": "Line one",
+            "x": 300.0,
+            "baselineY": 320.0
+          },
+          {
+            "text": "Line two",
+            "x": 300.0,
+            "baselineY": 545.0
+          },
+          {
+            "text": "Third",
+            "x": 300.0,
+            "baselineY": 770.0
+          }
+        ]
+      }
+    },
+    {
+      "name": "text-zoom-keyframed-mid",
+      "mask": {
+        "id": "t",
+        "shape": "text",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "expansion": 0,
+        "text": "Zoom\nme",
+        "fontId": "vera-sans",
+        "fontSize": 20,
+        "bold": false,
+        "underline": false,
+        "italic": false,
+        "letterSpacing": 0,
+        "lineSpacing": 120,
+        "align": "right",
+        "alignV": "bottom",
+        "zoom": 100,
+        "keyframes": {
+          "zoom": [
+            {
+              "t": 0,
+              "v": 50
+            },
+            {
+              "t": 2,
+              "v": 200
+            }
+          ]
+        }
+      },
+      "t": 1,
+      "frameAspect": 1.0,
+      "expect": {
+        "fontId": "vera-sans",
+        "requestedFontId": "vera-sans",
+        "fontFallback": false,
+        "styleKey": "regular",
+        "fontFile": "Vera.ttf",
+        "underline": false,
+        "fontSizeVb": 250.0,
+        "lineStep": 300.0,
+        "letterSpacingVb": 0.0,
+        "anchor": "end",
+        "pillowAnchor": "rs",
+        "align": "right",
+        "alignV": "bottom",
+        "underlineOffsetVb": 26.001,
+        "underlineThicknessVb": 17.4561,
+        "rotation": 0,
+        "centreX": 500.0,
+        "centreY": 500.0,
+        "lines": [
+          {
+            "text": "Zoom",
+            "x": 700.0,
+            "baselineY": 350.0
+          },
+          {
+            "text": "me",
+            "x": 700.0,
+            "baselineY": 650.0
+          }
+        ]
+      }
+    },
+    {
+      "name": "text-unknown-font-falls-back",
+      "mask": {
+        "id": "t",
+        "shape": "text",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "expansion": 0,
+        "text": "Text",
+        "fontId": "not-shipped-font",
+        "fontSize": 20,
+        "bold": false,
+        "underline": false,
+        "italic": false,
+        "letterSpacing": 0,
+        "lineSpacing": 120,
+        "align": "center",
+        "alignV": "middle",
+        "zoom": 100
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "fontId": "vera-sans",
+        "requestedFontId": "not-shipped-font",
+        "fontFallback": true,
+        "styleKey": "regular",
+        "fontFile": "Vera.ttf",
+        "underline": false,
+        "fontSizeVb": 200.0,
+        "lineStep": 240.0,
+        "letterSpacingVb": 0.0,
+        "anchor": "middle",
+        "pillowAnchor": "ms",
+        "align": "center",
+        "alignV": "middle",
+        "underlineOffsetVb": 20.8008,
+        "underlineThicknessVb": 13.9648,
+        "rotation": 0,
+        "centreX": 500.0,
+        "centreY": 500.0,
+        "lines": [
+          {
+            "text": "Text",
+            "x": 500.0,
+            "baselineY": 560.0
+          }
+        ]
+      }
+    },
+    {
+      "name": "text-empty-paints-nothing",
+      "mask": {
+        "id": "t",
+        "shape": "text",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "expansion": 0,
+        "text": "   ",
+        "fontId": "vera-sans",
+        "fontSize": 20,
+        "bold": false,
+        "underline": false,
+        "italic": false,
+        "letterSpacing": 0,
+        "lineSpacing": 120,
+        "align": "center",
+        "alignV": "middle",
+        "zoom": 100
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": null
+    }
+  ]
+}

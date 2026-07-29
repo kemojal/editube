@@ -342,6 +342,11 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
         # UI needs to know the result is unmasked, since a mask can be a
         # redaction, not just decoration.
         mask_render_failed_for_segment = False
+        # Text masks may name a font this worker does not ship; the vendored
+        # default is substituted so the export still renders, and the id is
+        # collected here so the result can say so instead of silently
+        # shipping a different typeface than the editor previewed.
+        mask_font_fallbacks: set[str] = set()
         matte_fps = _resolve_numeric_fps(settings, media_src) if (want_mp4_video and masks) else 30.0
         scale_w, scale_h = (0, 0)
         if want_mp4_video and masks:
@@ -402,6 +407,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                                 fps=matte_fps,
                                 size=(scale_w, scale_h),
                                 out_path=tmp_path / f"matte{index:03d}.mkv",
+                                font_warnings=mask_font_fallbacks,
                             )
                         except Exception:
                             # A masking bug must never fail the whole export —
@@ -635,6 +641,14 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 # failed to render, so this export shipped unmasked -- the UI
                 # must be able to warn the user (a mask can be a redaction).
                 meta["maskingFailed"] = True
+            if mask_font_fallbacks:
+                meta["warnings"] = [
+                    *meta.get("warnings", []),
+                    "Mask text font "
+                    + ", ".join(sorted(mask_font_fallbacks))
+                    + " is not available on the export worker; the default mask font was used instead.",
+                ]
+                meta["maskFontFallbacks"] = sorted(mask_font_fallbacks)
 
             if register_as_version and video is not None:
                 try:
