@@ -37,6 +37,7 @@ is bounding-box-identical with correct segment density — it does NOT prove
 curved-shape interiors are identical between the two renderers.
 """
 
+import hashlib
 import json
 import math
 import unittest
@@ -61,6 +62,27 @@ from app.services.mask_geometry import (
 # copy is missing, that's a broken checkout, not an environment this suite
 # should quietly tolerate -- fail loudly instead of skipping.
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "mask-geometry-golden.json"
+
+# The frontend's source of truth for the same fixture, only reachable in the
+# monorepo layout. A vendored copy with no link back to this can go stale
+# silently -- if the frontend regenerates its fixture and nobody re-vendors,
+# the backend suite keeps passing against outdated expectations, which reads
+# as real cross-language coverage while actually being none. `_source_fixture
+# _drift_message` (used by the drift test below) is the link: it compares
+# content hashes when the monorepo path exists, and is skipped -- not the
+# parity tests -- when it doesn't (split-repo deploys never had the monorepo
+# copy to compare against in the first place).
+SOURCE_FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "editube-frontend"
+    / "docs"
+    / "fixtures"
+    / "mask-geometry-golden.json"
+)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 # Shapes whose golden `pathTokens` are groups of 5: M(x,y) H(x) V(y) H(x),
 # i.e. an axis-aligned, unrounded rectangle's 4 corners.
@@ -99,6 +121,32 @@ def _assert_points_almost_equal(test: unittest.TestCase, got, want, places=2):
     for (gx, gy), (wx, wy) in zip(got, want):
         test.assertAlmostEqual(gx, wx, places=places)
         test.assertAlmostEqual(gy, wy, places=places)
+
+
+class VendoredFixtureDriftTests(unittest.TestCase):
+    """Guards against the vendored fixture going stale relative to the
+    frontend's copy -- a passing suite against a stale vendored copy is
+    worse than the SkipTest I10 removed, because it looks like real
+    coverage. Only reachable in the monorepo layout; split-repo deploys
+    never had the frontend copy to compare against, so this comparison
+    itself is skipped there (the parity tests above are not)."""
+
+    def test_vendored_copy_matches_the_frontend_source_when_reachable(self):
+        if not SOURCE_FIXTURE.exists():
+            raise unittest.SkipTest(
+                f"monorepo layout not present ({SOURCE_FIXTURE} not found) -- "
+                "drift check only applies when the frontend's fixture is reachable"
+            )
+        if not FIXTURE.exists():
+            self.fail(f"vendored fixture missing at {FIXTURE}")
+        got = _sha256(FIXTURE)
+        want = _sha256(SOURCE_FIXTURE)
+        self.assertEqual(
+            got,
+            want,
+            "vendored fixture has drifted from the frontend's copy -- "
+            f"re-copy {SOURCE_FIXTURE} to {FIXTURE}",
+        )
 
 
 class MaskGeometryParityTests(unittest.TestCase):

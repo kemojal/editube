@@ -216,10 +216,17 @@ def _make_keyframe(frame_idx: int, fps: float, clip_start: float, bbox: tuple[fl
     """
     transform = bbox_to_transform(bbox, frame_size)
     source_time = frame_idx / fps if fps > 0 else 0.0
+    # Clamp at zero: `anchor_frame`/`frame_idx` are rounded to whole source
+    # frames, so when `clip_start` doesn't land exactly on a frame boundary
+    # (e.g. clip_start=1.2133, fps=30) the conversion can come out
+    # fractionally negative even though this is meant to be the clip's
+    # first keyframe. `t` is a hard "clip-relative seconds, starting at 0"
+    # contract other code (timeline pips, duration math, clampMasksToRange)
+    # relies on without re-checking, so never emit a negative value here.
     return {
         "frame": frame_idx,
         "time": source_time,
-        "t": source_time - clip_start,
+        "t": max(0.0, source_time - clip_start),
         "rotation": 0.0,
         **transform,
     }
@@ -431,7 +438,8 @@ def mask_track_job(ai_result_id: int) -> None:
             final_payload["status"] = "partial"
             # Clip-relative seconds, matching the frontend's `formatMinSec`
             # rendering of `lostAt` -- NOT a source-absolute frame index.
-            final_payload["lostAt"] = (lost_at / fps if fps > 0 else 0.0) - clip_start
+            # Clamped at zero for the same rounding reason as `t` above.
+            final_payload["lostAt"] = max(0.0, (lost_at / fps if fps > 0 else 0.0) - clip_start)
             row.status = "partial"
         else:
             final_payload["status"] = "completed"

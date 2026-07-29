@@ -131,6 +131,20 @@ class EmittedKeyframeWireShapeTests(unittest.TestCase):
         self.assertAlmostEqual(kf["t"], 1.0, places=6)
         self.assertAlmostEqual(kf["time"], 3.0, places=6)
 
+    def test_t_never_goes_negative_when_clip_start_misses_a_frame_boundary(self):
+        # Regression: anchor_frame is rounded to a whole source frame, so a
+        # clip_start that doesn't land exactly on a frame boundary can put
+        # the resulting source_time fractionally *before* clip_start --
+        # source_time - clip_start would then be slightly negative even
+        # though this is the clip's very first keyframe.
+        fps = 30.0
+        clip_start = 1.2133
+        anchor_frame = round(clip_start * fps)  # rounds down here: frame 36
+        self.assertLess(anchor_frame / fps, clip_start)  # confirms the setup triggers it
+        kf = _make_keyframe(anchor_frame, fps, clip_start, (0, 0, 100, 100), self.SIZE)
+        self.assertGreaterEqual(kf["t"], 0.0)
+        self.assertEqual(kf["t"], 0.0)
+
 
 class MediaSourceSsrfGuardTests(unittest.TestCase):
     """I7: the tracking endpoint's `source_url` reaches `cv2.VideoCapture`
