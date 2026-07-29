@@ -77,17 +77,72 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
-def _sanitize_keyframe(raw: Any) -> dict[str, Any] | None:
-    if not isinstance(raw, dict):
-        return None
-    return {
-        "t": _clamp(_finite(raw.get("t")), 0, 1_000_000),
-        "x": _clamp(_finite(raw.get("x")), -1000, 1000),
-        "y": _clamp(_finite(raw.get("y")), -1000, 1000),
-        "width": _clamp(_finite(raw.get("width"), 1), 0, 1000),
-        "height": _clamp(_finite(raw.get("height"), 1), 0, 1000),
-        "rotation": _finite(raw.get("rotation")) % 360,
-    }
+# Mirrors `MASK_CHANNELS` in mask-keyframes.ts. `mask["keyframes"]` is a
+# per-channel map (`{channel: [{"t": ..., "v": ...}, ...]}`), not a flat
+# whole-transform array -- see mask-geometry.py's `sample_mask_channel`.
+_CHANNEL_RANGE: dict[str, tuple[float, float]] = {
+    "x": (-1000, 1000),
+    "y": (-1000, 1000),
+    "width": (0, 1000),
+    "height": (0, 1000),
+    "rotation": (-100_000, 100_000),  # normalised to [0, 360) below like the base field
+    "feather": (0, 100),
+    "roundness": (0, 100),
+    "zoom": (0, 1000),
+    "expansion": (-1000, 1000),
+}
+
+
+def _sanitize_channel_track(raw: Any, channel: str) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    lo, hi = _CHANNEL_RANGE.get(channel, (-1000, 1000))
+    out: list[dict[str, Any]] = []
+    for item in raw[:MAX_KEYFRAMES]:
+        if not isinstance(item, dict):
+            continue
+        t = _clamp(_finite(item.get("t")), 0, 1_000_000)
+        v = _finite(item.get("v"))
+        v = (v % 360) if channel == "rotation" else _clamp(v, lo, hi)
+        out.append({"t": t, "v": v})
+    out.sort(key=lambda k: k["t"])
+    return out
+
+
+def _looks_like_legacy_keyframe_array(raw: Any) -> bool:
+    """Phase 1 drafts store `keyframes` as a flat whole-transform array
+    (`{t, x, y, width, height, rotation}[]`). Detect that shape (an entry
+    with `x` but no `v`) so old payloads still animate correctly."""
+    if not isinstance(raw, list) or not raw:
+        return False
+    first = raw[0]
+    return isinstance(first, dict) and "x" in first and "v" not in first
+
+
+def _migrate_legacy_keyframes(raw: list[Any]) -> dict[str, list[dict[str, Any]]]:
+    """Converts each legacy whole-transform entry into one `{t, v}` on each
+    of the five transform channels it carried -- mirrors
+    `migrateLegacyKeyframes` in mask-keyframes.ts."""
+    entries = []
+    for item in raw[:MAX_KEYFRAMES]:
+        if not isinstance(item, dict):
+            continue
+        entries.append(
+            {
+                "t": _clamp(_finite(item.get("t")), 0, 1_000_000),
+                "x": _clamp(_finite(item.get("x")), -1000, 1000),
+                "y": _clamp(_finite(item.get("y")), -1000, 1000),
+                "width": _clamp(_finite(item.get("width"), 1), 0, 1000),
+                "height": _clamp(_finite(item.get("height"), 1), 0, 1000),
+                "rotation": _finite(item.get("rotation")) % 360,
+            }
+        )
+    entries.sort(key=lambda e: e["t"])
+    channels: dict[str, list[dict[str, Any]]] = {"x": [], "y": [], "width": [], "height": [], "rotation": []}
+    for entry in entries:
+        for channel in ("x", "y", "width", "height", "rotation"):
+            channels[channel].append({"t": entry["t"], "v": entry[channel]})
+    return channels
 
 
 def _sanitize_stroke(raw: Any) -> dict[str, Any] | None:
@@ -147,11 +202,18 @@ def sanitize_mask(raw: Any) -> dict[str, Any] | None:
     }
 
     keyframes = raw.get("keyframes")
-    if isinstance(keyframes, list) and keyframes:
-        cleaned = [k for k in (_sanitize_keyframe(k) for k in keyframes[:MAX_KEYFRAMES]) if k is not None]
-        cleaned.sort(key=lambda k: k["t"])
-        if cleaned:
-            out["keyframes"] = cleaned
+    if _looks_like_legacy_keyframe_array(keyframes):
+        migrated = _migrate_legacy_keyframes(keyframes)
+        if any(migrated.values()):
+            out["keyframes"] = migrated
+    elif isinstance(keyframes, dict):
+        channel_map: dict[str, list[dict[str, Any]]] = {}
+        for channel in _CHANNEL_RANGE:
+            track = _sanitize_channel_track(keyframes.get(channel), channel)
+            if track:
+                channel_map[channel] = track
+        if channel_map:
+            out["keyframes"] = channel_map
 
     if shape == "brush":
         strokes = raw.get("strokes")

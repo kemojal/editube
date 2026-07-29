@@ -86,28 +86,37 @@ def _lerp_angle(a: float, b: float, t: float) -> float:
     return a + delta * t
 
 
-def _base_transform(mask: dict[str, Any]) -> MaskTransform:
-    return MaskTransform(
-        x=mask["x"], y=mask["y"], width=mask["width"], height=mask["height"], rotation=mask["rotation"]
-    )
+# Channels with no base property on the mask dict yet (zoom/expansion land in
+# later tasks) fall back to these fixed defaults, mirroring
+# `CHANNEL_FALLBACK_DEFAULT` in mask-keyframes.ts.
+_CHANNEL_FALLBACK_DEFAULT: dict[str, float] = {"zoom": 100.0, "expansion": 0.0}
+
+_TRANSFORM_CHANNELS = ("x", "y", "width", "height", "rotation")
 
 
-def sample_mask_transform(mask: dict[str, Any], t: float) -> MaskTransform:
-    keyframes = mask.get("keyframes")
+def _base_channel_value(mask: dict[str, Any], channel: str) -> float:
+    if channel in mask:
+        return mask[channel]
+    return _CHANNEL_FALLBACK_DEFAULT.get(channel, 0.0)
+
+
+def sample_mask_channel(mask: dict[str, Any], channel: str, t: float) -> float:
+    """Samples one channel of the per-property keyframe map (`mask["keyframes"]
+    == {channel: [{"t": ..., "v": ...}, ...]}`), mirroring
+    `sampleMaskChannel` in mask-keyframes.ts: clamp at both ends, never
+    extrapolate; a channel with no keyframes falls back to the mask's base
+    value for that property.
+    """
+    keyframes = (mask.get("keyframes") or {}).get(channel)
     if not keyframes:
-        return _base_transform(mask)
+        return _base_channel_value(mask, channel)
 
     if len(keyframes) == 1 or t <= keyframes[0]["t"]:
-        first = keyframes[0]
-        return MaskTransform(
-            x=first["x"], y=first["y"], width=first["width"], height=first["height"], rotation=first["rotation"]
-        )
+        return keyframes[0]["v"]
 
     last = keyframes[-1]
     if t >= last["t"]:
-        return MaskTransform(
-            x=last["x"], y=last["y"], width=last["width"], height=last["height"], rotation=last["rotation"]
-        )
+        return last["v"]
 
     index = 0
     while index < len(keyframes) - 2 and keyframes[index + 1]["t"] <= t:
@@ -117,12 +126,24 @@ def sample_mask_transform(mask: dict[str, Any], t: float) -> MaskTransform:
     span = to["t"] - frm["t"]
     ratio = 0 if span <= 0 else (t - frm["t"]) / span
 
+    if channel == "rotation":
+        return _lerp_angle(frm["v"], to["v"], ratio)
+    return _lerp(frm["v"], to["v"], ratio)
+
+
+def sample_mask_transform(mask: dict[str, Any], t: float) -> MaskTransform:
+    """Assembles the whole transform by sampling each of the five transform
+    channels independently — mirrors `sampleMaskTransform` in
+    mask-keyframes.ts. `mask["keyframes"]` is the per-channel map; a mask
+    with no keyframes at all (or `None`) samples every channel to its base
+    value.
+    """
     return MaskTransform(
-        x=_lerp(frm["x"], to["x"], ratio),
-        y=_lerp(frm["y"], to["y"], ratio),
-        width=_lerp(frm["width"], to["width"], ratio),
-        height=_lerp(frm["height"], to["height"], ratio),
-        rotation=_lerp_angle(frm["rotation"], to["rotation"], ratio),
+        x=sample_mask_channel(mask, "x", t),
+        y=sample_mask_channel(mask, "y", t),
+        width=sample_mask_channel(mask, "width", t),
+        height=sample_mask_channel(mask, "height", t),
+        rotation=sample_mask_channel(mask, "rotation", t),
     )
 
 

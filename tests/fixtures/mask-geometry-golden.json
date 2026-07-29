@@ -537,24 +537,28 @@
         "rotation": 0,
         "feather": 0,
         "roundness": 0,
-        "keyframes": [
-          {
-            "t": 0,
-            "x": -20,
-            "y": 0,
-            "width": 20,
-            "height": 20,
-            "rotation": 350
-          },
-          {
-            "t": 2,
-            "x": 20,
-            "y": 10,
-            "width": 40,
-            "height": 30,
-            "rotation": 10
-          }
-        ]
+        "keyframes": {
+          "x": [
+            { "t": 0, "v": -20 },
+            { "t": 2, "v": 20 }
+          ],
+          "y": [
+            { "t": 0, "v": 0 },
+            { "t": 2, "v": 10 }
+          ],
+          "width": [
+            { "t": 0, "v": 20 },
+            { "t": 2, "v": 40 }
+          ],
+          "height": [
+            { "t": 0, "v": 20 },
+            { "t": 2, "v": 30 }
+          ],
+          "rotation": [
+            { "t": 0, "v": 350 },
+            { "t": 2, "v": 10 }
+          ]
+        }
       },
       "t": 1,
       "frameAspect": 1.7777777777777777,
@@ -592,24 +596,28 @@
         "rotation": 0,
         "feather": 0,
         "roundness": 0,
-        "keyframes": [
-          {
-            "t": 1,
-            "x": 10,
-            "y": 0,
-            "width": 20,
-            "height": 20,
-            "rotation": 0
-          },
-          {
-            "t": 2,
-            "x": 20,
-            "y": 0,
-            "width": 20,
-            "height": 20,
-            "rotation": 0
-          }
-        ]
+        "keyframes": {
+          "x": [
+            { "t": 1, "v": 10 },
+            { "t": 2, "v": 20 }
+          ],
+          "y": [
+            { "t": 1, "v": 0 },
+            { "t": 2, "v": 0 }
+          ],
+          "width": [
+            { "t": 1, "v": 20 },
+            { "t": 2, "v": 20 }
+          ],
+          "height": [
+            { "t": 1, "v": 20 },
+            { "t": 2, "v": 20 }
+          ],
+          "rotation": [
+            { "t": 1, "v": 0 },
+            { "t": 2, "v": 0 }
+          ]
+        }
       },
       "t": 99,
       "frameAspect": 1.7777777777777777,
@@ -640,6 +648,53 @@
           0
         ],
         "tokenCount": 16
+      }
+    },
+    {
+      "name": "keyframed-independent-channels",
+      "mask": {
+        "id": "g13",
+        "shape": "rectangle",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "keyframes": {
+          "x": [
+            { "t": 0, "v": 0 },
+            { "t": 4, "v": 40 }
+          ],
+          "rotation": [
+            { "t": 1, "v": 0 },
+            { "t": 3, "v": 90 }
+          ]
+        }
+      },
+      "t": 2,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "transform": {
+          "x": 20,
+          "y": 0,
+          "width": 40,
+          "height": 40,
+          "rotation": 45
+        },
+        "pathTokens": [
+          500,
+          300,
+          900,
+          700,
+          500
+        ],
+        "tokenCount": 5
       }
     }
   ]

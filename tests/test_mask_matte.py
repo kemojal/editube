@@ -129,6 +129,19 @@ class RenderMatteFrameTests(unittest.TestCase):
 
     def test_keyframes_move_the_matte_over_time(self):
         mask = circle(
+            keyframes={
+                "x": [{"t": 0, "v": -30}, {"t": 2, "v": 30}],
+            }
+        )
+        start = render_matte_frame([mask], 0.0, self.SIZE)
+        end = render_matte_frame([mask], 2.0, self.SIZE)
+        self.assertNotEqual(start.tobytes(), end.tobytes())
+
+    def test_legacy_whole_transform_keyframe_array_still_animates(self):
+        # Phase 1 drafts (or an old cached export payload) store keyframes as
+        # a flat whole-transform array. sanitize_mask must migrate it rather
+        # than silently dropping the animation.
+        mask = circle(
             keyframes=[
                 {"t": 0, "x": -30, "y": 0, "width": 40, "height": 40, "rotation": 0},
                 {"t": 2, "x": 30, "y": 0, "width": 40, "height": 40, "rotation": 0},
@@ -190,11 +203,16 @@ class SanitizeMasksHostileInputTests(unittest.TestCase):
             "enabled": True,
             "op": "add",
             "strokes": [{"points": [0, 0, 1, 1, 2, 2], "size": 4} for _ in range(5000)],
-            "keyframes": [{"t": i, "x": 0, "y": 0, "width": 10, "height": 10, "rotation": 0} for i in range(10000)],
+            "keyframes": {"x": [{"t": i, "v": 0} for i in range(10000)]},
         }
         cleaned = sanitize_mask(mask)
         self.assertLessEqual(len(cleaned["strokes"]), 200)
-        self.assertLessEqual(len(cleaned["keyframes"]), 200)
+        self.assertLessEqual(len(cleaned["keyframes"]["x"]), 200)
+
+    def test_unknown_channel_names_are_dropped(self):
+        mask = circle(keyframes={"x": [{"t": 0, "v": 5}], "bogusChannel": [{"t": 0, "v": 1}]})
+        cleaned = sanitize_mask(mask)
+        self.assertNotIn("bogusChannel", cleaned["keyframes"])
 
     def test_hostile_payload_never_raises_and_stays_bounded(self):
         hostile = [
