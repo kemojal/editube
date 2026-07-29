@@ -5,13 +5,14 @@ original, driven by the shared golden fixture
 THE THREE PARITY TIERS (see task-12-brief.md and mask_geometry.py's module
 docstring for the two known-bug rules this guards against):
 
-1. EXACT token parity, for polyline-only shapes (`split`, unrounded
-   `rectangle`, unrounded `filmstrip`, `star`, `brush`, `text`, and a pen
-   path whose anchors carry no handles — no such case exists in this
-   fixture). For these the TS SVG path's numeric tokens ARE the polygon
-   vertices in order, so the Python polygon must reproduce them exactly at
-   2dp. `test_exact_token_parity_polyline_shapes` decodes each shape's SVG
-   path grammar (M/H/V for axis-aligned rects, raw coordinate pairs for
+1. EXACT token parity, for polyline-only shapes (`split`, `filmstrip`
+   (itself just a full-width unrounded rect, same token shape as `split`),
+   unrounded `rectangle`, `star`, `brush`, `text`, and a pen path whose
+   anchors carry no handles — no such case exists in this fixture). For
+   these the TS SVG path's numeric tokens ARE the polygon vertices in order,
+   so the Python polygon must reproduce them exactly at 2dp.
+   `test_exact_token_parity_polyline_shapes` decodes each shape's SVG path
+   grammar (M/H/V for axis-aligned rects, raw coordinate pairs for
    star/brush) back into vertex lists and compares directly. This is the
    only tier that proves per-vertex identity.
 
@@ -228,10 +229,11 @@ class MaskGeometryParityTests(unittest.TestCase):
         want_rotated = _rotate(want, case["expect"]["transform"]["rotation"], centre)
         _assert_points_almost_equal(self, got, want_rotated)
 
-        # filmstrip: N unrounded rect groups concatenated, one MaskPolygon each.
-        case = self._case("filmstrip-4")
+        # filmstrip: single full-width unrounded rect group, one MaskPolygon.
+        case = self._case("filmstrip-band")
         want_flat = _decode_rect_groups(case["expect"]["pathTokens"])
         polys = mask_polygons(case["mask"], case["t"], case["frameAspect"])
+        self.assertEqual(len(polys), 1)
         got_flat = [p for poly in polys for p in poly.points]
         _assert_points_almost_equal(self, got_flat, want_flat)
 
@@ -327,38 +329,44 @@ class MaskGeometryParityTests(unittest.TestCase):
         self.assertEqual(len(poly.points), 1 + 24 + 1 + 1)
 
 
-class MaskStripesNullishTests(unittest.TestCase):
-    """`stripes` must follow TS `??` (only None/absent defaults to 3), not
-    Python truthiness (`or 3`) which would wrongly promote 0 -> 3."""
+class MaskFilmstripTests(unittest.TestCase):
+    """Filmstrip is a single full-width band sized by `height` alone — no
+    `stripes`/band-count field survives from Phase 1."""
 
-    def test_stripes_zero_yields_two_bands_like_typescript(self):
-        mask = {
+    def test_filmstrip_ignores_width_and_uses_full_frame_reach(self):
+        narrow = {
+            "shape": "filmstrip",
+            "enabled": True,
+            "x": 0,
+            "y": 0,
+            "width": 10,
+            "height": 30,
+            "rotation": 0,
+            "roundness": 0,
+        }
+        wide = {**narrow, "width": 200}
+        narrow_poly = mask_polygons(narrow, 0, 16 / 9)
+        wide_poly = mask_polygons(wide, 0, 16 / 9)
+        self.assertEqual(len(narrow_poly), 1)
+        self.assertEqual(narrow_poly[0].points, wide_poly[0].points)
+
+    def test_filmstrip_height_drives_band_thickness(self):
+        short = {
             "shape": "filmstrip",
             "enabled": True,
             "x": 0,
             "y": 0,
             "width": 60,
-            "height": 80,
-            "rotation": 0,
-            "roundness": 0,
-            "stripes": 0,
-        }
-        polygons = mask_polygons(mask, 0, 16 / 9)
-        self.assertEqual(len(polygons), 2)
-
-    def test_stripes_absent_defaults_to_three_bands(self):
-        mask = {
-            "shape": "filmstrip",
-            "enabled": True,
-            "x": 0,
-            "y": 0,
-            "width": 60,
-            "height": 80,
+            "height": 20,
             "rotation": 0,
             "roundness": 0,
         }
-        polygons = mask_polygons(mask, 0, 16 / 9)
-        self.assertEqual(len(polygons), 3)
+        tall = {**short, "height": 60}
+        short_poly = mask_polygons(short, 0, 16 / 9)[0].points
+        tall_poly = mask_polygons(tall, 0, 16 / 9)[0].points
+        short_span = max(p[1] for p in short_poly) - min(p[1] for p in short_poly)
+        tall_span = max(p[1] for p in tall_poly) - min(p[1] for p in tall_poly)
+        self.assertLess(short_span, tall_span)
 
 
 class MaskInertTests(unittest.TestCase):

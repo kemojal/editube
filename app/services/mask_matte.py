@@ -146,10 +146,6 @@ def sanitize_mask(raw: Any) -> dict[str, Any] | None:
         "roundness": _clamp(_finite(raw.get("roundness")), 0, 100),
     }
 
-    stripes = raw.get("stripes")
-    if stripes is not None:
-        out["stripes"] = int(_clamp(_finite(stripes, 3), 2, 12))
-
     keyframes = raw.get("keyframes")
     if isinstance(keyframes, list) and keyframes:
         cleaned = [k for k in (_sanitize_keyframe(k) for k in keyframes[:MAX_KEYFRAMES]) if k is not None]

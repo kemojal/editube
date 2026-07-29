@@ -250,22 +250,19 @@ def _split_points(box: _Box) -> list[tuple[float, float]]:
     return [(left, top), (right, top), (right, bottom), (left, bottom)]
 
 
-def _filmstrip_polygons(box: _Box, stripes: int, roundness: float) -> list[MaskPolygon]:
-    count = max(2, round(stripes))
-    band_height = box.height / (count * 2 - 1)
-    polygons = []
-    for index in range(count):
-        top = box.top + index * band_height * 2
-        band_box = _Box(
-            centre_x=box.centre_x,
-            centre_y=top + band_height / 2,
-            width=box.width,
-            height=band_height,
-            left=box.left,
-            top=top,
-        )
-        polygons.append(MaskPolygon(points=_rounded_rectangle_points(band_box, roundness)))
-    return polygons
+def _filmstrip_points(box: _Box) -> list[tuple[float, float]]:
+    """A single full-width horizontal band — CapCut's Filmstrip. `Size` is the
+    band's height only; width always spans the frame, so (like
+    `_split_points`) the horizontal reach is oversized well past the frame so
+    the mask's own rotation can never pull a vertical edge into view.
+    """
+    reach = VIEWBOX * 2
+    half_height = box.height / 2
+    left = box.centre_x - reach
+    right = box.centre_x + reach
+    top = box.centre_y - half_height
+    bottom = box.centre_y + half_height
+    return [(left, top), (right, top), (right, bottom), (left, bottom)]
 
 
 def _star_points(box: _Box, points: int = 5, inner_ratio: float = 0.42) -> list[tuple[float, float]]:
@@ -460,10 +457,7 @@ def mask_polygons(mask: dict[str, Any], t: float, frame_aspect: float) -> list[M
     elif shape == "split":
         polys = [MaskPolygon(points=_split_points(box))]
     elif shape == "filmstrip":
-        stripes = mask.get("stripes")
-        if stripes is None:
-            stripes = 3
-        polys = _filmstrip_polygons(box, stripes, mask.get("roundness", 0))
+        polys = [MaskPolygon(points=_filmstrip_points(box))]
     elif shape == "star":
         polys = [MaskPolygon(points=_star_points(box))]
     elif shape == "heart":

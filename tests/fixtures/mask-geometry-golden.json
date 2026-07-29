@@ -39,7 +39,7 @@
       }
     },
     {
-      "name": "filmstrip-4",
+      "name": "filmstrip-band",
       "mask": {
         "id": "g2",
         "shape": "filmstrip",
@@ -53,8 +53,7 @@
         "height": 80,
         "rotation": 0,
         "feather": 0,
-        "roundness": 0,
-        "stripes": 4
+        "roundness": 0
       },
       "t": 0,
       "frameAspect": 1.7777777777777777,
@@ -67,28 +66,13 @@
           "rotation": 0
         },
         "pathTokens": [
-          200,
+          -1500,
           100,
-          800,
-          214.29,
-          200,
-          200,
-          328.57,
-          800,
-          442.86,
-          200,
-          200,
-          557.14,
-          800,
-          671.43,
-          200,
-          200,
-          785.71,
-          800,
+          2500,
           900,
-          200
+          -1500
         ],
-        "tokenCount": 20
+        "tokenCount": 5
       }
     },
     {
