@@ -151,6 +151,55 @@ class RenderMatteFrameTests(unittest.TestCase):
         end = render_matte_frame([mask], 2.0, self.SIZE)
         self.assertNotEqual(start.tobytes(), end.tobytes())
 
+    def test_keyed_feather_changes_the_rendered_matte_over_time(self):
+        # C1 regression: `feather` is a keyframeable channel but was never
+        # sampled at render time (mask.get("feather") read the static base
+        # value). A keyed feather must actually change the rasterised edge
+        # between two different times.
+        mask = circle(feather=0, keyframes={"feather": [{"t": 0, "v": 0}, {"t": 2, "v": 80}]})
+        start = render_matte_frame([mask], 0.0, self.SIZE)
+        end = render_matte_frame([mask], 2.0, self.SIZE)
+        self.assertNotEqual(start.tobytes(), end.tobytes())
+        edge_values_end = {end.getpixel((x, 100)) for x in range(0, 200)}
+        self.assertTrue(any(0 < value < 255 for value in edge_values_end))
+
+    def test_keyed_expansion_changes_the_rendered_matte_over_time(self):
+        # C1 regression: same bug for `expansion`.
+        mask = circle(width=50, height=50, expansion=0, keyframes={"expansion": [{"t": 0, "v": 0}, {"t": 2, "v": 60}]})
+        start = render_matte_frame([mask], 0.0, self.SIZE)
+        end = render_matte_frame([mask], 2.0, self.SIZE)
+        self.assertNotEqual(start.tobytes(), end.tobytes())
+
+    def test_keyed_roundness_changes_the_rendered_matte_over_time(self):
+        # C1 regression: same bug for `roundness` (rectangle only -- circles
+        # have no roundness parameter).
+        mask = {
+            "id": "m1",
+            "shape": "rectangle",
+            "enabled": True,
+            "op": "add",
+            "space": "clip",
+            "invert": False,
+            "x": 0,
+            "y": 0,
+            "width": 60,
+            "height": 60,
+            "rotation": 0,
+            "feather": 0,
+            "roundness": 0,
+            "keyframes": {"roundness": [{"t": 0, "v": 0}, {"t": 2, "v": 80}]},
+        }
+        start = render_matte_frame([mask], 0.0, self.SIZE)
+        end = render_matte_frame([mask], 2.0, self.SIZE)
+        self.assertNotEqual(start.tobytes(), end.tobytes())
+        # A pixel right against the box's literal top-left corner must go
+        # from fully-inside (255, plain rectangle) to cut away (0, rounded
+        # corner arc) once roundness kicks in. The rectangle spans
+        # x/y in [40, 160]px here (width=height=60% of a 200px frame).
+        corner = (41, 41)
+        self.assertEqual(start.getpixel(corner), 255)
+        self.assertEqual(end.getpixel(corner), 0)
+
 
 class SanitizeMasksHostileInputTests(unittest.TestCase):
     """Mirrors the frontend's `sanitizeMasks` limits so a malformed or

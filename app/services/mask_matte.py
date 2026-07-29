@@ -28,7 +28,13 @@ from typing import Any
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
-from app.services.mask_geometry import VIEWBOX, expansion_radius, mask_is_inert, mask_polygons
+from app.services.mask_geometry import (
+    VIEWBOX,
+    expansion_radius,
+    mask_is_inert,
+    mask_polygons,
+    sample_mask_channel,
+)
 from app.services.mask_text import DEFAULT_MASK_FONT_ID, render_text_layer, viewbox_rotation_affine
 
 logger = logging.getLogger(__name__)
@@ -403,9 +409,20 @@ def render_matte_frame(
             # ahead of <feGaussianBlur> in the same filter. Expanding an
             # already-feathered edge would blur the dilation itself into
             # mush instead of growing the shape cleanly.
-            expansion = float(mask.get("expansion") or 0)
+            # C1: `expansion` (and `feather`/`width`/`height` below) are
+            # keyframeable channels (mirrors `MASK_CHANNELS` in
+            # mask-keyframes.ts) -- sample them for `t` like `mask_polygons`
+            # already samples x/y/width/height/rotation, not the mask's
+            # static base dict value, or a keyed Expansion/Feather would
+            # persist in the payload but never actually animate in the
+            # exported MP4.
+            expansion = sample_mask_channel(mask, "expansion", t)
             if expansion != 0:
-                radius_viewbox = expansion_radius(mask)
+                sampled_width = sample_mask_channel(mask, "width", t)
+                sampled_height = sample_mask_channel(mask, "height", t)
+                radius_viewbox = expansion_radius(
+                    {"width": sampled_width, "height": sampled_height, "expansion": expansion}
+                )
                 radius_px = radius_viewbox * ((sx + sy) / 2)
                 # Pillow's MaxFilter/MinFilter take an odd integer kernel
                 # size, not a radius: kernel = 2r + 1 (see the contract
@@ -421,21 +438,19 @@ def render_matte_frame(
                     morph = ImageFilter.MaxFilter(kernel) if expansion > 0 else ImageFilter.MinFilter(kernel)
                     layer = layer.filter(morph)
 
-            feather = float(mask.get("feather") or 0)
+            feather = sample_mask_channel(mask, "feather", t)
             if feather > 0:
                 # Matches the TS reference (`mask-svg-defs.tsx`'s
                 # `feGaussianBlur` stdDeviation): scales with the mask's own
                 # footprint rather than a fixed fraction of the viewBox, so
                 # preview and export feather by comparable amounts instead of
-                # ~10x apart. Note: the TS side blurs isotropically off the
-                # mask's *base* spec width/height, not the per-frame sampled
-                # transform -- so under a keyframed size change (mask
-                # growing/shrinking over time) this still won't be
-                # pixel-exact between preview and export; it fixes the
-                # order-of-magnitude mismatch, not full parity.
-                base_w = float(mask.get("width") or 0)
-                base_h = float(mask.get("height") or 0)
-                shorter = min(base_w, base_h) if base_w > 0 and base_h > 0 else 0.0
+                # ~10x apart. C1: both sides now use the SAMPLED width/height
+                # for the current time `t` (not the mask's static base spec),
+                # so a feathered mask whose size is keyframed blurs by the
+                # right amount at every frame, not just the base one.
+                sampled_w = sample_mask_channel(mask, "width", t)
+                sampled_h = sample_mask_channel(mask, "height", t)
+                shorter = min(sampled_w, sampled_h) if sampled_w > 0 and sampled_h > 0 else 0.0
                 radius = (feather / 100.0) * shorter * (VIEWBOX / 100.0) * 0.25 * ((sx + sy) / 2)
                 if radius > 0:
                     layer = layer.filter(ImageFilter.GaussianBlur(radius=radius))

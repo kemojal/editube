@@ -488,7 +488,14 @@ def mask_polygons(mask: dict[str, Any], t: float, frame_aspect: float) -> list[M
     centre = (box.centre_x, box.centre_y)
 
     if shape == "rectangle":
-        polys = [MaskPolygon(points=_rounded_rectangle_points(box, mask.get("roundness", 0)))]
+        # `roundness` is a keyframeable channel (mirrors `MASK_CHANNELS` in
+        # mask-keyframes.ts) -- sample it for `t` like every other channel
+        # here, not the mask's static base value, or a keyed roundness would
+        # persist in the payload (the sanitiser validates it) but never
+        # actually animate in the exported MP4.
+        polys = [
+            MaskPolygon(points=_rounded_rectangle_points(box, sample_mask_channel(mask, "roundness", t)))
+        ]
     elif shape == "circle":
         polys = [MaskPolygon(points=_circle_points(box))]
     elif shape == "split":
