@@ -464,7 +464,10 @@ def mask_polygons(mask: dict[str, Any], t: float, frame_aspect: float) -> list[M
     elif shape == "split":
         polys = [MaskPolygon(points=_split_points(box))]
     elif shape == "filmstrip":
-        polys = _filmstrip_polygons(box, mask.get("stripes", 3) or 3, mask.get("roundness", 0))
+        stripes = mask.get("stripes")
+        if stripes is None:
+            stripes = 3
+        polys = _filmstrip_polygons(box, stripes, mask.get("roundness", 0))
     elif shape == "star":
         polys = [MaskPolygon(points=_star_points(box))]
     elif shape == "heart":

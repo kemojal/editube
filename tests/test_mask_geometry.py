@@ -267,6 +267,40 @@ class MaskGeometryParityTests(unittest.TestCase):
         self.assertEqual(len(poly.points), 1 + 24 + 1 + 1)
 
 
+class MaskStripesNullishTests(unittest.TestCase):
+    """`stripes` must follow TS `??` (only None/absent defaults to 3), not
+    Python truthiness (`or 3`) which would wrongly promote 0 -> 3."""
+
+    def test_stripes_zero_yields_two_bands_like_typescript(self):
+        mask = {
+            "shape": "filmstrip",
+            "enabled": True,
+            "x": 0,
+            "y": 0,
+            "width": 60,
+            "height": 80,
+            "rotation": 0,
+            "roundness": 0,
+            "stripes": 0,
+        }
+        polygons = mask_polygons(mask, 0, 16 / 9)
+        self.assertEqual(len(polygons), 2)
+
+    def test_stripes_absent_defaults_to_three_bands(self):
+        mask = {
+            "shape": "filmstrip",
+            "enabled": True,
+            "x": 0,
+            "y": 0,
+            "width": 60,
+            "height": 80,
+            "rotation": 0,
+            "roundness": 0,
+        }
+        polygons = mask_polygons(mask, 0, 16 / 9)
+        self.assertEqual(len(polygons), 3)
+
+
 class MaskInertTests(unittest.TestCase):
     def test_brush_without_strokes_is_inert(self):
         self.assertTrue(mask_is_inert({"shape": "brush", "enabled": True}))
