@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "_note": "Shared text-mask layout fixture. Generated once and then hand-maintained; both mask-text.ts (preview) and app/services/mask_text.py (export) must reproduce every value. `expect: null` means the mask paints nothing.",
+  "_note": "Shared text-mask layout fixture. Both mask-text.ts (preview) and app/services/mask_text.py (export) must reproduce every value. `expect: null` means the mask paints nothing. `glyphScaleX` is the horizontal pre-compensation the SVG side applies to cancel the mask's non-uniform objectBoundingBox CTM; the text-aspect-16x9 / text-aspect-9x16 pair exists so dropping that compensation fails a test.",
   "cases": [
     {
       "name": "text-single-default",
@@ -58,7 +58,8 @@
             "x": 500.0,
             "baselineY": 560.0
           }
-        ]
+        ],
+        "glyphScaleX": 0.5625
       }
     },
     {
@@ -127,7 +128,8 @@
             "x": 300.0,
             "baselineY": 770.0
           }
-        ]
+        ],
+        "glyphScaleX": 0.5625
       }
     },
     {
@@ -203,7 +205,8 @@
             "x": 700.0,
             "baselineY": 650.0
           }
-        ]
+        ],
+        "glyphScaleX": 1.0
       }
     },
     {
@@ -262,7 +265,8 @@
             "x": 500.0,
             "baselineY": 560.0
           }
-        ]
+        ],
+        "glyphScaleX": 0.5625
       }
     },
     {
@@ -297,6 +301,186 @@
       "t": 0,
       "frameAspect": 1.7777777777777777,
       "expect": null
+    },
+    {
+      "name": "text-glyph-scale-portrait-rotated-right-aligned",
+      "mask": {
+        "id": "t2",
+        "shape": "text",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 30,
+        "feather": 0,
+        "roundness": 0,
+        "expansion": 0,
+        "text": "Hi",
+        "fontId": "vera-sans",
+        "fontSize": 20,
+        "bold": false,
+        "underline": false,
+        "italic": false,
+        "letterSpacing": 0,
+        "lineSpacing": 120,
+        "align": "right",
+        "alignV": "middle",
+        "zoom": 100
+      },
+      "t": 0,
+      "frameAspect": 0.5625,
+      "expect": {
+        "fontId": "vera-sans",
+        "requestedFontId": "vera-sans",
+        "fontFallback": false,
+        "styleKey": "regular",
+        "fontFile": "Vera.ttf",
+        "underline": false,
+        "fontSizeVb": 200.0,
+        "lineStep": 240.0,
+        "letterSpacingVb": 0.0,
+        "anchor": "end",
+        "pillowAnchor": "rs",
+        "align": "right",
+        "alignV": "middle",
+        "underlineOffsetVb": 20.8008,
+        "underlineThicknessVb": 13.9648,
+        "rotation": 30,
+        "centreX": 500.0,
+        "centreY": 500.0,
+        "glyphScaleX": 1.777778,
+        "lines": [
+          {
+            "text": "Hi",
+            "x": 700.0,
+            "baselineY": 560.0
+          }
+        ]
+      }
+    },
+    {
+      "name": "text-aspect-16x9",
+      "mask": {
+        "id": "t",
+        "shape": "text",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "expansion": 0,
+        "text": "Hi",
+        "fontId": "vera-sans",
+        "fontSize": 20,
+        "bold": false,
+        "underline": false,
+        "italic": false,
+        "letterSpacing": 0,
+        "lineSpacing": 120,
+        "align": "center",
+        "alignV": "middle",
+        "zoom": 100
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "fontId": "vera-sans",
+        "requestedFontId": "vera-sans",
+        "fontFallback": false,
+        "styleKey": "regular",
+        "fontFile": "Vera.ttf",
+        "underline": false,
+        "fontSizeVb": 200.0,
+        "lineStep": 240.0,
+        "letterSpacingVb": 0.0,
+        "anchor": "middle",
+        "pillowAnchor": "ms",
+        "align": "center",
+        "alignV": "middle",
+        "underlineOffsetVb": 20.8008,
+        "underlineThicknessVb": 13.9648,
+        "glyphScaleX": 0.5625,
+        "rotation": 0,
+        "centreX": 500.0,
+        "centreY": 500.0,
+        "lines": [
+          {
+            "text": "Hi",
+            "x": 500.0,
+            "baselineY": 560.0
+          }
+        ]
+      }
+    },
+    {
+      "name": "text-aspect-9x16",
+      "mask": {
+        "id": "t",
+        "shape": "text",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "expansion": 0,
+        "text": "Hi",
+        "fontId": "vera-sans",
+        "fontSize": 20,
+        "bold": false,
+        "underline": false,
+        "italic": false,
+        "letterSpacing": 0,
+        "lineSpacing": 120,
+        "align": "center",
+        "alignV": "middle",
+        "zoom": 100
+      },
+      "t": 0,
+      "frameAspect": 0.5625,
+      "expect": {
+        "fontId": "vera-sans",
+        "requestedFontId": "vera-sans",
+        "fontFallback": false,
+        "styleKey": "regular",
+        "fontFile": "Vera.ttf",
+        "underline": false,
+        "fontSizeVb": 200.0,
+        "lineStep": 240.0,
+        "letterSpacingVb": 0.0,
+        "anchor": "middle",
+        "pillowAnchor": "ms",
+        "align": "center",
+        "alignV": "middle",
+        "underlineOffsetVb": 20.8008,
+        "underlineThicknessVb": 13.9648,
+        "glyphScaleX": 1.777778,
+        "rotation": 0,
+        "centreX": 500.0,
+        "centreY": 500.0,
+        "lines": [
+          {
+            "text": "Hi",
+            "x": 500.0,
+            "baselineY": 560.0
+          }
+        ]
+      }
     }
   ]
 }
