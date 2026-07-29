@@ -39,6 +39,12 @@ MAX_MASKS = 8
 MAX_STROKES_PER_MASK = 200
 MAX_POINTS_PER_STROKE = 4000  # flat [x0, y0, x1, y1, ...] pairs -> 2000 points
 MAX_PATH_POINTS = 500
+# Per-channel keyframe cap. Reconciled with the TS side's `MASK_LIMITS.keyframes`
+# (which briefly drifted to 600 during the per-channel channel rewrite): 200 is
+# the shared value because a cap the exporter enforces but the editor doesn't
+# would let a mask animate in the preview and silently freeze partway through
+# the rendered MP4. 200 keyframes on one channel is already >6s of dense
+# per-frame keying at 30fps.
 MAX_KEYFRAMES = 200
 
 # I8: `duration` is caller-supplied (derived from a keep-range) and was
