@@ -83,6 +83,17 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+# Rotation wraps (mod 360) rather than clamps -- 720deg and 0deg are the same
+# rotation, and clamping to [-360, 360] would make 720 collapse to 360
+# instead. The wrap range is (-180, 180], NOT [0, 360): the frontend's
+# on-stage manipulator and its Rotate slider (min=-180, max=180) both live
+# in (-180, 180], so a mask rotated to -90 must sanitise back to -90, not
+# 270 -- otherwise the slider (which cannot represent 270) renders pinned
+# at its max. Mirrors `wrapRotation` in mask-sanitize.ts.
+def _wrap_rotation(value: float) -> float:
+    return ((value % 360) + 540) % 360 - 180
+
+
 # Mirrors `MASK_CHANNELS` in mask-keyframes.ts. `mask["keyframes"]` is a
 # per-channel map (`{channel: [{"t": ..., "v": ...}, ...]}`), not a flat
 # whole-transform array -- see mask-geometry.py's `sample_mask_channel`.
@@ -91,7 +102,7 @@ _CHANNEL_RANGE: dict[str, tuple[float, float]] = {
     "y": (-1000, 1000),
     "width": (0, 1000),
     "height": (0, 1000),
-    "rotation": (-100_000, 100_000),  # normalised to [0, 360) below like the base field
+    "rotation": (-100_000, 100_000),  # normalised to (-180, 180] via _wrap_rotation below
     "feather": (0, 100),
     "roundness": (0, 100),
     "zoom": (0, 1000),
@@ -109,7 +120,7 @@ def _sanitize_channel_track(raw: Any, channel: str) -> list[dict[str, Any]]:
             continue
         t = _clamp(_finite(item.get("t")), 0, 1_000_000)
         v = _finite(item.get("v"))
-        v = (v % 360) if channel == "rotation" else _clamp(v, lo, hi)
+        v = _wrap_rotation(v) if channel == "rotation" else _clamp(v, lo, hi)
         out.append({"t": t, "v": v})
     out.sort(key=lambda k: k["t"])
     return out
@@ -140,7 +151,7 @@ def _migrate_legacy_keyframes(raw: list[Any]) -> dict[str, list[dict[str, Any]]]
                 "y": _clamp(_finite(item.get("y")), -1000, 1000),
                 "width": _clamp(_finite(item.get("width"), 1), 0, 1000),
                 "height": _clamp(_finite(item.get("height"), 1), 0, 1000),
-                "rotation": _finite(item.get("rotation")) % 360,
+                "rotation": _wrap_rotation(_finite(item.get("rotation"))),
             }
         )
     entries.sort(key=lambda e: e["t"])
@@ -202,7 +213,7 @@ def sanitize_mask(raw: Any) -> dict[str, Any] | None:
         "y": _clamp(_finite(raw.get("y")), -1000, 1000),
         "width": _clamp(_finite(raw.get("width")), 0, 1000),
         "height": _clamp(_finite(raw.get("height")), 0, 1000),
-        "rotation": _finite(raw.get("rotation")) % 360,
+        "rotation": _wrap_rotation(_finite(raw.get("rotation"))),
         "feather": _clamp(_finite(raw.get("feather")), 0, 100),
         "roundness": _clamp(_finite(raw.get("roundness")), 0, 100),
     }

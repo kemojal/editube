@@ -181,6 +181,16 @@ class SanitizeMasksHostileInputTests(unittest.TestCase):
         self.assertTrue(math.isfinite(cleaned["width"]))
         self.assertTrue(math.isfinite(cleaned["height"]))
 
+    def test_rotation_round_trips_minus_90_not_270(self):
+        # -90 and 270 are the same rotation, but the frontend's Rotate
+        # slider is min=-180/max=180 and cannot render 270 -- sanitisation
+        # must always normalise back to (-180, 180], matching wrapRotation
+        # in mask-sanitize.ts.
+        self.assertEqual(sanitize_mask(circle(rotation=-90))["rotation"], -90)
+        self.assertEqual(sanitize_mask(circle(rotation=270))["rotation"], -90)
+        self.assertEqual(sanitize_mask(circle(rotation=720))["rotation"], 0)
+        self.assertEqual(sanitize_mask(circle(rotation=-400))["rotation"], -40)
+
     def test_unknown_op_and_shape_fall_back_to_safe_defaults(self):
         cleaned = sanitize_mask(circle(op="; DROP TABLE videos;--", shape="<script>alert(1)</script>"))
         self.assertEqual(cleaned["op"], "add")
