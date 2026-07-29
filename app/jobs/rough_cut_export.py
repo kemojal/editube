@@ -92,7 +92,38 @@ def _run_ffmpeg(args: list[str]) -> None:
         raise RuntimeError(err or "ffmpeg failed")
 
 
-def _normalize_ranges(raw: object) -> list[tuple[float, float]]:
+def _ffprobe_duration(input_src: str) -> float | None:
+    try:
+        out = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                input_src,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        value = (out.stdout or "").strip().splitlines()
+        if not value:
+            return None
+        duration = float(value[0].strip())
+        return duration if duration > 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _normalize_ranges(raw: object, max_end: float | None = None) -> list[tuple[float, float]]:
+    """`max_end`, when given (the probed source duration -- I8), clamps
+    every range's end so a hostile/malformed keep-range (e.g. `end: 1e9`)
+    can't pin the matte renderer or ffmpeg rasterising far past the real
+    media."""
     if not isinstance(raw, list):
         return []
     out: list[tuple[float, float]] = []
@@ -104,6 +135,9 @@ def _normalize_ranges(raw: object) -> list[tuple[float, float]]:
             end = float(item.get("end", 0))
         except (TypeError, ValueError):
             continue
+        if max_end is not None:
+            start = min(start, max_end)
+            end = min(end, max_end)
         if end - start > 0.05:
             out.append((start, end))
     out.sort(key=lambda x: x[0])
@@ -235,10 +269,14 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
         payload = dict(row.result_data or {})
         video_id = row.video_id
         fmt = str(payload.get("format") or "mp4").lower()
-        normalized = _normalize_ranges(payload.get("keepRanges"))
 
         video = db.query(Video).filter(Video.id == video_id).first()
         media_src = (video.file_path if video else "") or ""
+        # I8: clamp keep-ranges against the real source duration before
+        # anything downstream (matte rendering, ffmpeg -t) can be pinned by
+        # a hostile/malformed range extending far past the actual media.
+        source_duration = _ffprobe_duration(media_src) if media_src else None
+        normalized = _normalize_ranges(payload.get("keepRanges"), max_end=source_duration)
 
         row.status = "processing"
         row.error_message = None
@@ -276,6 +314,12 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
 
         fps_extra = _fps_filter_part(settings, media_src) if want_mp4_video else ""
         masks = payload.get("masks") if isinstance(payload.get("masks"), list) else []
+        # I11: tracked across segments -- if a mask was requested but any
+        # segment's matte failed to render, the export still finishes
+        # (fail-open: a masking bug must not fail an entire export) but the
+        # UI needs to know the result is unmasked, since a mask can be a
+        # redaction, not just decoration.
+        mask_render_failed_for_segment = False
         matte_fps = _resolve_numeric_fps(settings, media_src) if (want_mp4_video and masks) else 30.0
         scale_w, scale_h = (0, 0)
         if want_mp4_video and masks:
@@ -339,12 +383,16 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                             )
                         except Exception:
                             # A masking bug must never fail the whole export —
-                            # fall back to the unmasked segment.
+                            # fall back to the unmasked segment. Record the
+                            # failure (I11) so the UI can warn the user this
+                            # export is unmasked -- masks are sometimes a
+                            # redaction, not decoration.
                             logger.exception(
                                 "rough_cut_export_job: matte render failed for range %s, exporting without mask",
                                 index,
                             )
                             matte_path = None
+                            mask_render_failed_for_segment = True
 
                     if matte_path is not None:
                         filter_complex = (
@@ -565,6 +613,11 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 "captionEntries": len(subtitle_entries),
                 "shortsExport": shorts_export,
             }
+            if masks and mask_render_failed_for_segment:
+                # I11: masks were requested but at least one segment's matte
+                # failed to render, so this export shipped unmasked -- the UI
+                # must be able to warn the user (a mask can be a redaction).
+                meta["maskingFailed"] = True
 
             if register_as_version and video is not None:
                 try:

@@ -1,0 +1,662 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "split-base",
+      "mask": {
+        "id": "g1",
+        "shape": "split",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 30,
+        "feather": 0,
+        "roundness": 0
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "transform": {
+          "x": 0,
+          "y": 0,
+          "width": 40,
+          "height": 40,
+          "rotation": 30
+        },
+        "pathTokens": [
+          -1500,
+          -1500,
+          2500,
+          500,
+          -1500
+        ],
+        "tokenCount": 5
+      }
+    },
+    {
+      "name": "filmstrip-4",
+      "mask": {
+        "id": "g2",
+        "shape": "filmstrip",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 60,
+        "height": 80,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "stripes": 4
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "transform": {
+          "x": 0,
+          "y": 0,
+          "width": 60,
+          "height": 80,
+          "rotation": 0
+        },
+        "pathTokens": [
+          200,
+          100,
+          800,
+          214.29,
+          200,
+          200,
+          328.57,
+          800,
+          442.86,
+          200,
+          200,
+          557.14,
+          800,
+          671.43,
+          200,
+          200,
+          785.71,
+          800,
+          900,
+          200
+        ],
+        "tokenCount": 20
+      }
+    },
+    {
+      "name": "circle-wide",
+      "mask": {
+        "id": "g3",
+        "shape": "circle",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "transform": {
+          "x": 0,
+          "y": 0,
+          "width": 40,
+          "height": 40,
+          "rotation": 0
+        },
+        "pathTokens": [
+          387.5,
+          500,
+          112.5,
+          200,
+          0,
+          1,
+          0,
+          225,
+          0,
+          112.5,
+          200,
+          0,
+          1,
+          0,
+          -225,
+          0
+        ],
+        "tokenCount": 16
+      }
+    },
+    {
+      "name": "circle-tall",
+      "mask": {
+        "id": "g4",
+        "shape": "circle",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0
+      },
+      "t": 0,
+      "frameAspect": 0.5625,
+      "expect": {
+        "transform": {
+          "x": 0,
+          "y": 0,
+          "width": 40,
+          "height": 40,
+          "rotation": 0
+        },
+        "pathTokens": [
+          144.44,
+          500,
+          355.56,
+          200,
+          0,
+          1,
+          0,
+          711.11,
+          0,
+          355.56,
+          200,
+          0,
+          1,
+          0,
+          -711.11,
+          0
+        ],
+        "tokenCount": 16
+      }
+    },
+    {
+      "name": "rect-round",
+      "mask": {
+        "id": "g5",
+        "shape": "rectangle",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 50,
+        "height": 30,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 40
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "transform": {
+          "x": 0,
+          "y": 0,
+          "width": 50,
+          "height": 30,
+          "rotation": 0
+        },
+        "pathTokens": [
+          310,
+          350,
+          690,
+          60,
+          60,
+          0,
+          0,
+          1,
+          60,
+          60,
+          590,
+          60,
+          60,
+          0,
+          0,
+          1,
+          -60,
+          60,
+          310,
+          60,
+          60,
+          0,
+          0,
+          1,
+          -60,
+          -60,
+          410,
+          60,
+          60,
+          0,
+          0,
+          1,
+          60,
+          -60
+        ],
+        "tokenCount": 34
+      }
+    },
+    {
+      "name": "star-rot",
+      "mask": {
+        "id": "g6",
+        "shape": "star",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 15,
+        "feather": 0,
+        "roundness": 0
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "transform": {
+          "x": 0,
+          "y": 0,
+          "width": 40,
+          "height": 40,
+          "rotation": 15
+        },
+        "pathTokens": [
+          500,
+          300,
+          527.77,
+          432.04,
+          606.99,
+          438.2,
+          544.94,
+          525.96,
+          566.13,
+          661.8,
+          500,
+          584,
+          433.87,
+          661.8,
+          455.06,
+          525.96,
+          393.01,
+          438.2,
+          472.23,
+          432.04
+        ],
+        "tokenCount": 20
+      }
+    },
+    {
+      "name": "heart-off",
+      "mask": {
+        "id": "g7",
+        "shape": "heart",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 12,
+        "y": -8,
+        "width": 40,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "transform": {
+          "x": 12,
+          "y": -8,
+          "width": 40,
+          "height": 40,
+          "rotation": 0
+        },
+        "pathTokens": [
+          620,
+          620,
+          620,
+          620,
+          507.5,
+          468,
+          507.5,
+          364,
+          507.5,
+          268,
+          579.5,
+          228,
+          620,
+          316,
+          660.5,
+          228,
+          732.5,
+          268,
+          732.5,
+          364,
+          732.5,
+          468,
+          620,
+          620,
+          620,
+          620
+        ],
+        "tokenCount": 26
+      }
+    },
+    {
+      "name": "text-t",
+      "mask": {
+        "id": "g8",
+        "shape": "text",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 30,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "text": "T"
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "transform": {
+          "x": 0,
+          "y": 0,
+          "width": 30,
+          "height": 40,
+          "rotation": 0
+        },
+        "pathTokens": [
+          350,
+          300,
+          650,
+          396,
+          350,
+          461,
+          396,
+          539,
+          700,
+          461
+        ],
+        "tokenCount": 10
+      }
+    },
+    {
+      "name": "brush-two",
+      "mask": {
+        "id": "g9",
+        "shape": "brush",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 100,
+        "height": 100,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "strokes": [
+          {
+            "size": 8,
+            "hardness": 60,
+            "points": [
+              0.2,
+              0.2,
+              0.5,
+              0.5,
+              0.8,
+              0.2
+            ]
+          },
+          {
+            "size": 4,
+            "hardness": 90,
+            "points": [
+              0.3,
+              0.7,
+              0.7,
+              0.7
+            ]
+          }
+        ]
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "transform": {
+          "x": 0,
+          "y": 0,
+          "width": 100,
+          "height": 100,
+          "rotation": 0
+        },
+        "pathTokens": [
+          200,
+          200,
+          500,
+          500,
+          800,
+          200,
+          300,
+          700,
+          700,
+          700
+        ],
+        "tokenCount": 10
+      }
+    },
+    {
+      "name": "pen-closed",
+      "mask": {
+        "id": "g10",
+        "shape": "pen",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 100,
+        "height": 100,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "path": {
+          "closed": true,
+          "points": [
+            {
+              "x": 0.2,
+              "y": 0.2,
+              "outX": 0.1,
+              "outY": 0
+            },
+            {
+              "x": 0.8,
+              "y": 0.25,
+              "inX": -0.1,
+              "inY": 0
+            },
+            {
+              "x": 0.5,
+              "y": 0.8
+            }
+          ]
+        }
+      },
+      "t": 0,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "transform": {
+          "x": 0,
+          "y": 0,
+          "width": 100,
+          "height": 100,
+          "rotation": 0
+        },
+        "pathTokens": [
+          200,
+          200,
+          300,
+          200,
+          700,
+          250,
+          800,
+          250,
+          500,
+          800,
+          200,
+          200
+        ],
+        "tokenCount": 12
+      }
+    },
+    {
+      "name": "keyframed-mid",
+      "mask": {
+        "id": "g11",
+        "shape": "rectangle",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "keyframes": [
+          {
+            "t": 0,
+            "x": -20,
+            "y": 0,
+            "width": 20,
+            "height": 20,
+            "rotation": 350
+          },
+          {
+            "t": 2,
+            "x": 20,
+            "y": 10,
+            "width": 40,
+            "height": 30,
+            "rotation": 10
+          }
+        ]
+      },
+      "t": 1,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "transform": {
+          "x": 0,
+          "y": 5,
+          "width": 30,
+          "height": 25,
+          "rotation": 360
+        },
+        "pathTokens": [
+          350,
+          425,
+          650,
+          675,
+          350
+        ],
+        "tokenCount": 5
+      }
+    },
+    {
+      "name": "keyframed-clamped",
+      "mask": {
+        "id": "g12",
+        "shape": "circle",
+        "enabled": true,
+        "op": "add",
+        "space": "clip",
+        "invert": false,
+        "x": 0,
+        "y": 0,
+        "width": 40,
+        "height": 40,
+        "rotation": 0,
+        "feather": 0,
+        "roundness": 0,
+        "keyframes": [
+          {
+            "t": 1,
+            "x": 10,
+            "y": 0,
+            "width": 20,
+            "height": 20,
+            "rotation": 0
+          },
+          {
+            "t": 2,
+            "x": 20,
+            "y": 0,
+            "width": 20,
+            "height": 20,
+            "rotation": 0
+          }
+        ]
+      },
+      "t": 99,
+      "frameAspect": 1.7777777777777777,
+      "expect": {
+        "transform": {
+          "x": 20,
+          "y": 0,
+          "width": 20,
+          "height": 20,
+          "rotation": 0
+        },
+        "pathTokens": [
+          643.75,
+          500,
+          56.25,
+          100,
+          0,
+          1,
+          0,
+          112.5,
+          0,
+          56.25,
+          100,
+          0,
+          1,
+          0,
+          -112.5,
+          0
+        ],
+        "tokenCount": 16
+      }
+    }
+  ]
+}

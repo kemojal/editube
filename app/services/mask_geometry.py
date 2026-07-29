@@ -67,10 +67,6 @@ class _Box:
     top: float
 
 
-def _round2(value: float) -> float:
-    return round(value * 100) / 100
-
-
 def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import uuid
@@ -792,8 +793,27 @@ def start_mask_track(
     if direction not in ("forward", "backward", "both"):
         raise HTTPException(status_code=400, detail="direction must be forward, backward, or both")
 
+    # I9: `mask` arrives straight from the request body and previously only
+    # got an `isinstance(dict)` check -- unclamped values reached
+    # `transform_to_bbox`/`tracker.init` in the RQ job and an unbounded
+    # payload was persisted into `AiResult.result_data` and reflected back to
+    # clients. `sanitize_mask` (already used by the export path) clamps
+    # numerics and caps array sizes; run it here too, before the mask is
+    # used OR persisted.
+    from app.services.mask_matte import sanitize_mask
+
+    clean_mask = sanitize_mask(body.mask)
+    if clean_mask is None:
+        raise HTTPException(status_code=400, detail="mask is invalid")
+    # Belt-and-suspenders cap on the persisted payload size -- sanitize_mask
+    # already bounds array lengths, but this guards the JSON blob we commit
+    # into AiResult.result_data (and echo back to clients) against still
+    # being unreasonably large.
+    if len(json.dumps(clean_mask)) > 512_000:
+        raise HTTPException(status_code=400, detail="mask payload is too large")
+
     payload = {
-        "mask": body.mask,
+        "mask": clean_mask,
         "clipKey": body.clip_key,
         "clipStart": body.clip_start,
         "clipEnd": body.clip_end,

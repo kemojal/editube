@@ -49,13 +49,18 @@ from app.services.mask_geometry import (
     sample_mask_transform,
 )
 
-FIXTURE = (
-    Path(__file__).resolve().parents[2]
-    / "editube-frontend"
-    / "docs"
-    / "fixtures"
-    / "mask-geometry-golden.json"
-)
+# I10: this used to resolve only via the monorepo layout
+# (`parents[2]/"editube-frontend"/...`) and SkipTest if absent. Per
+# CLAUDE.md, `editube/` becomes the git root when split out for standalone
+# deployment -- in that configuration the monorepo path never exists, so the
+# entire cross-language parity guarantee silently evaporated while CI stayed
+# green. Fixed by vendoring a copy of the fixture into this repo
+# (`tests/fixtures/mask-geometry-golden.json`) and reading that; it is
+# checked in here and kept in sync manually with the frontend's copy
+# whenever `mask-geometry.ts`'s golden cases change. If even the vendored
+# copy is missing, that's a broken checkout, not an environment this suite
+# should quietly tolerate -- fail loudly instead of skipping.
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "mask-geometry-golden.json"
 
 # Shapes whose golden `pathTokens` are groups of 5: M(x,y) H(x) V(y) H(x),
 # i.e. an axis-aligned, unrounded rectangle's 4 corners.
@@ -102,7 +107,14 @@ class MaskGeometryParityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not FIXTURE.exists():
-            raise unittest.SkipTest(f"golden fixture not found at {FIXTURE}")
+            # Fail loudly, not SkipTest (I10) -- a missing vendored fixture
+            # is a broken checkout, and silently skipping let this whole
+            # cross-language parity guarantee evaporate without failing CI.
+            raise RuntimeError(
+                f"vendored golden fixture missing at {FIXTURE}; this repo "
+                "carries its own copy so parity testing doesn't depend on "
+                "the monorepo layout -- see I10 in the mask-geometry parity docstring."
+            )
         cls.cases = json.loads(FIXTURE.read_text())["cases"]
 
     def _case(self, name):
