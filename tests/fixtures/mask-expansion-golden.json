@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "note": "Cross-language parity fixture for Task 2 (Expansion). Asserts that TypeScript's expansionRadius() (mask-geometry.ts) and Python's expansion_radius() (mask_geometry.py) compute the identical VIEWBOX-space radius for the same mask, and that the Pillow kernel size mask_matte.py derives from that radius follows the documented `kernel = 2*round(radius_px) + 1` contract. sx/sy simulate scaling the 1000x1000 VIEWBOX onto an output frame of a given pixel size (sx = width/VIEWBOX, sy = height/VIEWBOX); radiusPx = radiusViewbox * ((sx + sy) / 2), mirroring render_matte_frame's feather scaling.",
+  "cases": [
+    {
+      "name": "zero expansion is a no-op",
+      "width": 40,
+      "height": 40,
+      "expansion": 0,
+      "sx": 0.5,
+      "sy": 0.5,
+      "expectRadiusViewbox": 0,
+      "expectOperator": null,
+      "expectRadiusPx": 0,
+      "expectKernel": null
+    },
+    {
+      "name": "positive expansion dilates a square mask",
+      "width": 40,
+      "height": 40,
+      "expansion": 50,
+      "sx": 0.5,
+      "sy": 0.5,
+      "expectRadiusViewbox": 50,
+      "expectOperator": "dilate",
+      "expectRadiusPx": 25,
+      "expectKernel": 51
+    },
+    {
+      "name": "negative expansion erodes a non-square mask (uses the shorter axis)",
+      "width": 60,
+      "height": 30,
+      "expansion": -100,
+      "sx": 0.3,
+      "sy": 0.1,
+      "expectRadiusViewbox": 75,
+      "expectOperator": "erode",
+      "expectRadiusPx": 15,
+      "expectKernel": 31
+    },
+    {
+      "name": "fractional radius rounds to the nearest Pillow kernel",
+      "width": 33,
+      "height": 33,
+      "expansion": 17,
+      "sx": 0.4,
+      "sy": 0.4,
+      "expectRadiusViewbox": 14.025,
+      "expectOperator": "dilate",
+      "expectRadiusPx": 5.61,
+      "expectKernel": 13
+    }
+  ]
+}

@@ -28,7 +28,7 @@ from typing import Any
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
-from app.services.mask_geometry import VIEWBOX, mask_is_inert, mask_polygons
+from app.services.mask_geometry import VIEWBOX, expansion_radius, mask_is_inert, mask_polygons
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +216,7 @@ def sanitize_mask(raw: Any) -> dict[str, Any] | None:
         "rotation": _wrap_rotation(_finite(raw.get("rotation"))),
         "feather": _clamp(_finite(raw.get("feather")), 0, 100),
         "roundness": _clamp(_finite(raw.get("roundness")), 0, 100),
+        "expansion": _clamp(_finite(raw.get("expansion")), -100, 100),
     }
 
     keyframes = raw.get("keyframes")
@@ -333,6 +334,29 @@ def render_matte_frame(masks: list[dict[str, Any]], t: float, size: tuple[int, i
                         draw.ellipse([px - r, py - r, px + r, py + r], fill=color)
                 elif len(pts) >= 3:
                     draw.polygon(pts, fill=color)
+
+            # Expansion (dilate/erode) applies to the crisp shape BEFORE
+            # feather -- mirrors mask-svg-defs.tsx's <feMorphology> placed
+            # ahead of <feGaussianBlur> in the same filter. Expanding an
+            # already-feathered edge would blur the dilation itself into
+            # mush instead of growing the shape cleanly.
+            expansion = float(mask.get("expansion") or 0)
+            if expansion != 0:
+                radius_viewbox = expansion_radius(mask)
+                radius_px = radius_viewbox * ((sx + sy) / 2)
+                # Pillow's MaxFilter/MinFilter take an odd integer kernel
+                # size, not a radius: kernel = 2r + 1 (see the contract
+                # comment on EXPANSION_RADIUS_FACTOR in mask_geometry.py).
+                # Round to the nearest whole pixel -- Pillow has no
+                # fractional-radius morphology, so any sub-pixel remainder
+                # is simply dropped here; the resulting drift vs the
+                # browser's continuous feMorphology radius is bounded to
+                # <= 0.5px and does not accumulate across frames.
+                r = round(radius_px)
+                if r > 0:
+                    kernel = 2 * r + 1
+                    morph = ImageFilter.MaxFilter(kernel) if expansion > 0 else ImageFilter.MinFilter(kernel)
+                    layer = layer.filter(morph)
 
             feather = float(mask.get("feather") or 0)
             if feather > 0:

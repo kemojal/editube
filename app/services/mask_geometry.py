@@ -33,6 +33,39 @@ VIEWBOX = 1000
 # aspect change never turns a circle into an ellipse.
 ROUND_SHAPES = {"circle", "star", "heart"}
 
+# Expansion -> feMorphology radius contract. MUST stay in sync with
+# `EXPANSION_RADIUS_FACTOR`/`expansionRadius` in the TypeScript mirror
+# (mask-geometry.ts) or the exported MP4 dilates/erodes by a different
+# amount than what the editor previewed.
+#
+# The Expansion slider runs -100..100 (0 = no change), mapped to a
+# VIEWBOX-space (0-1000) radius using the same "% of the shape's shorter
+# axis" convention as Feather:
+#
+#   radius = (|expansion| / 100) * min(width, height) * (VIEWBOX / 100) * EXPANSION_RADIUS_FACTOR
+#
+# On the TypeScript side that `radius` goes straight into `<feMorphology
+# radius>`, which accepts a continuous float. Pillow has no continuous-radius
+# morphology: `ImageFilter.MaxFilter`/`MinFilter` take an odd integer
+# **kernel size**, and the standard radius<->kernel identity is
+# `kernel = 2r + 1`. `mask_matte.py` rounds `r` (converted to output pixels)
+# to the nearest integer before building that kernel, since there is no way
+# to represent a fractional radius in Pillow's morphology filters. That
+# rounding is the ONLY drift between the two renderers: a fixed, bounded
+# (<= 0.5px) offset that does not compound across frames and is well under
+# one visible pixel at any real export resolution.
+EXPANSION_RADIUS_FACTOR = 0.25
+
+
+def expansion_radius(mask: dict[str, Any]) -> float:
+    """Mirrors `expansionRadius` in mask-geometry.ts — see the contract
+    comment on `EXPANSION_RADIUS_FACTOR` above."""
+    width = float(mask.get("width") or 0)
+    height = float(mask.get("height") or 0)
+    shorter = min(width, height)
+    expansion = float(mask.get("expansion") or 0)
+    return (abs(expansion) / 100.0) * shorter * (VIEWBOX / 100.0) * EXPANSION_RADIUS_FACTOR
+
 _CIRCLE_SEGMENTS = 64
 _CUBIC_SEGMENTS = 24
 _CORNER_ARC_SEGMENTS = 8
@@ -86,10 +119,12 @@ def _lerp_angle(a: float, b: float, t: float) -> float:
     return a + delta * t
 
 
-# Channels with no base property on the mask dict yet (zoom/expansion land in
-# later tasks) fall back to these fixed defaults, mirroring
-# `CHANNEL_FALLBACK_DEFAULT` in mask-keyframes.ts.
-_CHANNEL_FALLBACK_DEFAULT: dict[str, float] = {"zoom": 100.0, "expansion": 0.0}
+# Channels with no base property on the mask dict yet (zoom lands in a later
+# task) fall back to these fixed defaults, mirroring
+# `CHANNEL_FALLBACK_DEFAULT` in mask-keyframes.ts. `expansion` DOES have a
+# base property now (Task 2) — `_base_channel_value`'s `channel in mask`
+# check picks it up like `feather`/`roundness` without needing a case here.
+_CHANNEL_FALLBACK_DEFAULT: dict[str, float] = {"zoom": 100.0}
 
 _TRANSFORM_CHANNELS = ("x", "y", "width", "height", "rotation")
 
