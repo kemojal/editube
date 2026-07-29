@@ -766,6 +766,140 @@ def cancel_rough_cut_effect(
     return {"ok": True, "video_id": video_id, "ai_result_id": result_id}
 
 
+class MaskTrackBody(BaseModel):
+    mask: dict[str, Any]
+    clip_key: str
+    clip_start: float = 0.0
+    clip_end: float = 0.0
+    anchor_time: float = 0.0
+    direction: str = "both"
+    source_url: str | None = None
+
+
+@router.post("/{video_id}/ai/mask-track")
+def start_mask_track(
+    video_id: int,
+    body: MaskTrackBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+    if not body.clip_key.strip():
+        raise HTTPException(status_code=400, detail="clip_key is required")
+    if not isinstance(body.mask, dict) or not body.mask:
+        raise HTTPException(status_code=400, detail="mask is required")
+    direction = (body.direction or "both").strip().lower()
+    if direction not in ("forward", "backward", "both"):
+        raise HTTPException(status_code=400, detail="direction must be forward, backward, or both")
+
+    payload = {
+        "mask": body.mask,
+        "clipKey": body.clip_key,
+        "clipStart": body.clip_start,
+        "clipEnd": body.clip_end,
+        "anchorTime": body.anchor_time,
+        "direction": direction,
+        "sourceUrl": body.source_url,
+        "status": "queued",
+        "progress": 0,
+    }
+    row = AiResult(video_id=video_id, result_type="mask_track", status="queued", result_data=payload)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    from app.jobs.queue import enqueue_mask_track_job
+
+    rq_job_id = enqueue_mask_track_job(row.id)
+    data = dict(row.result_data or {})
+    if rq_job_id:
+        data["rqJobId"] = rq_job_id
+        row.result_data = data
+        db.commit()
+    else:
+        msg = "Background worker unavailable. Configure Redis and an RQ worker for mask tracking."
+        row.status = "failed"
+        row.error_message = msg
+        data["status"] = "failed"
+        data["error"] = msg
+        row.result_data = data
+        db.commit()
+    db.refresh(row)
+    return {
+        "video_id": row.video_id,
+        "result_type": row.result_type,
+        "status": row.status,
+        "result_data": row.result_data,
+        "error_message": row.error_message,
+        "ai_result_id": row.id,
+    }
+
+
+@router.get("/{video_id}/ai/mask-track/{result_id}")
+def get_mask_track(
+    video_id: int,
+    result_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+    row = (
+        db.query(AiResult)
+        .filter(AiResult.id == result_id, AiResult.video_id == video_id, AiResult.result_type == "mask_track")
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Mask track job not found")
+    return {
+        "video_id": row.video_id,
+        "result_type": row.result_type,
+        "status": row.status,
+        "result_data": row.result_data,
+        "error_message": row.error_message,
+        "ai_result_id": row.id,
+    }
+
+
+@router.post("/{video_id}/ai/mask-track/{result_id}/cancel")
+def cancel_mask_track(
+    video_id: int,
+    result_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _check_video_access(video_id, db, current_user)
+    row = (
+        db.query(AiResult)
+        .filter(AiResult.id == result_id, AiResult.video_id == video_id, AiResult.result_type == "mask_track")
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Mask track job not found")
+    data = dict(row.result_data or {})
+    rq_job_id = data.get("rqJobId")
+    if isinstance(rq_job_id, str) and rq_job_id.strip():
+        try:
+            from redis import Redis
+            from rq.job import Job
+
+            url = os.environ.get("REDIS_URL", "").strip()
+            if url:
+                job = Job.fetch(rq_job_id, connection=Redis.from_url(url))
+                if job.get_status() in ("queued", "scheduled", "deferred"):
+                    job.cancel()
+        except Exception:
+            pass
+    if row.status in ("queued", "processing"):
+        row.status = "failed"
+        row.error_message = "Mask tracking cancelled."
+        data["status"] = "failed"
+        data["error"] = "Mask tracking cancelled."
+        data["progress"] = 0
+        row.result_data = data
+        db.commit()
+    return {"ok": True, "video_id": video_id, "ai_result_id": result_id}
+
+
 class RoughCutExportBody(BaseModel):
     format: str = "mp4"  # "mp4" | "wav"
     keepRanges: list[dict[str, Any]] = Field(default_factory=list)

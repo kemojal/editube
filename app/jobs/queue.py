@@ -59,6 +59,31 @@ def enqueue_rough_cut_effect_job(ai_result_id: int) -> str | None:
         return None
 
 
+def enqueue_mask_track_job(ai_result_id: int) -> str | None:
+    """Enqueue CV mask tracking. Returns RQ job id or None."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; mask track not enqueued for ai_result %s", ai_result_id)
+        return None
+    try:
+        from app.jobs.mask_track import mask_track_job
+        from redis import Redis
+        from rq import Queue
+
+        timeout_sec = max(900, int(os.environ.get("MASK_TRACK_TIMEOUT_SEC", "3600") or "3600"))
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=timeout_sec)
+        job = q.enqueue(
+            mask_track_job,
+            ai_result_id,
+            job_timeout=timeout_sec,
+        )
+        return job.id if job else None
+    except Exception as e:
+        logger.exception("Failed to enqueue mask track ai_result=%s: %s", ai_result_id, e)
+        return None
+
+
 def enqueue_generated_media_job(media_id: int) -> str | None:
     """Enqueue AI media generation. Returns the RQ job id, or None if unqueued.
 
@@ -183,6 +208,49 @@ def enqueue_mention_email_job(
     except Exception as e:
         logger.exception(
             "Failed to enqueue mention email for user %s: %s",
+            recipient_user_id,
+            e,
+        )
+        return False
+
+
+def enqueue_comment_notification_email_job(
+    recipient_user_id: int,
+    actor_name: str,
+    project_name: str | None,
+    video_name: str | None,
+    comment_text: str,
+    comment_url: str,
+) -> bool:
+    """Enqueue async 'new comment on your work' email. Returns True if queued."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning(
+            "REDIS_URL not set; comment email job not enqueued for user %s",
+            recipient_user_id,
+        )
+        return False
+    try:
+        from app.jobs.mention_email import send_comment_notification_email_job
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=3600)
+        q.enqueue(
+            send_comment_notification_email_job,
+            recipient_user_id,
+            actor_name,
+            project_name,
+            video_name,
+            comment_text,
+            comment_url,
+            job_timeout=300,
+        )
+        return True
+    except Exception as e:
+        logger.exception(
+            "Failed to enqueue comment email for user %s: %s",
             recipient_user_id,
             e,
         )
