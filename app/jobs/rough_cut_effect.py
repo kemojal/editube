@@ -212,7 +212,22 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
 # SEGMENTATION_PROVIDER=auto|local|http.
 
 
+def _was_canceled(db, row: AiResult) -> bool:
+    """True if the user cancelled while this job was running.
+
+    Re-read from the database rather than trusted from memory: the cancel is
+    written by the API process, so the copy this job loaded at the start cannot
+    know about it. Without this check a job that finished in the gap between the
+    stop being requested and delivered would write `completed` over the user's
+    cancel, and the effect would appear to have applied anyway.
+    """
+    db.expire(row)
+    return bool((row.result_data or {}).get("canceled")) or row.status == "canceled"
+
+
 def _complete(db, row: AiResult, clip_key: str, effect_type: str, output_url: str) -> None:
+    if _was_canceled(db, row):
+        return
     _update_row(db, row, status="completed", progress=100, output_url=output_url)
     _attach_to_draft(db, row.video_id, clip_key, effect_type, {
         "resultId": row.id,
@@ -223,6 +238,10 @@ def _complete(db, row: AiResult, clip_key: str, effect_type: str, output_url: st
 
 
 def _fail(db, row: AiResult, message: str) -> None:
+    # A cancelled job dies by signal or raises on a closed pipe; reporting that as
+    # a failure would show the user an error for something they chose to do.
+    if _was_canceled(db, row):
+        return
     payload = dict(row.result_data or {})
     payload["status"] = "failed"
     payload["progress"] = 0

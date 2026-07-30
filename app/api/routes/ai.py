@@ -876,27 +876,72 @@ def cancel_rough_cut_effect(
         raise HTTPException(status_code=404, detail="Effect job not found")
     data = dict(row.result_data or {})
     rq_job_id = data.get("rqJobId")
+    stopped = False
+
     if isinstance(rq_job_id, str) and rq_job_id.strip():
         try:
             from redis import Redis
+            from rq.command import send_stop_job_command
             from rq.job import Job
 
             url = os.environ.get("REDIS_URL", "").strip()
             if url:
-                job = Job.fetch(rq_job_id, connection=Redis.from_url(url))
-                if job.get_status() in ("queued", "scheduled", "deferred"):
+                connection = Redis.from_url(url)
+                job = Job.fetch(rq_job_id, connection=connection)
+                status = job.get_status(refresh=True)
+                if status in ("queued", "scheduled", "deferred"):
                     job.cancel()
+                    stopped = True
+                elif status == "started":
+                    # `job.cancel()` only removes a job from the queue — it does
+                    # nothing to one already running, so cancelling a started job
+                    # used to mark the row failed while the work-horse carried on
+                    # burning GPU. This actually stops it.
+                    send_stop_job_command(connection, rq_job_id)
+                    stopped = True
         except Exception:
+            # Redis unreachable, or the job already finished between the fetch and
+            # the stop. The row is still marked below — a cancel the user asked
+            # for should not appear to have been ignored.
             pass
+
     if row.status in ("queued", "processing"):
-        row.status = "failed"
-        row.error_message = "Effect cancelled."
-        data["status"] = "failed"
-        data["error"] = "Effect cancelled."
+        # "canceled", not "failed". The user did this on purpose, and rendering it
+        # as an error puts a red alarm on an intentional action.
+        row.status = "canceled"
+        row.error_message = None
+        data["status"] = "canceled"
         data["progress"] = 0
+        data.pop("error", None)
+        data.pop("errorDetail", None)
+        # Read by the job itself before it writes a result, so work that finishes
+        # in the gap cannot resurrect a cancelled row.
+        data["canceled"] = True
         row.result_data = data
         db.commit()
-    return {"ok": True, "video_id": video_id, "ai_result_id": result_id}
+
+        clip_key = str(data.get("clipKey") or "").strip()
+        effect_type = str(data.get("effectType") or "").strip()
+        if clip_key and effect_type:
+            from app.jobs.rough_cut_effect import _attach_to_draft
+
+            _attach_to_draft(
+                db,
+                row.video_id,
+                clip_key,
+                effect_type,
+                {"resultId": row.id, "status": "canceled", "progress": 0},
+            )
+
+    return {
+        "ok": True,
+        "video_id": video_id,
+        "ai_result_id": result_id,
+        # Whether the running work was actually signalled, as opposed to only the
+        # row being marked. Useful when a stop could not be delivered.
+        "stopped": stopped,
+        "status": row.status,
+    }
 
 
 class MaskTrackBody(BaseModel):
