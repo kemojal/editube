@@ -170,6 +170,17 @@ def clear_predictors() -> None:
         _PREDICTORS.clear()
 
 
+def warm_up(*, quality: str = "faster") -> None:
+    """Loads the checkpoint ahead of the first segmentation.
+
+    Exists so the caller can report progress across a multi-second weight load
+    rather than having it billed silently to the first frame — where it looked
+    exactly like the first frame had hung.
+    """
+    _assert_fork_safe()
+    _load_predictor(MODEL_IDS.get(quality, MODEL_IDS["faster"]), pick_device(), os.getpid())
+
+
 def segment_at_points(
     frame_rgb: Any,
     points: list[tuple[float, float]],

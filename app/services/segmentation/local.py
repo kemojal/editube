@@ -172,11 +172,23 @@ class LocalSegmentationProvider:
         Safe to call directly only from a process that has not forked from a
         torch-using or HTTP-using parent — uvicorn, or the spawned child itself.
         """
+        # Report before the slow imports, not after. Loading torch and the model
+        # weights takes several seconds during which nothing else happens, and a
+        # bar that sits at one number through it is indistinguishable from a
+        # wedged job — which is exactly how a genuinely dead job was read.
+        def step(value: int) -> None:
+            if progress:
+                progress(value)
+
+        step(4)
+
         import cv2  # type: ignore
         import numpy as np  # type: ignore
         # Imported lazily and only used on the automatic path, so a SAM 2-only
         # deployment does not need rembg at all.
         from rembg import new_session, remove  # type: ignore
+
+        step(6)
 
         quality = str(settings.get("quality") or "faster").lower()
         # Read once per clip, not per frame: the interactive preview reads the same
@@ -199,9 +211,18 @@ class LocalSegmentationProvider:
                     "this server. Run `pip install torch sam2` in the API "
                     "environment and restart the worker, or switch to Auto removal."
                 )
+            # Load the checkpoint now rather than lazily on the first frame.
+            # Same total time, but it stops several seconds of weight loading from
+            # being billed to "frame 1", where it looked like the first frame had
+            # hung. Progress can move across it instead.
+            step(8)
+            sam2_backend.warm_up(quality=quality)
+            step(10)
             session = None
         else:
+            step(8)
             session = new_session(self.MODELS.get(quality, self.MODELS["faster"]))
+            step(10)
 
         capture = cv2.VideoCapture(source)
         if not capture.isOpened():

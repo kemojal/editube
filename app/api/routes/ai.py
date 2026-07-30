@@ -757,6 +757,9 @@ def get_rough_cut_effect(
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Effect job not found")
+
+    _reconcile_dead_effect(db, row)
+
     return {
         "video_id": row.video_id,
         "result_type": row.result_type,
@@ -765,6 +768,84 @@ def get_rough_cut_effect(
         "error_message": row.error_message,
         "ai_result_id": row.id,
     }
+
+
+def _reconcile_dead_effect(db: Session, row: AiResult) -> None:
+    """Marks a row failed when the RQ job behind it is gone.
+
+    Without this a job whose worker died stays `processing` forever and the
+    editor polls a percentage that will never move again — which is exactly what
+    happened when the work-horse was killed by a signal: RQ marked *its* job
+    failed, but nothing told our row, so three of them sat at 8% indefinitely.
+
+    Deliberately keyed on the RQ job's actual state rather than a timeout, so a
+    genuinely slow job is never killed off for being slow. If the job id is
+    missing or Redis is unreachable, this does nothing — a wrong "failed" is
+    worse than a stale "processing".
+    """
+    if row.status not in {"queued", "processing"}:
+        return
+
+    payload = dict(row.result_data or {})
+    rq_job_id = str(payload.get("rqJobId") or "").strip()
+    if not rq_job_id:
+        return
+
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        return
+
+    try:
+        from redis import Redis
+        from rq.job import Job
+
+        connection = Redis.from_url(url)
+        try:
+            job = Job.fetch(rq_job_id, connection=connection)
+        except Exception:
+            # Job.fetch raises NoSuchJobError once the job has expired out of
+            # Redis. A row still claiming to run then has nothing behind it.
+            job = None
+    except Exception:
+        # Redis unreachable or rq unavailable: leave the row alone.
+        return
+
+    if job is not None and job.get_status(refresh=True) not in {"failed", "canceled", "stopped"}:
+        return
+
+    reason = (
+        "The background worker stopped before finishing this effect. "
+        "Check the worker, then run it again."
+    )
+    if job is not None:
+        detail = (job.exc_info or "").strip().splitlines()
+        if detail:
+            reason = f"{reason} Last error: {detail[-1][:200]}"
+
+    payload["status"] = "failed"
+    # Zeroed so the row and the draft agree; a failed job showing 8% invites the
+    # reading that it is still partway through.
+    payload["progress"] = 0
+    payload["error"] = reason
+    row.status = "failed"
+    row.error_message = reason
+    row.result_data = payload
+    db.commit()
+
+    clip_key = str(payload.get("clipKey") or "").strip()
+    effect_type = str(payload.get("effectType") or "").strip()
+    if clip_key and effect_type:
+        # The editor reads progress off the draft, so the draft has to learn too
+        # or the inspector keeps showing a spinner for a dead job.
+        from app.jobs.rough_cut_effect import _attach_to_draft
+
+        _attach_to_draft(
+            db,
+            row.video_id,
+            clip_key,
+            effect_type,
+            {"resultId": row.id, "status": "failed", "progress": 0, "error": reason},
+        )
 
 
 @router.post("/{video_id}/ai/rough-cut-effect/{result_id}/cancel")
