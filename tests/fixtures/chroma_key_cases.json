@@ -1,0 +1,19 @@
+{
+  "_comment": "Shared golden for chroma key. The frontend reads this from _lib/chroma/chroma-export-contract.test.ts and the backend from tests/test_chroma_key.py. Both must produce `filter` from `removeBg`. Edit in one place only; whichever side disagrees is the side that is wrong.",
+  "cases": [
+    { "name": "disabled produces no filter at all", "removeBg": {}, "filter": null },
+    { "name": "explicitly disabled", "removeBg": { "chromaKey": false, "keyColor": "#00ff00" }, "filter": null },
+    { "name": "defaults when only enabled", "removeBg": { "chromaKey": true }, "filter": "chromakey=0x00ff00:0.4000:0.1000" },
+    { "name": "shorthand colour is normalised for ffmpeg", "removeBg": { "chromaKey": true, "keyColor": "#0f0" }, "filter": "chromakey=0x00ff00:0.4000:0.1000" },
+    { "name": "uppercase hex is normalised", "removeBg": { "chromaKey": true, "keyColor": "#00FF00" }, "filter": "chromakey=0x00ff00:0.4000:0.1000" },
+    { "name": "blue screen", "removeBg": { "chromaKey": true, "keyColor": "#0000ff" }, "filter": "chromakey=0x0000ff:0.4000:0.1000" },
+    { "name": "custom tuning", "removeBg": { "chromaKey": true, "keyColor": "#123456", "similarity": 0.65, "blend": 0.25 }, "filter": "chromakey=0x123456:0.6500:0.2500" },
+    { "name": "hard edge keeps an explicit zero blend", "removeBg": { "chromaKey": true, "similarity": 0.5, "blend": 0 }, "filter": "chromakey=0x00ff00:0.5000:0.0000" },
+    { "name": "zero similarity is not replaced by the default", "removeBg": { "chromaKey": true, "similarity": 0 }, "filter": "chromakey=0x00ff00:0.0000:0.1000" },
+    { "name": "spill appends despill", "removeBg": { "chromaKey": true, "spill": 0.5 }, "filter": "chromakey=0x00ff00:0.4000:0.1000,despill=type=green:mix=0.5000" },
+    { "name": "zero spill appends nothing", "removeBg": { "chromaKey": true, "spill": 0 }, "filter": "chromakey=0x00ff00:0.4000:0.1000" },
+    { "name": "out-of-range values are clamped", "removeBg": { "chromaKey": true, "similarity": 5, "blend": -3 }, "filter": "chromakey=0x00ff00:1.0000:0.0000" },
+    { "name": "unparseable colour yields no filter rather than a broken one", "removeBg": { "chromaKey": true, "keyColor": "not-a-colour" }, "filter": null },
+    { "name": "empty colour falls back to the default green", "removeBg": { "chromaKey": true, "keyColor": "" }, "filter": "chromakey=0x00ff00:0.4000:0.1000" }
+  ]
+}

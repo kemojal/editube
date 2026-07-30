@@ -9,6 +9,7 @@ from typing import Any
 
 from app.db.database import SessionLocal
 from app.db.models import AiResult, Video
+from app.services.chroma_key import build_chroma_key_filter, chroma_key_from_attributes
 from app.services.segmentation import get_provider
 from app.utils.cloudinary import cloudinary_credentials_configured, upload_local_path_to_cloudinary
 
@@ -85,6 +86,33 @@ def build_ffmpeg_effect_command(
     return cmd
 
 
+def build_chroma_key_command(source: str, out_path: str, settings: dict[str, Any]) -> list[str]:
+    """ffmpeg command for a chroma-key-only removal.
+
+    The filter itself comes from `app.services.chroma_key`, which is held to the
+    same golden fixture as the frontend keyer — see tests/test_chroma_key.py.
+
+    VP9 in WebM with yuva420p because the output is a cutout: h264 has no alpha,
+    so an mp4 here would look correct in isolation and be wrong the moment it is
+    composited.
+    """
+    chroma = chroma_key_from_attributes(settings)
+    chain = build_chroma_key_filter(chroma)
+    if not chain:
+        raise RuntimeError("Chroma key is enabled but no key colour is set.")
+
+    return [
+        "ffmpeg", "-y",
+        "-i", source,
+        "-vf", chain,
+        "-c:v", "libvpx-vp9",
+        "-pix_fmt", "yuva420p",
+        "-b:v", "0", "-crf", "30",
+        "-c:a", "copy",
+        out_path,
+    ]
+
+
 def rough_cut_effect_job(ai_result_id: int) -> None:
     db = SessionLocal()
     try:
@@ -104,7 +132,18 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
         _update_row(db, row, status="processing", progress=8)
         source = _resolve_media_source(video.file_path)
 
-        if effect_type in ML_EFFECTS:
+        # Chroma key needs no model — it is a pure ffmpeg filter. A removal that
+        # only keys should therefore work on any server, with no provider
+        # configured and nothing installed. Only auto/custom removal, which do
+        # need a segmentation model, go to a provider.
+        chroma_only = (
+            effect_type == "remove_bg"
+            and bool(settings.get("chromaKey"))
+            and not settings.get("autoRemoval")
+            and not settings.get("customRemoval")
+        )
+
+        if effect_type in ML_EFFECTS and not chroma_only:
             # Providers produce a file or a URL; publishing stays here, because
             # this is what already knows Cloudinary, the uploads directory and
             # the naming scheme.
@@ -126,18 +165,24 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
             _complete(db, row, clip_key, effect_type, output_url)
             return
 
-        if effect_type not in FFMPEG_EFFECTS:
+        if effect_type not in FFMPEG_EFFECTS and not chroma_only:
             raise RuntimeError(f"Unsupported effect type: {effect_type}")
 
         with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp) / f"rough-cut-effect-{row.id}.mp4"
-            cmd = build_ffmpeg_effect_command(
-                source,
-                str(out),
-                effect_type=effect_type,
-                clip_target=clip_target,
-                settings=settings,
-            )
+            # A keyed result has to keep its alpha, so it cannot be h264/mp4 —
+            # that would silently composite the cutout onto black.
+            suffix = "webm" if chroma_only else "mp4"
+            out = Path(tmp) / f"rough-cut-effect-{row.id}.{suffix}"
+            if chroma_only:
+                cmd = build_chroma_key_command(source, str(out), settings)
+            else:
+                cmd = build_ffmpeg_effect_command(
+                    source,
+                    str(out),
+                    effect_type=effect_type,
+                    clip_target=clip_target,
+                    settings=settings,
+                )
             _update_row(db, row, status="processing", progress=20)
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             _update_row(db, row, status="processing", progress=84)
