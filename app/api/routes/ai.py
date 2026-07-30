@@ -813,16 +813,21 @@ def _reconcile_dead_effect(db: Session, row: AiResult) -> None:
     if job is not None and job.get_status(refresh=True) not in {"failed", "canceled", "stopped"}:
         return
 
-    reason = (
-        "The background worker stopped before finishing this effect. "
-        "Check the worker, then run it again."
-    )
+    # Two fields, deliberately. `error` is for the user and says what to do;
+    # `errorDetail` is the machine text, kept out of the way behind a disclosure
+    # in the editor. Concatenating them put "waitpid returned 6 (signal 6)" in
+    # front of someone trying to edit a video, which tells them nothing they can
+    # act on.
+    reason = "The background worker stopped before finishing. Nothing was changed — try again."
+    detail = None
     if job is not None:
-        detail = (job.exc_info or "").strip().splitlines()
-        if detail:
-            reason = f"{reason} Last error: {detail[-1][:200]}"
+        lines = (job.exc_info or "").strip().splitlines()
+        if lines:
+            detail = lines[-1][:300]
 
     payload["status"] = "failed"
+    if detail:
+        payload["errorDetail"] = detail
     # Zeroed so the row and the draft agree; a failed job showing 8% invites the
     # reading that it is still partway through.
     payload["progress"] = 0
@@ -844,7 +849,13 @@ def _reconcile_dead_effect(db: Session, row: AiResult) -> None:
             row.video_id,
             clip_key,
             effect_type,
-            {"resultId": row.id, "status": "failed", "progress": 0, "error": reason},
+            {
+                "resultId": row.id,
+                "status": "failed",
+                "progress": 0,
+                "error": reason,
+                **({"errorDetail": detail} if detail else {}),
+            },
         )
 
 

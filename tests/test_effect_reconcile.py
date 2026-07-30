@@ -91,9 +91,14 @@ class ReconcileTests(unittest.TestCase):
             _reconcile_dead_effect(self.db, target)
         self.assertEqual(target.status, "failed")
         self.assertIn("worker stopped", target.error_message)
-        # The underlying reason is the actionable part, so it must survive.
-        self.assertIn("signal 6", target.error_message)
         self.assertEqual(target.result_data["progress"], 0)
+
+        # The machine text is kept separate from the message shown to the user.
+        # Putting "waitpid returned 6 (signal 6)" in front of someone editing a
+        # video tells them nothing they can act on, so it lives behind a
+        # disclosure instead.
+        self.assertNotIn("signal 6", target.error_message)
+        self.assertIn("signal 6", target.result_data["errorDetail"])
 
     def test_a_vanished_job_marks_the_row_failed(self):
         # Job.fetch raises once the job has expired out of Redis.
