@@ -13,6 +13,14 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 
+#: Capability names, referenced by both the provider and the API that reports
+#: them to the editor. Auto matting needs a salient-object model; point prompts
+#: need a promptable one; propagation needs video memory across frames.
+CAPABILITY_AUTO_MATTE = "auto_matte"
+CAPABILITY_POINT_PROMPT = "point_prompt"
+CAPABILITY_PROPAGATE = "propagate"
+
+
 class SegmentationError(RuntimeError):
     """Raised with a message intended for the user, not just the log.
 
@@ -48,6 +56,15 @@ class SegmentationProvider(Protocol):
 
     def is_available(self) -> tuple[bool, str]:
         """`(ready, reason)`. `reason` is shown to the user when not ready."""
+
+    def supports(self, capability: str) -> bool:
+        """Whether this backend can do `capability`.
+
+        The editor needs this to decide what to offer. Auto matting and
+        point-prompt segmentation are genuinely different models, so a backend
+        that can do one may not do the other — offering a subject picker that
+        cannot segment is worse than not offering it.
+        """
 
     def run_effect(
         self,

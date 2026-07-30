@@ -19,7 +19,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .base import SegmentationError, SegmentationResult
+from .base import (
+    CAPABILITY_AUTO_MATTE,
+    CAPABILITY_POINT_PROMPT,
+    CAPABILITY_PROPAGATE,
+    SegmentationError,
+    SegmentationResult,
+)
 
 #: Frame-by-frame matting is slow on CPU; refuse very long clips rather than
 #: appearing to hang for an hour with no way to tell whether it is progressing.
@@ -37,6 +43,20 @@ class LocalSegmentationProvider:
     #: lighter u2net; `Better` is BiRefNet, which holds hair and soft edges far
     #: better and costs proportionally more.
     MODELS = {"faster": "u2netp", "better": "birefnet-general"}
+
+    def supports(self, capability: str) -> bool:
+        """rembg does whole-subject matting only.
+
+        Point prompts and cross-frame propagation need a promptable video model
+        (SAM 2), which is a separate install. Reporting this honestly is what
+        lets the editor hide a subject picker it cannot honour rather than
+        showing one that silently does nothing.
+        """
+        if capability == CAPABILITY_AUTO_MATTE:
+            return _has("rembg")
+        if capability in (CAPABILITY_POINT_PROMPT, CAPABILITY_PROPAGATE):
+            return _has("sam2")
+        return False
 
     def is_available(self) -> tuple[bool, str]:
         missing = [name for name in ("rembg", "cv2", "numpy", "PIL") if not _has(name)]

@@ -23,6 +23,14 @@ class HttpSegmentationProvider:
         self.url = os.environ.get("ROUGH_CUT_ML_PROVIDER_URL", "").strip()
         self.timeout = float(os.environ.get("ROUGH_CUT_ML_PROVIDER_TIMEOUT", "900") or "900")
 
+    def supports(self, capability: str) -> bool:
+        """A configured remote service is assumed to implement the contract.
+
+        There is no capability handshake in the existing protocol, and inventing
+        one would break deployments already speaking it.
+        """
+        return self.is_available()[0]
+
     def is_available(self) -> tuple[bool, str]:
         if not self.url:
             return False, (
