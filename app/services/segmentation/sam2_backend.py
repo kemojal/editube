@@ -27,8 +27,49 @@ MODEL_IDS = {
 }
 
 
+#: PID that first put torch to work here. See `_assert_fork_safe`.
+_TORCH_OWNER_PID: int | None = None
+
+
 def is_installed() -> bool:
+    # find_spec rather than import: the capability handshake calls this on every
+    # job, and importing torch to answer "no" would cost seconds per job — and,
+    # worse, would poison the process for forking (see `_assert_fork_safe`).
     return all(importlib.util.find_spec(name) is not None for name in ("torch", "sam2"))
+
+
+def _assert_fork_safe() -> None:
+    """Refuse to run torch in a process forked from a torch-using parent.
+
+    On macOS this combination does not raise — it takes the process out with
+    SIGSEGV/SIGABRT inside Metal's shader compiler, which kills an RQ worker
+    mid-job and pops a "Python quit unexpectedly" dialog. Measured directly:
+    a clean parent forking children that each load torch is fine and repeatable,
+    but once the parent itself has run inference, every forked child dies —
+    including children that clear the predictor cache and force CPU. The
+    poisoning is the fork, not the device.
+
+    So the invariant is "torch is only ever used by a process that has not
+    forked from a torch-using parent", and this asserts it rather than trusting
+    it. A clear error the operator can act on beats a signal that destroys the
+    worker and says nothing.
+    """
+    global _TORCH_OWNER_PID
+
+    current = os.getpid()
+    if _TORCH_OWNER_PID is None:
+        _TORCH_OWNER_PID = current
+        return
+    if _TORCH_OWNER_PID == current:
+        return
+
+    raise SegmentationError(
+        "Background removal cannot run in this process: it was forked from a "
+        "process that had already loaded the segmentation model, which crashes "
+        "hard on macOS instead of failing cleanly. Run the worker without "
+        "forking (`rq worker --worker-class rq.SimpleWorker`), or set "
+        "SEGMENTATION_PROVIDER=http to move the model out of the worker."
+    )
 
 
 def pick_device() -> str:
@@ -51,18 +92,22 @@ def pick_device() -> str:
     return "cpu"
 
 
-@functools.lru_cache(maxsize=2)
-def _load_predictor(model_id: str, device: str):
+@functools.lru_cache(maxsize=4)
+def _load_predictor(model_id: str, device: str, owner_pid: int):
     """Loads and caches a predictor.
 
     Cached per (model, device) because construction downloads and initialises
-    weights — doing that per click would make the tool unusable. The cache is
-    tiny by design: two tiers, one device.
+    weights — doing that per click would make the tool unusable.
+
+    `owner_pid` is part of the key and is not otherwise used. An lru_cache
+    survives fork, so without it a forked child would silently reuse a predictor
+    holding the parent's GPU handles. `_assert_fork_safe` is the real guard; this
+    makes the cache honest on its own terms so it cannot hand out an inherited
+    device context if that guard is ever relaxed.
     """
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-    predictor = SAM2ImagePredictor.from_pretrained(model_id, device=device)
-    return predictor
+    return SAM2ImagePredictor.from_pretrained(model_id, device=device)
 
 
 def segment_at_points(
@@ -86,15 +131,21 @@ def segment_at_points(
             "restart the worker."
         )
 
-    import numpy as np
-    import torch
-
     if not points and box is None:
         raise SegmentationError("Nothing was selected to segment.")
 
+    # Before importing torch, not after: the point is to fail cleanly rather than
+    # let a doomed process reach Metal.
+    _assert_fork_safe()
+
+    import numpy as np
+    import torch
+
     height, width = frame_rgb.shape[:2]
     device = pick_device()
-    predictor = _load_predictor(MODEL_IDS.get(quality, MODEL_IDS["faster"]), device)
+    predictor = _load_predictor(
+        MODEL_IDS.get(quality, MODEL_IDS["faster"]), device, os.getpid()
+    )
 
     point_coords = (
         np.array([[x * width, y * height] for x, y in points], dtype=np.float32)
