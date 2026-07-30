@@ -160,6 +160,80 @@ Existing videos created before this feature will have **`transcription: null`** 
 | **`failed`** with ffmpeg message | `ffmpeg` missing on the **worker** host, or bad/corrupt download. |
 | **`failed`** with CUDA / model errors | Wrong `TRANSCRIPTION_DEVICE` / `TRANSCRIPTION_COMPUTE_TYPE` for your machine. |
 
+## Background removal, chroma key and click-to-select
+
+Three separate paths, with deliberately different requirements:
+
+| Feature | Needs | Runs in |
+|---------|-------|---------|
+| **Chroma key** | nothing beyond `ffmpeg` | RQ worker (pure filter, no model) |
+| **Auto removal** | `rembg` (ONNX, in `requirements-ml.txt`) | spawned child of the worker |
+| **Custom removal / click-to-select** | `torch` + `sam2` | spawned child; preview in the API process |
+
+Chroma key needs no model at all, so it works on any host with no provider
+configured. Only auto/custom removal load a model.
+
+### Installing SAM 2 (click-to-select and custom removal)
+
+```bash
+.venv/bin/python -m pip install -r requirements-ml.txt   # includes torch + sam2
+```
+
+`torch` is by far the heaviest dependency here. To keep it out of the API image,
+set `SEGMENTATION_PROVIDER=http` and point `ROUGH_CUT_ML_PROVIDER_URL` at a GPU
+service instead. Capabilities are negotiated, so the editor hides the subject
+picker when the configured provider cannot honour point prompts.
+
+Checkpoints download from HuggingFace on first use (`sam2.1-hiera-tiny` for
+*Faster*, `sam2.1-hiera-large` for *Better*) and are cached thereafter. The first
+segmentation of a session therefore takes several seconds; subsequent ones are
+~0.3s on Apple silicon.
+
+### Env vars
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `SEGMENTATION_PROVIDER` | `auto` | `auto` \| `local` \| `http`. |
+| `SEGMENTATION_DEVICE` | auto-detected | Override device. Detection order is `cuda` → `mps` → `cpu`. |
+| `SEGMENTATION_LOCAL_MAX_SECONDS` | `120` | Refuses longer **clips** (not sources) rather than appearing to hang. |
+| `SEGMENTATION_ISOLATE` | `1` | Run removal in a separate interpreter. **Leave on** — see below. |
+| `SEGMENTATION_ISOLATE_TIMEOUT_SEC` | `3600` | Hard ceiling on the isolated child. |
+
+### Why removal runs in its own interpreter
+
+The RQ worker forks a child per job, and on macOS a forked child cannot safely
+use what this work needs. It fails by *signal*, not exception, so the worker dies
+mid-job and logs nothing — the visible symptom is a **"Python quit unexpectedly"**
+dialog. Three distinct crash sites were observed:
+
+- `_scproxy.get_proxies` → `SCDynamicStoreCopyProxiesWithOptions`. SystemConfiguration
+  is not fork-safe, and *any* HTTP client reaches it — including HuggingFace
+  checking for a checkpoint that is already cached.
+- `at::mps::MPSAllocator::allocate` → `IOGPUDeviceGetAllocatedSize`. The inherited
+  GPU handle is invalid in the child.
+- Metal's shader compiler (`SIGABRT`).
+
+`SEGMENTATION_ISOLATE=1` runs the work via
+`python -m app.services.segmentation.child`, a fresh interpreter that inherits no
+CoreFoundation state, no Metal context and no GPU handles. Set it to `0` only to
+get a readable traceback while debugging, and expect crashes if you do so under a
+forking worker.
+
+The interactive click-to-select preview is *not* isolated: it runs in the API
+process, which does not fork, because an interpreter start per click would defeat
+the point. It does mean a preview occupies a request thread while it runs.
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+|---------|----------------|
+| "Python quit unexpectedly", worker dies mid-job | `SEGMENTATION_ISOLATE=0` under a forking worker. Set it back to `1`. |
+| `remove bg requires ROUGH_CUT_ML_PROVIDER_URL` | `SEGMENTATION_PROVIDER=http` with no URL set. |
+| "needs SAM 2, which is not installed" | `pip install -r requirements-ml.txt`, then restart **both** API and worker. |
+| "This clip is Ns, over the 120s limit" | Trim the clip, raise `SEGMENTATION_LOCAL_MAX_SECONDS`, or use a GPU provider. |
+| Cutout looks opaque when inspected | Expected artefact: ffmpeg's *native* vp9 decoder drops WebM alpha. Decode with `-c:v libvpx-vp9`. The file carries `alpha_mode=1`. |
+| Subject picker missing in the editor | Provider reports no `point_prompt` capability — SAM 2 not installed, or an HTTP provider without it. |
+
 ## Creator studio (YouTube, aspect exports, chapters)
 
 ### YouTube OAuth and publish
