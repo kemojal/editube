@@ -138,6 +138,38 @@ class LocalSegmentationProvider:
         *,
         progress: Any = None,
     ) -> SegmentationResult:
+        """Dispatches to a spawned process unless isolation is switched off.
+
+        The indirection is not architectural taste — it is the fix for three
+        distinct hard crashes. An RQ worker forks per job, and a forked child on
+        macOS cannot safely reach SystemConfiguration (which any HTTP client
+        does, including a HuggingFace cache check), the MPS allocator, or the
+        Metal compiler. See `isolated.py` for the crash signatures.
+        """
+        from .isolated import isolation_enabled, remove_background_isolated
+
+        if isolation_enabled():
+            return remove_background_isolated(
+                source, clip_target, settings, output_dir, progress=progress
+            )
+        return self.remove_background_inprocess(
+            source, clip_target, settings, output_dir, progress=progress
+        )
+
+    def remove_background_inprocess(
+        self,
+        source: str,
+        clip_target: dict[str, Any],
+        settings: dict[str, Any],
+        output_dir: Path,
+        *,
+        progress: Any = None,
+    ) -> SegmentationResult:
+        """The actual work. Public because the spawned child calls it by name.
+
+        Safe to call directly only from a process that has not forked from a
+        torch-using or HTTP-using parent — uvicorn, or the spawned child itself.
+        """
         import cv2  # type: ignore
         import numpy as np  # type: ignore
         # Imported lazily and only used on the automatic path, so a SAM 2-only
