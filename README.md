@@ -118,6 +118,13 @@ This runs:
 
 On macOS, the script also sets `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` to avoid fork-related worker crashes.
 
+That variable only disables the Objective-C runtime's fork-safety *check*; it does
+not make CoreFoundation, SystemConfiguration or Metal fork-safe. Work that touches
+those (background removal, and anything else loading torch or making HTTP calls
+through the system proxy config) still has to run outside the forked child — which
+is what `SEGMENTATION_ISOLATE` does. See
+[Why removal runs in its own interpreter](#why-removal-runs-in-its-own-interpreter).
+
 ### Queue health check (API + CLI)
 
 Live queue diagnostics endpoint:
