@@ -5,3 +5,10 @@ google-genai
 whisperx
 opencv-python-headless>=4.9.0
 numpy>=1.26.0
+
+# Background removal / matting. rembg wraps ONNX models (u2netp for the Faster
+# tier, birefnet-general for Better) and needs only onnxruntime rather than a
+# full torch install, which keeps the API image an order of magnitude smaller.
+# Selected via SEGMENTATION_PROVIDER; see app/services/segmentation/.
+rembg>=2.0.50
+onnxruntime>=1.17.0

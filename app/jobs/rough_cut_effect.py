@@ -9,6 +9,7 @@ from typing import Any
 
 from app.db.database import SessionLocal
 from app.db.models import AiResult, Video
+from app.services.segmentation import get_provider
 from app.utils.cloudinary import cloudinary_credentials_configured, upload_local_path_to_cloudinary
 
 
@@ -104,7 +105,24 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
         source = _resolve_media_source(video.file_path)
 
         if effect_type in ML_EFFECTS:
-            output_url = _run_ml_provider(source, effect_type, clip_target, settings)
+            # Providers produce a file or a URL; publishing stays here, because
+            # this is what already knows Cloudinary, the uploads directory and
+            # the naming scheme.
+            provider = get_provider()
+            with tempfile.TemporaryDirectory() as tmp:
+                result = provider.run_effect(
+                    source,
+                    effect_type,
+                    clip_target,
+                    settings,
+                    output_dir=Path(tmp),
+                    progress=lambda value: _update_row(db, row, status="processing", progress=value),
+                )
+                output_url = (
+                    result.url
+                    if result.url
+                    else _publish_output(result.path, row.video_id, row.id)
+                )
             _complete(db, row, clip_key, effect_type, output_url)
             return
 
@@ -134,30 +152,9 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
         db.close()
 
 
-def _run_ml_provider(source: str, effect_type: str, clip_target: dict[str, Any], settings: dict[str, Any]) -> str:
-    provider_url = os.environ.get("ROUGH_CUT_ML_PROVIDER_URL", "").strip()
-    if not provider_url:
-        raise RuntimeError(f"{effect_type.replace('_', ' ')} requires ROUGH_CUT_ML_PROVIDER_URL.")
-    try:
-        import httpx
-    except Exception as exc:
-        raise RuntimeError("httpx is required for ML rough-cut provider calls.") from exc
-    with httpx.Client(timeout=float(os.environ.get("ROUGH_CUT_ML_PROVIDER_TIMEOUT", "900") or "900")) as client:
-        response = client.post(
-            provider_url,
-            json={
-                "source": source,
-                "effectType": effect_type,
-                "clipTarget": clip_target,
-                "settings": settings,
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-    output_url = data.get("outputUrl") or data.get("output_url")
-    if not isinstance(output_url, str) or not output_url:
-        raise RuntimeError("ML provider returned no outputUrl.")
-    return output_url
+# `_run_ml_provider` moved to app/services/segmentation/http.py, which speaks
+# the same ROUGH_CUT_ML_PROVIDER_URL contract. Selection is now
+# SEGMENTATION_PROVIDER=auto|local|http.
 
 
 def _complete(db, row: AiResult, clip_key: str, effect_type: str, output_url: str) -> None:
