@@ -15,7 +15,6 @@ from __future__ import annotations
 import importlib.util
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -54,8 +53,14 @@ class LocalSegmentationProvider:
         """
         if capability == CAPABILITY_AUTO_MATTE:
             return _has("rembg")
-        if capability in (CAPABILITY_POINT_PROMPT, CAPABILITY_PROPAGATE):
-            return _has("sam2")
+        if capability == CAPABILITY_POINT_PROMPT:
+            from . import sam2_backend
+
+            return sam2_backend.is_installed()
+        if capability == CAPABILITY_PROPAGATE:
+            # Video propagation needs SAM 2's memory predictor, which is a
+            # separate code path from the image predictor wired up here.
+            return False
         return False
 
     def is_available(self) -> tuple[bool, str]:
@@ -89,6 +94,41 @@ class LocalSegmentationProvider:
 
         return self._remove_background(source, clip_target, settings, output_dir, progress=progress)
 
+    @staticmethod
+    def _selection_prompts(settings: dict[str, Any]):
+        """Normalised prompts from the editor's selection, or None.
+
+        Returning None rather than empty lists is what lets the caller choose
+        between prompted and automatic matting on one condition.
+        """
+        selection = settings.get("selection") or {}
+        raw_points = selection.get("points") or []
+        strokes = selection.get("strokes") or []
+
+        points: list[tuple[float, float]] = []
+        labels: list[int] = []
+
+        for point in raw_points:
+            if isinstance(point, dict) and "x" in point and "y" in point:
+                points.append((float(point["x"]), float(point["y"])))
+                labels.append(1 if point.get("include", True) else 0)
+
+        # A brush stroke becomes a run of point prompts. Sampling rather than
+        # sending every vertex keeps the prompt count sane on a long stroke,
+        # which SAM is sensitive to.
+        for stroke in strokes:
+            stroke_points = stroke.get("points") or []
+            label = 1 if stroke.get("include", True) else 0
+            step = max(1, len(stroke_points) // 12)
+            for vertex in stroke_points[::step]:
+                if isinstance(vertex, dict) and "x" in vertex and "y" in vertex:
+                    points.append((float(vertex["x"]), float(vertex["y"])))
+                    labels.append(label)
+
+        if not points:
+            return None
+        return points, labels
+
     def _remove_background(
         self,
         source: str,
@@ -100,10 +140,30 @@ class LocalSegmentationProvider:
     ) -> SegmentationResult:
         import cv2  # type: ignore
         import numpy as np  # type: ignore
+        # Imported lazily and only used on the automatic path, so a SAM 2-only
+        # deployment does not need rembg at all.
         from rembg import new_session, remove  # type: ignore
 
         quality = str(settings.get("quality") or "faster").lower()
-        session = new_session(self.MODELS.get(quality, self.MODELS["faster"]))
+
+        # Prompted segmentation when the user has selected something, automatic
+        # salient-subject matting otherwise. This is what makes the clicks steer
+        # the result rather than merely being recorded.
+        prompts = self._selection_prompts(settings)
+        use_prompts = prompts is not None and bool(settings.get("customRemoval"))
+
+        if use_prompts:
+            from . import sam2_backend
+
+            if not sam2_backend.is_installed():
+                raise SegmentationError(
+                    "Point-based selection needs SAM 2, which is not installed on "
+                    "this server. Run `pip install torch sam2` in the API "
+                    "environment and restart the worker, or switch to Auto removal."
+                )
+            session = None
+        else:
+            session = new_session(self.MODELS.get(quality, self.MODELS["faster"]))
 
         capture = cv2.VideoCapture(source)
         if not capture.isOpened():
@@ -135,65 +195,108 @@ class LocalSegmentationProvider:
         if start > 0:
             capture.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
 
-        # The matte is scratch; the cutout goes to output_dir for the job to publish.
-        with tempfile.TemporaryDirectory() as tmp:
-            # VP9 in WebM, because the alpha channel has to survive — an mp4
-            # here would silently composite the matte onto black.
-            matte_path = Path(tmp) / "matte.webm"
-            writer = cv2.VideoWriter(
-                str(matte_path),
-                cv2.VideoWriter_fourcc(*"VP90"),
-                fps,
-                (width, height),
-            )
-            if not writer.isOpened():
-                capture.release()
-                raise SegmentationError(
-                    "This server's OpenCV build cannot write VP9, which is needed to "
-                    "keep transparency. Install ffmpeg support or use a GPU provider."
-                )
+        if not width or not height:
+            capture.release()
+            raise SegmentationError("Could not determine the video's dimensions.")
 
-            index = 0
-            try:
-                while True:
-                    if total and index >= total:
-                        break
-                    ok, frame = capture.read()
-                    if not ok:
-                        break
+        output = output_dir / "cutout.webm"
 
+        # The matte is piped straight into ffmpeg as raw greyscale frames rather
+        # than written to an intermediate video.
+        #
+        # The previous version went through cv2.VideoWriter with a "VP90" fourcc.
+        # That was wrong twice over: the matte carries no alpha of its own — it
+        # *is* the alpha, one grey plane — so an alpha-capable codec bought
+        # nothing, and OpenCV rejected the fourcc anyway ("tag 0x30395056/'VP90'
+        # is not supported"), silently fell back to another encoder, and still
+        # returned isOpened() == True, so the guard against exactly that was dead
+        # code. Piping removes the codec lottery, keeps the matte lossless
+        # instead of re-compressing a mask, and drops a whole decode pass.
+        command = [
+            "ffmpeg", "-y",
+            # Trim the colour input to the clip. A mismatch between this range
+            # and the frames read below silently offsets the cutout.
+            *(["-ss", f"{start:.3f}"] if start > 0 else []),
+            *(["-t", f"{clip_seconds:.3f}"] if clip_seconds > 0 else []),
+            "-i", source,
+            # The matte, arriving on stdin.
+            "-f", "rawvideo",
+            "-pix_fmt", "gray",
+            "-s", f"{width}x{height}",
+            "-r", f"{fps:.6f}",
+            "-i", "-",
+            "-filter_complex", "[0:v][1:v]alphamerge[out]",
+            "-map", "[out]",
+            # VP9/WebM is what a browser can actually play with transparency.
+            # Note for anyone verifying this file: ffmpeg's *native* vp9 decoder
+            # drops the alpha layer, so `ffmpeg -i cutout.webm` reports yuv420p
+            # and looks like the alpha was lost. It is there — the WebM carries
+            # alpha_mode=1. Decode with `-c:v libvpx-vp9` to see it.
+            "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
+            "-b:v", "0", "-crf", "30",
+            str(output),
+        ]
+
+        process = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        assert process.stdin is not None
+
+        index = 0
+        try:
+            while True:
+                if total and index >= total:
+                    break
+                ok, frame = capture.read()
+                if not ok:
+                    break
+
+                if use_prompts:
+                    from . import sam2_backend
+
+                    assert prompts is not None
+                    points, labels = prompts
+                    # SAM wants RGB; OpenCV hands back BGR.
+                    cut = sam2_backend.segment_at_points(
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                        points,
+                        labels,
+                        quality=quality,
+                        box=None,
+                    )
+                else:
                     cut = remove(frame, session=session, only_mask=True)
-                    # Write the matte as greyscale RGB; the alpha is muxed in
-                    # afterwards, since VideoWriter has no alpha channel.
-                    writer.write(cv2.cvtColor(np.asarray(cut), cv2.COLOR_GRAY2BGR))
 
-                    index += 1
-                    if progress and total:
-                        progress(min(92, 10 + int((index / total) * 80)))
-            finally:
-                writer.release()
-                capture.release()
+                matte = np.ascontiguousarray(np.asarray(cut, dtype=np.uint8))
+                if matte.ndim == 3:
+                    matte = cv2.cvtColor(matte, cv2.COLOR_BGR2GRAY)
+                if matte.shape != (height, width):
+                    # rembg can hand back the model's working size rather than
+                    # the frame's. A silent mismatch would shear every row.
+                    matte = cv2.resize(matte, (width, height), interpolation=cv2.INTER_LINEAR)
 
-            output = output_dir / "cutout.webm"
-            # Combine colour and matte into one alpha video. `alphamerge` is the
-            # step that makes the result a cutout rather than a mask preview.
-            subprocess.run(
-                [
-                    "ffmpeg", "-y",
-                    # Same range as the matte above; a mismatch here silently
-                    # offsets the cutout from the footage.
-                    *(["-ss", f"{start:.3f}"] if start > 0 else []),
-                    *(["-t", f"{clip_seconds:.3f}"] if clip_seconds > 0 else []),
-                    "-i", source,
-                    "-i", str(matte_path),
-                    "-filter_complex", "[0:v][1:v]alphamerge[out]",
-                    "-map", "[out]",
-                    "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
-                    str(output),
-                ],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                process.stdin.write(matte.tobytes())
+
+                index += 1
+                if progress and total:
+                    progress(min(92, 10 + int((index / total) * 80)))
+        except BrokenPipeError:
+            # ffmpeg died mid-write; its stderr is the useful error, not ours.
+            pass
+        finally:
+            capture.release()
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
+        _, stderr = process.communicate()
+        if process.returncode != 0:
+            raise SegmentationError(
+                "Background removal failed while writing the cutout: "
+                + (stderr.decode("utf-8", "replace").strip().splitlines() or ["unknown error"])[-1]
             )
+        if index == 0:
+            raise SegmentationError("No frames could be read from the clip's range.")
 
-            return SegmentationResult(path=output)
+        return SegmentationResult(path=output)

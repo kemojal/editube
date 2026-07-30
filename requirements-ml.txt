@@ -2,7 +2,6 @@
 # Install only on machines that run these workloads.
 faster-whisper>=1.0.0
 google-genai
-whisperx
 opencv-python-headless>=4.9.0
 numpy>=1.26.0
 
@@ -12,3 +11,13 @@ numpy>=1.26.0
 # Selected via SEGMENTATION_PROVIDER; see app/services/segmentation/.
 rembg>=2.0.50
 onnxruntime>=1.17.0
+
+# Point-prompt segmentation for custom background removal: click a subject,
+# refine with add/subtract. SAM 2 is promptable, which rembg is not — the two
+# cover different jobs and both are used. Apache-2.0.
+#
+# Pulls torch, so this is by far the heaviest entry here. Install only where
+# custom removal actually runs; SEGMENTATION_PROVIDER=http moves it elsewhere.
+torch>=2.3.1
+torchvision
+sam2>=1.1.0
