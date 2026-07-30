@@ -110,6 +110,7 @@ def preview_mask_png(
     labels: list[int],
     *,
     quality: str = "faster",
+    settings: dict[str, Any] | None = None,
 ) -> tuple[bytes, int, int]:
     """Returns `(png_bytes, width, height)` for a one-frame mask preview.
 
@@ -130,6 +131,14 @@ def preview_mask_png(
 
     frame = extract_frame(source, at_seconds)
     mask = sam2_backend.segment_at_points(frame, points, labels, quality=quality)
+
+    # The same refinement the export applies, from the same settings, through the
+    # same function. Invert, grow/shrink and feather are exactly the controls a
+    # user tunes by eye, so showing an unrefined preview beside a refined render
+    # would be the WYSIWYG bug this codebase already fixed once for chroma key.
+    from .matte_ops import matte_settings_from_attributes, refine_matte
+
+    mask = refine_matte(mask, matte_settings_from_attributes(settings))
 
     ok, buffer = cv2.imencode(".png", mask)
     if not ok:

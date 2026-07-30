@@ -25,6 +25,8 @@ from .base import (
     SegmentationError,
     SegmentationResult,
 )
+from .matte_ops import matte_settings_from_attributes, refine_matte
+from .matte_stride import StrideDecider, blend_mattes, motion_probe, stride_for_quality
 
 #: Frame-by-frame matting is slow on CPU; refuse very long clips rather than
 #: appearing to hang for an hour with no way to tell whether it is progressing.
@@ -177,6 +179,10 @@ class LocalSegmentationProvider:
         from rembg import new_session, remove  # type: ignore
 
         quality = str(settings.get("quality") or "faster").lower()
+        # Read once per clip, not per frame: the interactive preview reads the same
+        # settings through the same function, which is what keeps what the user
+        # tuned on screen identical to what the render produces.
+        refine = matte_settings_from_attributes(settings)
 
         # Prompted segmentation when the user has selected something, automatic
         # salient-subject matting otherwise. This is what makes the clicks steer
@@ -265,7 +271,15 @@ class LocalSegmentationProvider:
             # and looks like the alpha was lost. It is there — the WebM carries
             # alpha_mode=1. Decode with `-c:v libvpx-vp9` to see it.
             "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
-            "-b:v", "0", "-crf", "30",
+            "-b:v", "0", "-crf", "32",
+            # libvpx-vp9 defaults to a very slow single-threaded encode. Measured
+            # 3x faster at 1080p with these, for a few percent more bytes on a
+            # matte-driven cutout — an unambiguous trade here.
+            "-row-mt", "1",
+            "-threads", str(max(2, min(8, (os.cpu_count() or 4)))),
+            "-tile-columns", "2",
+            "-cpu-used", "5",
+            "-deadline", "good",
             str(output),
         ]
 
@@ -274,7 +288,52 @@ class LocalSegmentationProvider:
         )
         assert process.stdin is not None
 
+        def segment(frame):
+            """Runs the chosen model on one frame and normalises the result."""
+            if use_prompts:
+                from . import sam2_backend
+
+                assert prompts is not None
+                points, labels = prompts
+                # SAM wants RGB; OpenCV hands back BGR.
+                cut = sam2_backend.segment_at_points(
+                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                    points,
+                    labels,
+                    quality=quality,
+                    box=None,
+                )
+            else:
+                cut = remove(frame, session=session, only_mask=True)
+
+            matte = np.ascontiguousarray(np.asarray(cut, dtype=np.uint8))
+            if matte.ndim == 3:
+                matte = cv2.cvtColor(matte, cv2.COLOR_BGR2GRAY)
+            if matte.shape != (height, width):
+                # rembg can hand back the model's working size rather than the
+                # frame's. A silent mismatch would shear every row.
+                matte = cv2.resize(matte, (width, height), interpolation=cv2.INTER_LINEAR)
+            return matte
+
+        def emit(matte) -> None:
+            """Refines and writes one matte. Every frame leaves through here, so
+            refinement cannot be applied inconsistently across the reuse path."""
+            assert process.stdin is not None
+            process.stdin.write(refine_matte(matte, refine).tobytes())
+
+        # Motion-adaptive segmentation: the model is the entire cost (~100ms/frame
+        # against 1.6ms to decode one), so frames that barely changed reuse an
+        # interpolated matte instead. See matte_stride.py for what was measured,
+        # including the two approaches that did not work.
+        decider = StrideDecider(max_stride=stride_for_quality(quality))
+
         index = 0
+        # Frames waiting for the *next* segmented matte to interpolate towards.
+        # Only the count is needed — the blend is between mattes, not frames — so
+        # this holds no image data.
+        pending = 0
+        previous_matte = None
+
         try:
             while True:
                 if total and index >= total:
@@ -283,35 +342,34 @@ class LocalSegmentationProvider:
                 if not ok:
                     break
 
-                if use_prompts:
-                    from . import sam2_backend
-
-                    assert prompts is not None
-                    points, labels = prompts
-                    # SAM wants RGB; OpenCV hands back BGR.
-                    cut = sam2_backend.segment_at_points(
-                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                        points,
-                        labels,
-                        quality=quality,
-                        box=None,
-                    )
+                if decider.needs_segmentation(motion_probe(frame)):
+                    matte = segment(frame)
+                    # Flush the held frames first, so output stays in frame order:
+                    # they sit between the previous segmented matte and this one.
+                    if pending and previous_matte is not None:
+                        for offset in range(1, pending + 1):
+                            emit(blend_mattes(previous_matte, matte, offset / (pending + 1)))
+                    elif pending:
+                        for _ in range(pending):
+                            emit(matte)
+                    pending = 0
+                    emit(matte)
+                    previous_matte = matte
                 else:
-                    cut = remove(frame, session=session, only_mask=True)
-
-                matte = np.ascontiguousarray(np.asarray(cut, dtype=np.uint8))
-                if matte.ndim == 3:
-                    matte = cv2.cvtColor(matte, cv2.COLOR_BGR2GRAY)
-                if matte.shape != (height, width):
-                    # rembg can hand back the model's working size rather than
-                    # the frame's. A silent mismatch would shear every row.
-                    matte = cv2.resize(matte, (width, height), interpolation=cv2.INTER_LINEAR)
-
-                process.stdin.write(matte.tobytes())
+                    # Held back until the next real segmentation gives us
+                    # something to interpolate towards.
+                    pending += 1
 
                 index += 1
                 if progress and total:
                     progress(min(92, 10 + int((index / total) * 80)))
+
+            # Trailing frames have no later matte to blend with, so they hold the
+            # last one. Bounded by max_stride, so this is a few frames at most.
+            if pending and previous_matte is not None:
+                for _ in range(pending):
+                    emit(previous_matte)
+                pending = 0
         except BrokenPipeError:
             # ffmpeg died mid-write; its stderr is the useful error, not ours.
             pass

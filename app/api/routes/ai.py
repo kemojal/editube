@@ -624,6 +624,10 @@ class SegmentPreviewBody(BaseModel):
     at_seconds: float = 0.0
     selection: dict[str, Any] = Field(default_factory=dict)
     quality: str = "faster"
+    #: The clip's `removeBg` attributes, so the preview applies the same invert /
+    #: grow / feather / strength the export will. Sent whole rather than as named
+    #: fields so adding a control does not require changing this contract.
+    refine: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.post("/{video_id}/ai/segment-preview")
@@ -664,6 +668,9 @@ def segment_preview(
             points,
             labels,
             quality=quality,
+            # Invert / grow / feather come from the same stored attributes the
+            # export reads, so the preview shows the refined matte, not a raw one.
+            settings=body.refine,
         )
     except SegmentationError as exc:
         # 422, not 500: these are all "the request cannot be satisfied as asked"
