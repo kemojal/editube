@@ -12,9 +12,9 @@ theoretical.
 
 from __future__ import annotations
 
-import functools
 import importlib.util
 import os
+import threading
 from typing import Any
 
 from .base import SegmentationError
@@ -92,22 +92,82 @@ def pick_device() -> str:
     return "cpu"
 
 
-@functools.lru_cache(maxsize=4)
+#: Predictors by (model_id, device, pid), and the lock that guards *construction*.
+#:
+#: This was an `lru_cache`, which was wrong in a way that only appears under
+#: concurrency: it does not hold a lock across the call, so N concurrent misses
+#: run N constructors. `SAM2Transforms.__init__` calls `torch.jit.script`, which
+#: is not re-entrant, so two simultaneous first-clicks corrupted the JIT
+#: compilation unit — and corrupted it *permanently*, so every later request in
+#: that process failed too:
+#:
+#:     KeyError: '__torch__.torch.nn.functional.interpolate'
+#:     RuntimeError: Can't redefine method: forward on class:
+#:         __torch__.torchvision.transforms.transforms.Resize
+#:
+#: The interactive preview makes this easy to hit: it runs in the API process,
+#: where two clicks land on two threads. Reproducible with two threads on a cold
+#: cache; not reproducible once warm, which is why an earlier concurrency check
+#: passed and this got through.
+_PREDICTORS: dict[tuple[str, str, int], Any] = {}
+_PREDICTOR_LOCK = threading.Lock()
+
+#: Serialises inference itself, for two independent reasons.
+#:
+#: 1. Correctness. A SAM 2 predictor is stateful: `set_image` stores the frame's
+#:    embeddings *on the predictor*, and `predict` then reads them. Two threads
+#:    sharing one predictor can interleave as set(A), set(B), predict(A) — which
+#:    silently segments the wrong frame. No error, just a wrong mask.
+#: 2. It hangs otherwise. Two concurrent cold requests left one thread wedged
+#:    inside MPS `layer_norm` in the image encoder, indefinitely — past the
+#:    construction lock and deep in Metal. Flaky rather than deterministic: an
+#:    earlier two-thread check on a warm predictor passed, which is exactly why
+#:    this needed to be found by hanging rather than by reasoning.
+#:
+#: The cost is that concurrent previews queue instead of overlapping. At ~300ms
+#: each that is barely visible, and it is what a single GPU wants anyway.
+_INFERENCE_LOCK = threading.Lock()
+
+
 def _load_predictor(model_id: str, device: str, owner_pid: int):
-    """Loads and caches a predictor.
+    """Returns a cached predictor, constructing at most one at a time.
 
-    Cached per (model, device) because construction downloads and initialises
-    weights — doing that per click would make the tool unusable.
+    Cached per (model, device, pid) because construction downloads and
+    initialises weights — doing that per click would make the tool unusable.
 
-    `owner_pid` is part of the key and is not otherwise used. An lru_cache
-    survives fork, so without it a forked child would silently reuse a predictor
-    holding the parent's GPU handles. `_assert_fork_safe` is the real guard; this
-    makes the cache honest on its own terms so it cannot hand out an inherited
-    device context if that guard is ever relaxed.
+    `owner_pid` is part of the key because a plain cache survives fork, so
+    without it a forked child could reuse a predictor holding the parent's GPU
+    handles. `_assert_fork_safe` is the real guard; this keeps the cache honest
+    on its own terms.
+
+    Double-checked: the fast path stays lock-free once warm, and the slow path
+    holds the lock across construction so `torch.jit.script` is never entered
+    concurrently. Holding it for the whole load means a second caller waits for
+    the first rather than racing it — a few seconds once, against a process that
+    otherwise never recovers.
     """
-    from sam2.sam2_image_predictor import SAM2ImagePredictor
+    key = (model_id, device, owner_pid)
+    predictor = _PREDICTORS.get(key)
+    if predictor is not None:
+        return predictor
 
-    return SAM2ImagePredictor.from_pretrained(model_id, device=device)
+    with _PREDICTOR_LOCK:
+        # Re-check: another thread may have finished while we waited.
+        predictor = _PREDICTORS.get(key)
+        if predictor is not None:
+            return predictor
+
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+        predictor = SAM2ImagePredictor.from_pretrained(model_id, device=device)
+        _PREDICTORS[key] = predictor
+        return predictor
+
+
+def clear_predictors() -> None:
+    """Drops cached predictors. For tests; not part of the request path."""
+    with _PREDICTOR_LOCK:
+        _PREDICTORS.clear()
 
 
 def segment_at_points(
@@ -170,7 +230,10 @@ def segment_at_points(
         else torch.inference_mode()
     )
 
-    with torch.inference_mode(), context:
+    # set_image and predict must be one atomic unit — see _INFERENCE_LOCK. The
+    # predictor carries the frame's embeddings between the two calls, so letting
+    # another thread in between segments the wrong frame.
+    with _INFERENCE_LOCK, torch.inference_mode(), context:
         predictor.set_image(frame_rgb)
         masks, scores, _ = predictor.predict(
             point_coords=point_coords,

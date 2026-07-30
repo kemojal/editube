@@ -10,6 +10,7 @@ being tested is not matte quality, it is that the *prompt* controls the output â
 which is the whole difference between this and unpromptable matting.
 """
 
+import threading
 import unittest
 
 import numpy as np
@@ -109,3 +110,109 @@ class PointPromptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(sam2_backend.is_installed(), REASON)
+class ConcurrencyTests(unittest.TestCase):
+    """Two clicks at once must not break the process or cross their answers.
+
+    This is a regression test for a real failure, not a hypothetical. The
+    interactive preview runs in the API process, so two clicks land on two
+    threads, and the original code shared one predictor behind an lru_cache with
+    no lock. Two consequences, both observed:
+
+      * `lru_cache` does not hold a lock across the call, so both threads ran
+        `SAM2ImagePredictor.from_pretrained`, which calls `torch.jit.script`.
+        That is not re-entrant, and it corrupted the JIT compilation unit
+        *permanently* â€” every subsequent request in the process failed with
+        "Can't redefine method: forward on class: ...transforms.Resize".
+      * With construction serialised, concurrent *inference* then wedged one
+        thread inside MPS `layer_norm` indefinitely.
+
+    Both only appear on a cold cache, which is why a warm two-thread check
+    passed and this reached production.
+    """
+
+    def setUp(self):
+        # Cold, which is the only state that reproduces either failure.
+        sam2_backend.clear_predictors()
+
+    def test_concurrent_cold_requests_all_succeed(self):
+        errors: list[str] = []
+        masks: dict[int, object] = {}
+
+        def work(index):
+            try:
+                masks[index] = sam2_backend.segment_at_points(
+                    two_subjects(), [(0.22, 0.5)], [1]
+                )
+            except BaseException as exc:  # noqa: BLE001 - recording, not handling
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            # Generous but finite: the bug was an indefinite hang, so a timeout
+            # is the assertion. Cold load is a few seconds.
+            thread.join(timeout=300)
+
+        self.assertFalse([t for t in threads if t.is_alive()], "a thread hung in inference")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(masks), 4)
+
+    def test_the_process_still_works_after_concurrent_use(self):
+        # The JIT corruption was permanent, so a single call afterwards is the
+        # thing that actually proves the process survived.
+        def work():
+            try:
+                sam2_backend.segment_at_points(two_subjects(), [(0.22, 0.5)], [1])
+            except BaseException:  # noqa: BLE001
+                pass
+
+        threads = [threading.Thread(target=work) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=300)
+
+        mask = sam2_backend.segment_at_points(two_subjects(), [(0.22, 0.5)], [1])
+        self.assertGreater(coverage(mask)[0], 0.9)
+
+    def test_concurrent_requests_do_not_cross_their_frames(self):
+        # The correctness half: `set_image` stores embeddings on the predictor,
+        # so an interleaved set/predict segments the *other* thread's target.
+        # Different prompts, so a crossed answer is visible rather than benign.
+        outcomes: dict[int, tuple[float, float]] = {}
+
+        def work(index, point):
+            outcomes[index] = coverage(
+                sam2_backend.segment_at_points(two_subjects(), [point], [1])
+            )
+
+        threads = [
+            threading.Thread(target=work, args=(i, (0.22, 0.5) if i % 2 == 0 else (0.78, 0.5)))
+            for i in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=300)
+
+        self.assertEqual(len(outcomes), 4)
+        for index, (left, right) in outcomes.items():
+            with self.subTest(thread=index):
+                if index % 2 == 0:
+                    self.assertGreater(left, 0.9)
+                    self.assertLess(right, 0.1)
+                else:
+                    self.assertGreater(right, 0.9)
+                    self.assertLess(left, 0.1)
+
+    def test_a_warm_predictor_is_reused_rather_than_rebuilt(self):
+        # Rebuilding per call would be correct but unusably slow, so the cache
+        # has to still be a cache after the locking change.
+        sam2_backend.segment_at_points(two_subjects(), [(0.22, 0.5)], [1])
+        before = len(sam2_backend._PREDICTORS)
+        sam2_backend.segment_at_points(two_subjects(), [(0.78, 0.5)], [1])
+        self.assertEqual(len(sam2_backend._PREDICTORS), before)
