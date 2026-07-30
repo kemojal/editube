@@ -87,11 +87,12 @@ class LocalSegmentationProvider:
                 f"{effect_type.replace('_', ' ')} is not available on this server yet."
             )
 
-        return self._remove_background(source, settings, output_dir, progress=progress)
+        return self._remove_background(source, clip_target, settings, output_dir, progress=progress)
 
     def _remove_background(
         self,
         source: str,
+        clip_target: dict[str, Any],
         settings: dict[str, Any],
         output_dir: Path,
         *,
@@ -109,16 +110,30 @@ class LocalSegmentationProvider:
             raise SegmentationError("Could not read the video for background removal.")
 
         fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
-        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        source_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
-        if total and fps and total / fps > MAX_LOCAL_SECONDS:
+        # Only the clip's own range needs matting. Reading the whole source was
+        # both enormously wasteful and the reason a five-second clip taken from a
+        # long recording was refused: the limit was being measured against the
+        # source, not the clip.
+        start = max(0.0, float(clip_target.get("start") or 0.0))
+        end = float(clip_target.get("end") or 0.0)
+        clip_seconds = (end - start) if end > start else (source_frames / fps if fps else 0.0)
+
+        if clip_seconds > MAX_LOCAL_SECONDS:
             capture.release()
             raise SegmentationError(
-                f"This clip is longer than the {int(MAX_LOCAL_SECONDS)}s limit for "
-                "on-server background removal. Trim it, or configure a GPU provider."
+                f"This clip is {int(clip_seconds)}s, over the "
+                f"{int(MAX_LOCAL_SECONDS)}s limit for on-server background removal. "
+                "Trim the clip, raise SEGMENTATION_LOCAL_MAX_SECONDS, or configure a "
+                "GPU provider."
             )
+
+        total = int(round(clip_seconds * fps)) if fps else 0
+        if start > 0:
+            capture.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
 
         # The matte is scratch; the cutout goes to output_dir for the job to publish.
         with tempfile.TemporaryDirectory() as tmp:
@@ -141,6 +156,8 @@ class LocalSegmentationProvider:
             index = 0
             try:
                 while True:
+                    if total and index >= total:
+                        break
                     ok, frame = capture.read()
                     if not ok:
                         break
@@ -163,6 +180,10 @@ class LocalSegmentationProvider:
             subprocess.run(
                 [
                     "ffmpeg", "-y",
+                    # Same range as the matte above; a mismatch here silently
+                    # offsets the cutout from the footage.
+                    *(["-ss", f"{start:.3f}"] if start > 0 else []),
+                    *(["-t", f"{clip_seconds:.3f}"] if clip_seconds > 0 else []),
                     "-i", source,
                     "-i", str(matte_path),
                     "-filter_complex", "[0:v][1:v]alphamerge[out]",

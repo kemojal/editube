@@ -86,7 +86,9 @@ def build_ffmpeg_effect_command(
     return cmd
 
 
-def build_chroma_key_command(source: str, out_path: str, settings: dict[str, Any]) -> list[str]:
+def build_chroma_key_command(
+    source: str, out_path: str, clip_target: dict[str, Any], settings: dict[str, Any]
+) -> list[str]:
     """ffmpeg command for a chroma-key-only removal.
 
     The filter itself comes from `app.services.chroma_key`, which is held to the
@@ -101,9 +103,17 @@ def build_chroma_key_command(source: str, out_path: str, settings: dict[str, Any
     if not chain:
         raise RuntimeError("Chroma key is enabled but no key colour is set.")
 
+    # Trim to the clip, like every other effect here. Keying the whole source
+    # would burn minutes of encode for a few seconds of output.
+    start = _num(clip_target.get("start"), 0)
+    end = _num(clip_target.get("end"), 0)
+    duration = max(0.05, end - start) if end > start else 0
+
     return [
         "ffmpeg", "-y",
+        *(["-ss", f"{start:.3f}"] if start > 0 else []),
         "-i", source,
+        *(["-t", f"{duration:.3f}"] if duration else []),
         "-vf", chain,
         "-c:v", "libvpx-vp9",
         "-pix_fmt", "yuva420p",
@@ -174,7 +184,7 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
             suffix = "webm" if chroma_only else "mp4"
             out = Path(tmp) / f"rough-cut-effect-{row.id}.{suffix}"
             if chroma_only:
-                cmd = build_chroma_key_command(source, str(out), settings)
+                cmd = build_chroma_key_command(source, str(out), clip_target, settings)
             else:
                 cmd = build_ffmpeg_effect_command(
                     source,

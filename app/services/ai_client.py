@@ -31,17 +31,59 @@ def generate_text(prompt: str, system: str | None = None) -> str:
     return text.strip()
 
 
-def generate_json(prompt: str, fallback: dict[str, Any]) -> dict[str, Any]:
-    raw = generate_text(
-        prompt=(
-            "Return valid JSON only. Do not wrap in markdown fences.\n"
-            f"{prompt}"
-        )
-    )
+_JSON_ONLY = "Return valid JSON only. Do not wrap in markdown fences.\n"
+
+
+def _parse_json(raw: str, fallback: dict[str, Any]) -> dict[str, Any]:
+    """Parse a model response as JSON, tolerating a ```json fence it was told
+    not to emit but sometimes does anyway."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1] if "\n" in text else ""
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[: -len("```")]
     try:
-        return json.loads(raw)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
         return fallback
+    return parsed if isinstance(parsed, dict) else fallback
+
+
+def generate_json(prompt: str, fallback: dict[str, Any]) -> dict[str, Any]:
+    return _parse_json(generate_text(prompt=f"{_JSON_ONLY}{prompt}"), fallback)
+
+
+def generate_json_multimodal(
+    prompt: str,
+    images: list[bytes],
+    fallback: dict[str, Any],
+    *,
+    mime_type: str = "image/jpeg",
+) -> dict[str, Any]:
+    """``generate_json`` with image parts attached — the model sees the frames
+    alongside the prompt. Images are sent in order, so the prompt can refer to
+    them positionally ("frame 1 is at 0.6s"). Falls back to a text-only call if
+    the installed SDK can't build image parts."""
+    if not images:
+        return generate_json(prompt, fallback)
+
+    client = _get_client()
+    full_prompt = f"{_JSON_ONLY}{prompt}"
+    try:
+        from google.genai import types
+
+        contents: list[Any] = [
+            types.Part.from_bytes(data=blob, mime_type=mime_type) for blob in images
+        ]
+        contents.append(full_prompt)
+    except (ImportError, AttributeError):
+        return generate_json(prompt, fallback)
+
+    response = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+    text = getattr(response, "text", None)
+    if not text:
+        return fallback
+    return _parse_json(text, fallback)
 
 
 def generate_broll_image(transcript_text: str) -> dict[str, Any]:

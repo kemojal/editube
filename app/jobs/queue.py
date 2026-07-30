@@ -673,3 +673,30 @@ def enqueue_ugc_variation_generate_job(
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to enqueue ugc variation gen for campaign %s: %s", campaign_id, e)
         return None
+
+
+def enqueue_ai_review_job(video_id: int, options: dict | None = None) -> str | None:
+    """Enqueue the multimodal AI review. Returns RQ job id, or None when Redis
+    is unset — the caller then runs the review inline so dev without a worker
+    still works."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; AI review not enqueued for video %s", video_id)
+        return None
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        timeout_sec = max(300, int(os.environ.get("AI_REVIEW_TIMEOUT_SEC", "1800") or "1800"))
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=timeout_sec)
+        job = q.enqueue(
+            "app.jobs.ai_review.ai_review_job",
+            video_id,
+            options,
+            job_timeout=timeout_sec,
+        )
+        return job.id if job else None
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to enqueue AI review for video %s: %s", video_id, e)
+        return None
