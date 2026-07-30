@@ -18,12 +18,13 @@ from app.jobs.ai_jobs import (
     detect_chapters,
     detect_fillers,
 )
+from app.jobs.queue import enqueue_ai_review_job
 from app.services.ai_client import generate_broll_image, generate_json
 from app.services.auto_edit import (
     AutoEditOptions,
     _analyze_segments,
-    _summarize_analysis,
 )
+from app.services.video_review import build_review, empty_review
 from app.utils.cloudinary import upload_image_bytes
 from app.utils.security import get_current_user
 from app.services.project_access import can_access_project
@@ -430,6 +431,31 @@ def rough_cut(
     )
 
 
+def _review_row(db: Session, video_id: int) -> dict:
+    row = (
+        db.query(AiResult)
+        .filter(AiResult.video_id == video_id, AiResult.result_type == "review")
+        .first()
+    )
+    if row is None:
+        return {
+            "video_id": video_id,
+            "result_type": "review",
+            "status": "idle",
+            "result_data": None,
+            "error_message": None,
+            "updated_at": None,
+        }
+    return {
+        "video_id": row.video_id,
+        "result_type": row.result_type,
+        "status": row.status,
+        "result_data": row.result_data,
+        "error_message": row.error_message,
+        "updated_at": row.updated_at,
+    }
+
+
 @router.post("/{video_id}/ai/review")
 def review_video(
     video_id: int,
@@ -437,11 +463,17 @@ def review_video(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Holistic AI review: engagement score + filler/silence/bad-take counts + suggestions."""
+    """Kick off the pro-tier AI review: engagement + per-dimension scores and
+    timestamped notes, judged from the transcript *and* sampled frames.
+
+    Frame extraction is far too slow for a request, so this enqueues the work
+    and returns the row as ``processing``; the player polls
+    ``GET /videos/{id}/ai/review``. Without ``REDIS_URL`` (dev, no worker) the
+    review runs inline so the feature still works.
+    """
     video = _check_video_access(video_id, db, current_user)
     tr = db.query(VideoTranscription).filter(VideoTranscription.video_id == video_id).first()
     segments = list(tr.segments) if tr and tr.segments else []
-    duration = float(getattr(video, "duration", 0) or 0)
     opts = body or AutoEditOptions()
 
     if not segments:
@@ -449,29 +481,22 @@ def review_video(
             db,
             video_id,
             "review",
-            {
-                "needs_transcription": True,
-                "engagement_score": None,
-                "verdict": "Transcribe the video first to run an AI review.",
-                "hook": "",
-                "pacing": "",
-                "strengths": [],
-                "improvements": [],
-                "counts": {"fillers": 0, "silences": 0, "bad_takes": 0},
-                "removable_seconds": 0,
-                "keepRanges": [],
-            },
+            empty_review("Transcribe the video first to run an AI review."),
         )
 
-    analysis = _analyze_segments(
-        segments,
-        duration,
-        remove_fillers=opts.remove_fillers,
-        remove_silences=opts.remove_silences,
-        remove_bad_takes=opts.remove_bad_takes,
-        aggressiveness=opts.aggressiveness,
-    )
-    counts, removable = _summarize_analysis(analysis)
+    job_id = enqueue_ai_review_job(video_id, opts.model_dump())
+    if job_id:
+        previous = _review_row(db, video_id)
+        pending = previous.get("result_data")
+        # Keep the last report on screen while the new one builds, so the panel
+        # doesn't flash empty on a re-review.
+        return _upsert_result(
+            db,
+            video_id,
+            "review",
+            pending if isinstance(pending, dict) else empty_review(""),
+            status="processing",
+        )
 
     comments = (
         db.query(Comment)
@@ -480,81 +505,26 @@ def review_video(
         .limit(60)
         .all()
     )
-
-    # Heuristic engagement score — also the LLM fallback when GEMINI_API_KEY is unset.
-    minutes = max(duration / 60.0, 0.5)
-    filler_rate = counts["fillers"] / minutes
-    penalty = (
-        min(filler_rate * 4, 30)
-        + min(counts["silences"] * 2, 20)
-        + min(counts["bad_takes"] * 5, 25)
+    payload = build_review(
+        video_id=video_id,
+        duration=float(getattr(video, "duration", 0) or 0),
+        media_src=str(getattr(video, "file_path", "") or ""),
+        segments=segments,
+        comments=[{"timecode": c.timecode, "text": c.text} for c in comments],
+        options=opts,
     )
-    heuristic_score = int(max(35, round(100 - penalty)))
-
-    fallback = {
-        "engagement_score": heuristic_score,
-        "verdict": "Heuristic estimate (set GEMINI_API_KEY for a full AI review).",
-        "hook": "",
-        "pacing": "",
-        "strengths": [],
-        "improvements": [],
-    }
-
-    context = {
-        "transcript": segments[:400],
-        "comments": [{"timecode": c.timecode, "text": c.text} for c in comments],
-        "stats": {"duration_sec": duration, **counts},
-    }
-    review = generate_json(
-        "You are an expert video editor reviewing a creator's video from its "
-        "transcript. Rate audience engagement 0-100 (hook strength, pacing, "
-        "clarity, retention risk). Be specific and reference timecodes.\n"
-        "Return JSON: {engagement_score:number, verdict:string, hook:string, "
-        'pacing:string, strengths:string[], improvements:[{text:string, '
-        'start:number, severity:"low"|"medium"|"high"}]}\n'
-        f"{context}",
-        fallback=fallback,
-    )
-    if not isinstance(review, dict):
-        review = dict(fallback)
-
-    # Harden the LLM output into a stable shape.
-    try:
-        score = int(round(float(review.get("engagement_score", heuristic_score))))
-    except (TypeError, ValueError):
-        score = heuristic_score
-    review["engagement_score"] = max(0, min(100, score))
-    review["verdict"] = str(review.get("verdict") or "")
-    review["hook"] = str(review.get("hook") or "")
-    review["pacing"] = str(review.get("pacing") or "")
-    review["strengths"] = [str(x) for x in (review.get("strengths") or []) if str(x).strip()][:8]
-
-    improvements = []
-    for it in (review.get("improvements") or [])[:12]:
-        if isinstance(it, dict):
-            text = str(it.get("text") or "").strip()
-            if not text:
-                continue
-            start = it.get("start")
-            try:
-                start = float(start) if start is not None else None
-            except (TypeError, ValueError):
-                start = None
-            improvements.append(
-                {"text": text, "start": start, "severity": it.get("severity") or "medium"}
-            )
-        elif isinstance(it, str) and it.strip():
-            improvements.append({"text": it.strip(), "start": None, "severity": "medium"})
-    review["improvements"] = improvements
-
-    payload = {
-        **review,
-        "needs_transcription": False,
-        "counts": counts,
-        "removable_seconds": round(removable, 1),
-        "keepRanges": analysis.get("keepRanges", []),
-    }
     return _upsert_result(db, video_id, "review", payload)
+
+
+@router.get("/{video_id}/ai/review")
+def get_video_review(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """The current review row — polled while a review job is running."""
+    _check_video_access(video_id, db, current_user)
+    return _review_row(db, video_id)
 
 
 @router.get("/{video_id}/ai/rough-cut-draft")
@@ -646,6 +616,69 @@ class RoughCutEffectBody(BaseModel):
     clip_key: str
     clip_target: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class SegmentPreviewBody(BaseModel):
+    """One-frame preview request. `selection` is the editor's stored shape."""
+
+    at_seconds: float = 0.0
+    selection: dict[str, Any] = Field(default_factory=dict)
+    quality: str = "faster"
+
+
+@router.post("/{video_id}/ai/segment-preview")
+def segment_preview(
+    video_id: int,
+    body: SegmentPreviewBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Segments one frame from the user's clicks and returns the mask.
+
+    Synchronous on purpose. This answers a click, so it has to return in about
+    the time a click takes to feel acknowledged — a queued job plus polling
+    cannot. The whole-clip run stays on the queue where it belongs.
+
+    Returns the mask as a base64 greyscale PNG rather than a URL: it is a few KB,
+    it is scratch data that would only litter storage, and inlining it means the
+    overlay appears with the response instead of after a second fetch.
+    """
+    video = _check_video_access(video_id, db, current_user)
+
+    from app.jobs.rough_cut_effect import _resolve_media_source
+    from app.services.segmentation.base import SegmentationError
+    from app.services.segmentation.local import LocalSegmentationProvider
+    from app.services.segmentation.preview import preview_mask_png
+
+    prompts = LocalSegmentationProvider._selection_prompts({"selection": body.selection})
+    if prompts is None:
+        raise HTTPException(status_code=400, detail="Click the subject to select it first.")
+    points, labels = prompts
+
+    quality = "better" if str(body.quality).strip().lower() == "better" else "faster"
+
+    try:
+        png, width, height = preview_mask_png(
+            _resolve_media_source(video.file_path),
+            float(body.at_seconds or 0.0),
+            points,
+            labels,
+            quality=quality,
+        )
+    except SegmentationError as exc:
+        # 422, not 500: these are all "the request cannot be satisfied as asked"
+        # — model missing, unreadable frame, nothing selected — and the editor
+        # shows the message to the user rather than logging a server fault.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    import base64
+
+    return {
+        "width": width,
+        "height": height,
+        "mask_png": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+        "point_count": len(points),
+    }
 
 
 @router.post("/{video_id}/ai/rough-cut-effect")
