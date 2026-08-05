@@ -16,7 +16,13 @@ class User(Base):
     role = Column(String)
     avatar_url = Column(String, nullable=True)
     phone = Column(String, nullable=True)
-    workflow_type = Column(String, nullable=True)  # "agency", "freelancer", "internal"
+    # Retired. Held one org type ("agency", "freelancer", "internal") and later
+    # one workflow. Kept for the historical answers only — nothing writes it.
+    workflow_type = Column(String, nullable=True)
+    # The workflows the user picked in onboarding, in the order they picked
+    # them: any of "auto_edit", "repurpose", "review". A list because these are
+    # not exclusive — most people arrive wanting more than one.
+    workflow_types = Column(JSONB, nullable=True)
     plan = Column(String, nullable=True)  # "free", "pro", "scale", "enterprise"
     onboarding_completed = Column(Boolean, server_default="false", nullable=False)
     trial_start_date = Column(TIMESTAMP, nullable=True)

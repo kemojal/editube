@@ -38,6 +38,21 @@ IMPLEMENTED_MODELS: dict[str, str] = {
     "openai/gpt-5-image": "openrouter",
     "openai/gpt-5-image-mini": "openrouter",
 }
+
+#: Models the product offers but cannot execute here yet. They are surfaced in
+#: the pickers as unavailable so the roadmap is visible, and generation requests
+#: against them are still rejected by the IMPLEMENTED_MODELS check.
+#:
+#: Seedance sits here rather than under OpenRouter on purpose: as of the last
+#: check, GET https://openrouter.ai/api/v1/models returns **no** model with a
+#: `video` output modality and no Seedance entry at all, so routing it through
+#: OpenRouter is not currently possible. It needs a direct ByteDance/Volcengine
+#: Ark adapter (provider `seedance`) plus a key.
+PLANNED_MODELS: dict[str, str] = {
+    "seedance-2.0": "seedance",
+    "seedance-2.0-mini": "seedance",
+    "seedance-2.0-fast": "seedance",
+}
 #: Widest window any implemented video model supports; per-model limits are
 #: enforced by the registry on the client.
 MIN_DURATION = 3.0

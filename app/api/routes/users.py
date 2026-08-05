@@ -18,6 +18,7 @@ from app.db.models import (
     UserSession,
     UserMFAMethod,
     UserMFARecoveryCode,
+    Workspace,
     WorkspaceSSOProvider,
     WorkspaceMember,
     WorkspaceAuthPolicy,
@@ -110,26 +111,52 @@ def _pretty_model_label(model_id: str) -> str:
     return " ".join(word.capitalize() for word in name.split())
 
 
+#: Human copy for generation models. Ids not listed here still appear — they
+#: just fall back to the prettified id with no supporting line.
+_GENERATION_MODEL_NOTES: dict[str, str] = {
+    "veo-3.1-generate-preview": "Highest quality, native audio",
+    "veo-3.1-lite-generate-preview": "Faster and cheaper, 720p",
+    "gemini-omni-flash-video": "Fastest, up to 10s",
+    "gemini-3.1-flash-image-preview": "Fast and economical",
+    "gemini-3-pro-image": "Highest quality",
+    "google/gemini-3.1-flash-image": "Fast, via OpenRouter",
+    "google/gemini-3.1-flash-lite-image": "Cheapest, via OpenRouter",
+    "google/gemini-3-pro-image-preview": "Highest quality, via OpenRouter",
+    "openai/gpt-5-image": "Strong prompt adherence",
+    "openai/gpt-5-image-mini": "Fast and cheap",
+    "seedance-2.0": "Up to 4K with audio",
+    "seedance-2.0-mini": "Fast 720p drafts",
+    "seedance-2.0-fast": "Lowest latency Seedance",
+}
+
+
 def _build_ai_model_catalog() -> dict:
     # Image/video options are derived from the generation registry so this stays
-    # in sync with what the media pipeline can actually run.
-    from app.api.routes.ai_media import IMPLEMENTED_MODELS
+    # in sync with what the media pipeline can actually run. Models the registry
+    # knows about but cannot execute yet are listed as unavailable rather than
+    # hidden, so the picker shows the roadmap without handing out a 500.
+    from app.api.routes.ai_media import IMPLEMENTED_MODELS, PLANNED_MODELS
+    from app.services.transcription_models import (
+        default_transcription_model_id,
+        transcription_catalog_payload,
+    )
 
     image_models, video_models = [], []
-    for model_id, provider in IMPLEMENTED_MODELS.items():
-        entry = {"id": model_id, "label": _pretty_model_label(model_id), "provider": provider}
+    for model_id, provider in {**IMPLEMENTED_MODELS, **PLANNED_MODELS}.items():
+        entry = {
+            "id": model_id,
+            "label": _pretty_model_label(model_id),
+            "provider": provider,
+            "available": model_id in IMPLEMENTED_MODELS,
+        }
+        note = _GENERATION_MODEL_NOTES.get(model_id)
+        if note:
+            entry["note"] = note
         (image_models if "image" in model_id else video_models).append(entry)
 
-    transcription = [
-        {"id": "tiny", "label": "Whisper tiny", "provider": "faster-whisper", "note": "Fastest, least accurate"},
-        {"id": "base", "label": "Whisper base", "provider": "faster-whisper", "note": "Balanced"},
-        {"id": "small", "label": "Whisper small", "provider": "faster-whisper"},
-        {"id": "medium", "label": "Whisper medium", "provider": "faster-whisper"},
-        {"id": "large-v3", "label": "Whisper large-v3", "provider": "faster-whisper", "note": "Most accurate, slowest"},
-    ]
     editing = [
-        {"id": "gemini-3-flash-preview", "label": "Gemini 3 Flash", "provider": "gemini", "note": "Fast and economical"},
-        {"id": "gemini-3-pro", "label": "Gemini 3 Pro", "provider": "gemini", "note": "Highest quality"},
+        {"id": "gemini-3-flash-preview", "label": "Gemini 3 Flash", "provider": "gemini", "note": "Fast and economical", "available": True},
+        {"id": "gemini-3-pro", "label": "Gemini 3 Pro", "provider": "gemini", "note": "Highest quality", "available": True},
     ]
 
     return {
@@ -138,8 +165,12 @@ def _build_ai_model_catalog() -> dict:
                 "key": "transcription",
                 "label": "Transcription",
                 "description": "Model used to transcribe your videos.",
-                "models": transcription,
-                "default": os.getenv("WHISPER_MODEL_SIZE", "base"),
+                "models": transcription_catalog_payload(),
+                "default": default_transcription_model_id(),
+                # Rendered as scrollable cards with accuracy/speed meters rather
+                # than a plain dropdown — there are 16 of these and the choice
+                # turns on size and language coverage, not just the name.
+                "picker": "cards",
             },
             {
                 "key": "editing",
@@ -618,6 +649,22 @@ def get_current_user_settings(
     return get_or_create_user_settings(db, current_user.id)
 
 
+def _owned_workspace(db: Session, user_id: int) -> Workspace | None:
+    """The personal workspace a user owns, if any. Used to keep the Drive name
+    in `user_settings` and the `Workspace` row from drifting apart."""
+    return (
+        db.query(Workspace)
+        .join(WorkspaceMember, WorkspaceMember.workspace_id == Workspace.id)
+        .filter(
+            WorkspaceMember.user_id == user_id,
+            WorkspaceMember.role == "owner",
+            Workspace.owner_user_id == user_id,
+        )
+        .order_by(Workspace.id.asc())
+        .first()
+    )
+
+
 @router.put("/me/settings", response_model=UserSettingsResponse)
 def update_current_user_settings(
     data: UserSettingsUpdate,
@@ -650,6 +697,16 @@ def update_current_user_settings(
 
     for key, value in update_data.items():
         setattr(settings, key, value)
+
+    # Settings presents this as "Drive name", but it only ever wrote
+    # `user_settings.workspace_name` — so renaming a Drive left the Workspace
+    # row, and everything reading it (member lists, invite emails, share
+    # links), on the old name. Rename the workspace the user *owns*; a
+    # workspace they merely belong to isn't theirs to relabel.
+    if "workspace_name" in update_data:
+        owned = _owned_workspace(db, current_user.id)
+        if owned:
+            owned.name = update_data["workspace_name"]
 
     db.commit()
     db.refresh(settings)
@@ -784,9 +841,25 @@ def onboarding_update_workflow(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if data.workflow_type not in ("agency", "freelancer", "internal"):
-        raise HTTPException(status_code=400, detail="Invalid workflow type")
-    current_user.workflow_type = data.workflow_type
+    # Onboarding asks which of the product's workflows the user came for, not
+    # what kind of company they are. The old org-type values ("agency",
+    # "freelancer", "internal") are still readable on existing rows but are no
+    # longer accepted on write.
+    allowed = ("auto_edit", "repurpose", "review")
+
+    # Dedupe while keeping the order they were picked in — that order is the
+    # signal about what the user cares about most.
+    selected: list[str] = []
+    for value in data.workflow_types:
+        if value not in allowed:
+            raise HTTPException(status_code=400, detail="Invalid workflow type")
+        if value not in selected:
+            selected.append(value)
+
+    if not selected:
+        raise HTTPException(status_code=400, detail="Select at least one workflow")
+
+    current_user.workflow_types = selected
     db.commit()
     db.refresh(current_user)
     return current_user

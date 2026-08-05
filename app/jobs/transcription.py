@@ -17,7 +17,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
 from app.db.database import SessionLocal
-from app.db.models import RepurposeJob, Video, VideoTranscription
+from app.db.models import RepurposeJob, UserSettings, Video, VideoTranscription
+from app.services.transcription_models import resolve_runtime
 from app.utils.language import normalize_language
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,37 @@ def _job_source_range(job: RepurposeJob | None) -> tuple[float, float | None]:
     return max(0.0, start), end
 
 
+def _preferred_transcription_model(db: Session, video: Video | None) -> str | None:
+    """The uploader's Settings → AI models transcription choice, if any.
+
+    Returns None when they have not chosen one — `resolve_runtime` then falls
+    through to `default_transcription_model_id()`, the same function the picker
+    reads its default from. Resolving the env var here instead would let the
+    worker run one model while the settings panel displayed another.
+    """
+    user_id = getattr(video, "uploader_id", None)
+    if user_id:
+        try:
+            row = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+            prefs = row.ai_model_preferences if row else None
+            if isinstance(prefs, dict):
+                chosen = (prefs.get("transcription") or "").strip()
+                if chosen:
+                    return chosen
+        except Exception:
+            # A settings lookup must never take the transcription down.
+            db.rollback()
+            logger.exception("Could not read transcription model preference for video")
+    return None
+
+
+def _preferred_transcription_model_id(db: Session, video_id: int) -> str:
+    """Catalog id to persist on a row when the run never got far enough to pick one."""
+    video = db.query(Video).filter(Video.id == video_id).first()
+    model, _size, _fallback = resolve_runtime(_preferred_transcription_model(db, video))
+    return model.id
+
+
 def transcribe_video(video_id: int, language: str | None = None) -> None:
     _ensure_worker_logging()
     logger.info("transcribe_video: starting job for video_id=%s", video_id)
@@ -159,7 +191,20 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
         vt.error_message = None
         db.commit()
 
-        model_size = os.environ.get("WHISPER_MODEL_SIZE", "base").strip() or "base"
+        # Honour the user's Settings → AI models choice. Previously this read
+        # WHISPER_MODEL_SIZE only, so picking a model in the UI changed nothing.
+        selected_model, model_size, engine_fallback = resolve_runtime(
+            _preferred_transcription_model(db, video)
+        )
+        if engine_fallback:
+            logger.info(
+                "transcribe_video: %s runs on engine '%s', which has no adapter here; "
+                "using faster-whisper '%s' for video_id=%s",
+                selected_model.label,
+                selected_model.engine,
+                model_size,
+                video_id,
+            )
         device = os.environ.get("TRANSCRIPTION_DEVICE", "cpu").strip() or "cpu"
         compute_type = os.environ.get("TRANSCRIPTION_COMPUTE_TYPE", "int8").strip() or "int8"
 
@@ -244,7 +289,7 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
                 vt.speakers = []
                 vt.speaker_count = 0
                 vt.status = "failed"
-                vt.model_name = model_size
+                vt.model_name = selected_model.id
                 vt.error_message = (
                     "No usable audio extracted (file may be video-only). For YouTube imports, "
                     "re-run transcription with an updated worker that uses a dedicated audio stream."
@@ -357,7 +402,7 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
                 vt.speakers = []
                 vt.speaker_count = 0
                 vt.status = "failed"
-                vt.model_name = model_size
+                vt.model_name = selected_model.id
                 vt.error_message = (
                     "Whisper produced no speech. Common cause: video-only stream with no audio track. "
                     "Use Force new job after updating the worker, or re-import from YouTube."
@@ -373,7 +418,7 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
             vt.speakers = sorted(speaker_labels)
             vt.speaker_count = len(speaker_labels)
             vt.status = "completed"
-            vt.model_name = model_size
+            vt.model_name = selected_model.id
             vt.error_message = None
             db.commit()
             logger.info("Transcription completed for video %s (%s segments)", video_id, len(nonempty))
@@ -433,7 +478,7 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
                     row.speakers = []
                     row.speaker_count = 0
                     row.status = "failed"
-                    row.model_name = os.environ.get("WHISPER_MODEL_SIZE", "base").strip() or "base"
+                    row.model_name = _preferred_transcription_model_id(db, video_id)
                     row.error_message = (
                         "ffmpeg found no audio in this stream (often a video-only YouTube URL). "
                         "Use Force new job after updating the worker."

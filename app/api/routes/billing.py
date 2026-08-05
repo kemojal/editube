@@ -12,6 +12,7 @@ from app.db.models import StripePrice, Subscription, User, WorkspaceMember
 from app.services.pricing import PLAN_SPECS, get_plan_spec, normalize_plan_key
 from app.services.marketing_offers import active_marketing_offer, resolve_checkout_offer
 from app.services.storage_policy import workspace_usage_payload
+from app.services.workspace_bootstrap import ensure_personal_workspace
 from app.services.stripe_catalog_sync import (
     mark_stripe_price_inactive,
     mark_stripe_product_inactive,
@@ -318,9 +319,13 @@ def get_billing_usage(
         .order_by(WorkspaceMember.id.asc())
         .first()
     )
-    if not member:
-        raise HTTPException(status_code=404, detail="Workspace not found for current user")
-    payload = workspace_usage_payload(db, user=current_user, workspace_id=member.workspace_id)
+    # Accounts created before signup started bootstrapping a personal workspace
+    # have no membership row at all, and a 404 here read to the user as "your
+    # subscription is gone". Create the workspace the way signup would instead
+    # — `ensure_personal_workspace` is idempotent, so this is a no-op for
+    # everyone else. Same self-heal `projects` and `google_drive` already do.
+    workspace_id = member.workspace_id if member else ensure_personal_workspace(db, current_user).id
+    payload = workspace_usage_payload(db, user=current_user, workspace_id=workspace_id)
     plan = get_plan_spec(current_user.plan)
     payload["plan_label"] = plan.label
     payload["subscription_detail"] = _subscription_detail_dict(db, current_user)

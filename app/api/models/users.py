@@ -18,7 +18,7 @@
 # app/api/models/users.py
 
 from pydantic import BaseModel, EmailStr, ConfigDict
-from typing import Optional, Dict
+from typing import List, Optional, Dict
 from typing import Literal
 from sqlalchemy import Column, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
@@ -37,7 +37,8 @@ class UserResponse(BaseModel):
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
     phone: Optional[str] = None
-    workflow_type: Optional[str] = None
+    workflow_type: Optional[str] = None  # retired; historical answers only
+    workflow_types: Optional[List[str]] = None
     plan: Optional[str] = None
     onboarding_completed: bool = False
     subscription_status: Optional[str] = None
@@ -140,7 +141,8 @@ class OnboardingProfileUpdate(BaseModel):
 
 
 class OnboardingWorkflowUpdate(BaseModel):
-    workflow_type: str  # "agency", "freelancer", "internal"
+    # One or more of "auto_edit", "repurpose", "review".
+    workflow_types: List[str]
 
 
 class OnboardingPlanUpdate(BaseModel):

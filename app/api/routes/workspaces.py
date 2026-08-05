@@ -47,6 +47,7 @@ from app.db.models import (
     ProjectTemplate,
     TimeEntry,
     User,
+    UserSettings,
     Video,
     Workspace,
     WorkspaceAsset,
@@ -128,6 +129,12 @@ def list_my_workspaces(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Legacy accounts predate the signup-time bootstrap and own no workspace, so
+    # this returned [] and every workspace-scoped panel showed "No workspace
+    # found". Idempotent, so it costs one indexed lookup for everyone else.
+    if not db.query(WorkspaceMember).filter(WorkspaceMember.user_id == current_user.id).first():
+        ensure_personal_workspace(db, current_user)
+
     rows = (
         db.query(WorkspaceMember, Workspace, User)
         .join(Workspace, Workspace.id == WorkspaceMember.workspace_id)
@@ -187,6 +194,14 @@ def update_workspace(
         raise HTTPException(status_code=403, detail="Not allowed to rename workspace")
     if body.name is not None:
         ws.name = body.name.strip() or ws.name
+        # Mirror of the write-through in `PUT /users/me/settings`: the owner's
+        # "Drive name" in settings is the same name, so a rename from either
+        # entry point has to land in both places or the two panels disagree.
+        owner_settings = (
+            db.query(UserSettings).filter(UserSettings.user_id == ws.owner_user_id).first()
+        )
+        if owner_settings:
+            owner_settings.workspace_name = ws.name[:120]
     log_security_audit_event(
         db,
         action="workspace.update",

@@ -14,6 +14,14 @@ def _slug_for_user(user_id: int) -> str:
 
 
 def ensure_personal_workspace(db: Session, user: User) -> Workspace:
+    # Serialize concurrent bootstraps for this user before the existence check.
+    # The account dialog fires `/workspaces` and `/billing/usage` at the same
+    # time and both self-heal now, so without the lock two requests can each
+    # see "no workspace" and each create one. Postgres only — SQLite (tests)
+    # has no row locks and no concurrency to protect against.
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.query(User).filter(User.id == user.id).with_for_update().first()
+
     existing = (
         db.query(WorkspaceMember)
         .filter(WorkspaceMember.user_id == user.id, WorkspaceMember.role == "owner")
