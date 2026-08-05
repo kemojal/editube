@@ -144,10 +144,12 @@ def _resolve_media_source(video: Video, explicit_source_url: str | None) -> str:
         try:
             from app.services.youtube_stream_resolve import (
                 YoutubeStreamResolveError,
-                resolve_youtube_page_to_stream_url,
+                resolve_youtube_page_to_best_video_stream_url,
             )
 
-            return resolve_youtube_page_to_stream_url(page_for_video)
+            # Tracking runs frame by frame through ffmpeg: resolution matters,
+            # an audio track does not.
+            return resolve_youtube_page_to_best_video_stream_url(page_for_video)
         except Exception as exc:
             logger.warning(
                 "mask_track: could not resolve YouTube stream for video %s (falling back to file_path): %s",

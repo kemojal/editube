@@ -45,6 +45,54 @@ def is_stream_url_stale(
     return expire_at is None or expire_at <= time.time() + min_remaining_sec
 
 
+# The progressive (muxed: one file, video AND audio) YouTube formats. Everything
+# else googlevideo serves is DASH — video-only or audio-only — which a plain
+# `<video src>` renders as a black frame with a running clock, or as sound with
+# no picture. Legacy flv/3gp itags are included for completeness; in practice
+# YouTube serves 18 (360p avc1+aac) and sometimes 22 (720p).
+MUXED_ITAGS = frozenset(
+    {5, 6, 17, 18, 22, 34, 35, 36, 37, 38, 43, 44, 45, 46, 59, 78, 82, 83, 84, 85, 100, 101, 102}
+)
+
+
+def stream_url_itag(file_path: str | None) -> int | None:
+    """The `itag` (YouTube format id) of a googlevideo stream URL, else None."""
+    if not file_path:
+        return None
+    try:
+        raw = parse_qs(urlparse(file_path).query).get("itag", [None])[0]
+        return int(raw) if raw is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
+def is_stream_url_muxed(file_path: str | None) -> bool:
+    """
+    True when `file_path` can carry both picture and sound on its own.
+
+    A URL with no itag isn't a googlevideo stream at all (an upload, a Cloudinary
+    asset, a local `/uploads/...` path), so it is taken at face value — this
+    heuristic exists only to catch DASH streams standing in for playback.
+    """
+    itag = stream_url_itag(file_path)
+    return itag is None or itag in MUXED_ITAGS
+
+
+def should_refresh_stream_url(
+    file_path: str | None, *, min_remaining_sec: int = STREAM_REFRESH_MIN_REMAINING_SEC
+) -> bool:
+    """
+    True when a stored playback URL has to be re-resolved: either it is expiring
+    (or already dead), or it is a DASH stream that cannot play on its own.
+
+    The second case is what makes an already-broken row heal itself instead of
+    staying black until its `expire` runs out.
+    """
+    return is_stream_url_stale(file_path, min_remaining_sec=min_remaining_sec) or not (
+        is_stream_url_muxed(file_path)
+    )
+
+
 def _yt_dlp_g_lines(url: str, *format_args: str) -> list[str]:
     raw = (url or "").strip()
     if not raw:
@@ -72,11 +120,65 @@ def _yt_dlp_g_lines(url: str, *format_args: str) -> list[str]:
     return lines
 
 
+# Playback selectors, most to least desirable. h264+aac first: it is the one
+# combination every browser decodes, at every resolution, without hardware
+# surprises (a 2160p AV1 stream decodes to a black frame on plenty of machines).
+_PLAYBACK_FORMAT_SELECTORS = (
+    "best[ext=mp4][vcodec^=avc1][acodec!=none]",
+    "best[ext=mp4][vcodec!=none][acodec!=none]",
+    "best[vcodec!=none][acodec!=none]",
+    "22/18",
+    "18",
+)
+
+
 def resolve_youtube_page_to_stream_url(url: str) -> str:
     """
-    First progressive / combined stream URL (legacy: used when storing `videos.file_path`
-    for playback). May be video-only; prefer `resolve_youtube_page_to_audio_stream_url`
-    for transcription.
+    A **muxed** progressive stream URL — video and audio in one file — for
+    storing as `videos.file_path` and handing straight to a `<video>` element.
+
+    This must ask for a format explicitly. yt-dlp's default is
+    `bestvideo*+bestaudio`, so a bare `yt-dlp -g` prints two URLs (video-only
+    then audio-only) and taking the first stored a silent, often-undecodable
+    DASH stream: the viewer went black while the clock ran, and nothing errored
+    because the URL itself served 206 video/mp4 perfectly well.
+
+    Falls back through `_PLAYBACK_FORMAT_SELECTORS`, then — rather than leave a
+    video with no URL at all — to yt-dlp's default first line, the old
+    behaviour. Prefer `resolve_youtube_page_to_audio_stream_url` for
+    transcription, which wants audio only.
+    """
+    last: YoutubeStreamResolveError | None = None
+    for fmt in _PLAYBACK_FORMAT_SELECTORS:
+        try:
+            return _yt_dlp_g_lines(url, "-f", fmt)[0]
+        except YoutubeStreamResolveError as exc:
+            last = exc
+            logger.info("yt-dlp playback format %r unavailable: %s", fmt, exc)
+
+    logger.warning(
+        "No muxed stream for %s; falling back to yt-dlp's default format (playback may be silent)",
+        url,
+    )
+    try:
+        return _yt_dlp_g_lines(url)[0]
+    except YoutubeStreamResolveError:
+        raise last or YoutubeStreamResolveError("Could not resolve a playable stream")
+
+
+def resolve_youtube_page_to_best_video_stream_url(url: str) -> str:
+    """
+    Highest-quality video stream, **which may be video-only** (no audio track).
+
+    yt-dlp's default `bestvideo*+bestaudio` selection, first line — i.e. what
+    every caller used to get from `resolve_youtube_page_to_stream_url`. Kept for
+    the ffmpeg pipelines (clip render, mask tracking) that were built against
+    it: they want resolution over a muxed container, and switching them to a
+    muxed 360p stream would quietly downgrade every export.
+
+    Never store the result as a video's playback URL — a browser renders it as
+    a black frame with a running clock. Use `resolve_youtube_page_to_stream_url`
+    for that.
     """
     return _yt_dlp_g_lines(url)[0]
 

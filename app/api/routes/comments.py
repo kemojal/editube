@@ -45,7 +45,12 @@ from app.api.models.comments import (
     CommentWithRepliesResponse,
     CommentUserResponse,
 )
-from app.jobs.queue import enqueue_mention_email_job, enqueue_push_notification_job
+from app.jobs.queue import (
+    enqueue_mention_email_job,
+    enqueue_comment_notification_email_job,
+    enqueue_push_notification_job,
+)
+from app.services.notification_prefs import wants_comment_emails
 from app.services.mentions import extract_mention_handles, resolve_mentioned_users
 from app.services.comment_export import export_comments
 from app.services.comment_workflow import (
@@ -368,6 +373,17 @@ async def add_comment(
         .first()
     )
 
+    frontend_base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+    comment_url = (
+        f"{frontend_base}/player/{video_id}?"
+        + urlencode({"tab": "comments", "commentId": str(db_comment.id)})
+    )
+    actor_name = current_user.name or current_user.email or "A teammate"
+
+    created_notifications: list[Notification] = []
+    notified_ids: set[int] = set()
+
+    # --- @mentions: notify + email mentioned users (gated by email_mentions) ---
     handles = extract_mention_handles(comment.text or "")
     if handles:
         project_users = list_users_for_mentions(db, db_project)
@@ -376,13 +392,6 @@ async def add_comment(
             candidate_users=project_users,
             actor_user_id=current_user.id,
         )
-        frontend_base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
-        comment_url = (
-            f"{frontend_base}/player/{video_id}?"
-            + urlencode({"tab": "comments", "commentId": str(db_comment.id)})
-        )
-
-        created_notifications: list[Notification] = []
         for recipient in recipients:
             notification = Notification(
                 user_id=recipient.id,
@@ -392,16 +401,15 @@ async def add_comment(
                 comment_id=db_comment.id,
                 read=False,
             )
-            db.add(
-                notification
-            )
+            db.add(notification)
             created_notifications.append(notification)
+            notified_ids.add(recipient.id)
             settings = db.query(UserSettings).filter(UserSettings.user_id == recipient.id).first()
             if settings is not None and not settings.email_mentions:
                 continue
             queued = enqueue_mention_email_job(
                 recipient_user_id=recipient.id,
-                actor_name=current_user.name or current_user.email or "A teammate",
+                actor_name=actor_name,
                 project_name=db_project.name,
                 video_name=db_video.name,
                 comment_text=db_comment.text or "",
@@ -410,6 +418,37 @@ async def add_comment(
             if not queued:
                 logger.warning("Mention email enqueue skipped/failed for user %s", recipient.id)
 
+    # --- Comment: notify the video/project owner (gated by email_comments) ---
+    # Skips the commenter and anyone already notified as a mention.
+    owner_ids: set[int] = set()
+    if db_project.creator_id:
+        owner_ids.add(db_project.creator_id)
+    if db_video.uploader_id:
+        owner_ids.add(db_video.uploader_id)
+    owner_ids -= {current_user.id}
+    owner_ids -= notified_ids
+    for owner_id in owner_ids:
+        owner_notification = Notification(
+            user_id=owner_id,
+            type="comment",
+            project_id=project_id,
+            video_id=video_id,
+            comment_id=db_comment.id,
+            read=False,
+        )
+        db.add(owner_notification)
+        created_notifications.append(owner_notification)
+        if wants_comment_emails(db, owner_id):
+            enqueue_comment_notification_email_job(
+                recipient_user_id=owner_id,
+                actor_name=actor_name,
+                project_name=db_project.name,
+                video_name=db_video.name,
+                comment_text=db_comment.text or "",
+                comment_url=comment_url,
+            )
+
+    if created_notifications:
         db.commit()
         for notification in created_notifications:
             enqueue_push_notification_job(notification.user_id, notification.id)

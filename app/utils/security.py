@@ -1,3 +1,4 @@
+import hashlib
 import os
 
 from passlib.context import CryptContext
@@ -8,7 +9,15 @@ from fastapi.security import OAuth2PasswordBearer
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 from app.db.database import get_db
-from app.db.models import User, UserSettings, UserSession
+from app.db.models import ApiToken, User, UserSettings, UserSession
+
+# Personal access tokens are issued as ``edt_<40 hex>`` and stored only as a hash.
+API_TOKEN_PREFIX = "edt_"
+
+
+def hash_api_token(raw_token: str) -> str:
+    """One-way hash used to store/look up personal access tokens."""
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -85,14 +94,40 @@ def _validate_and_touch_session(db: Session, user_id: int, session_id: str) -> N
     session.last_activity_at = now
     db.commit()
 
+def authenticate_api_token(db: Session, token: str) -> User:
+    """Resolve a personal access token (``edt_…``) to its owning user."""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid API token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    record = (
+        db.query(ApiToken)
+        .filter(ApiToken.token_hash == hash_api_token(token))
+        .first()
+    )
+    if record is None:
+        raise credentials_exception
+    user = db.query(User).filter(User.id == record.user_id).first()
+    if user is None or user.deleted_at is not None:
+        raise credentials_exception
+    record.last_used_at = datetime.utcnow()
+    db.commit()
+    return user
+
+
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    if token and token.startswith(API_TOKEN_PREFIX):
+        return authenticate_api_token(db, token)
     return authenticate_access_token(db, token, touch_session=True)
 
 
 
 def authenticate_user(db: Session, email: str, password: str):
     user = db.query(User).filter(User.email == email).first()
-    if not user:
+    if not user or user.deleted_at is not None:
+        return None
+    if not user.hashed_password:
         return None
     if not verify_password(password, user.hashed_password):
         return None
@@ -155,7 +190,7 @@ def authenticate_access_token(db: Session, token: str, touch_session: bool = Tru
         raise credentials_exception
 
     user = db.query(User).filter(User.id == user_id).first()
-    if user is None:
+    if user is None or user.deleted_at is not None:
         raise credentials_exception
     if touch_session:
         _validate_and_touch_session(db, user.id, session_id)

@@ -459,14 +459,24 @@ async def create_invite(
 
     url = _workspace_invite_accept_url(raw)
     inviter_name = current_user.name or current_user.email or "A teammate"
-    email_sent = send_workspace_invite_email(
-        to_email=email,
-        workspace_name=ws.name,
-        inviter_name=inviter_name,
-        invite_role=invite_role,
-        invite_url=url,
-        expires_days=14,
+    # Respect an existing user's "Project invites" email preference. The invite
+    # record + in-app notification still happen; we just don't email them.
+    from app.services.notification_prefs import allows_project_invites
+
+    invitee_opted_out = existing_user is not None and not allows_project_invites(
+        db, existing_user.id
     )
+    if invitee_opted_out:
+        email_sent = False
+    else:
+        email_sent = send_workspace_invite_email(
+            to_email=email,
+            workspace_name=ws.name,
+            inviter_name=inviter_name,
+            invite_role=invite_role,
+            invite_url=url,
+            expires_days=14,
+        )
     await _emit_workspace_invite_notification(
         db,
         invite=inv,

@@ -5,14 +5,17 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from datetime import datetime
 import os
+import secrets
 from urllib.parse import quote as url_quote
 
-from ..models.users import User as UserSchema, UserCreate, UserUpdate, UserRegisterSchema, UserLoginSchema, OnboardingProfileUpdate, OnboardingWorkflowUpdate, OnboardingPlanUpdate, UserSettingsResponse, UserSettingsUpdate
+from ..models.users import User as UserSchema, UserCreate, UserUpdate, UserRegisterSchema, UserLoginSchema, OnboardingProfileUpdate, OnboardingWorkflowUpdate, OnboardingPlanUpdate, UserSettingsResponse, UserSettingsUpdate, ApiTokenResponse, ApiTokenCreateRequest, ApiTokenCreateResponse
 from ...db.database import get_db
 from app.db.models import (
+    ApiToken,
     User,
     UserCaptionFavorite,
     UserSettings,
+    UserSession,
     UserMFAMethod,
     UserMFARecoveryCode,
     WorkspaceSSOProvider,
@@ -31,6 +34,8 @@ from ...utils.security import (
     validate_refresh_session,
     decode_access_token_payload,
     revoke_user_session,
+    hash_api_token,
+    API_TOKEN_PREFIX,
 )
 from app.utils.cloudinary import upload_file_to_cloudinary
 from app.services.mfa_totp import (
@@ -70,6 +75,9 @@ DEFAULT_USER_SETTINGS = {
     "session_timeout": "30",
     "allow_project_invites": True,
     "email_mention_digest": "off",
+    "share_data": False,
+    "default_publish_privacy": "private",
+    "ai_model_preferences": {},
 }
 ALLOWED_TIMEZONES = {
     "America/Los_Angeles",
@@ -90,6 +98,206 @@ def get_or_create_user_settings(db: Session, user_id: int) -> UserSettings:
     db.commit()
     db.refresh(settings)
     return settings
+
+
+# ---------------------------------------------------------------------------
+# AI model catalog (choices surfaced in Settings → AI models)
+# ---------------------------------------------------------------------------
+
+
+def _pretty_model_label(model_id: str) -> str:
+    name = model_id.split("/")[-1].replace("-", " ").replace("_", " ")
+    return " ".join(word.capitalize() for word in name.split())
+
+
+def _build_ai_model_catalog() -> dict:
+    # Image/video options are derived from the generation registry so this stays
+    # in sync with what the media pipeline can actually run.
+    from app.api.routes.ai_media import IMPLEMENTED_MODELS
+
+    image_models, video_models = [], []
+    for model_id, provider in IMPLEMENTED_MODELS.items():
+        entry = {"id": model_id, "label": _pretty_model_label(model_id), "provider": provider}
+        (image_models if "image" in model_id else video_models).append(entry)
+
+    transcription = [
+        {"id": "tiny", "label": "Whisper tiny", "provider": "faster-whisper", "note": "Fastest, least accurate"},
+        {"id": "base", "label": "Whisper base", "provider": "faster-whisper", "note": "Balanced"},
+        {"id": "small", "label": "Whisper small", "provider": "faster-whisper"},
+        {"id": "medium", "label": "Whisper medium", "provider": "faster-whisper"},
+        {"id": "large-v3", "label": "Whisper large-v3", "provider": "faster-whisper", "note": "Most accurate, slowest"},
+    ]
+    editing = [
+        {"id": "gemini-3-flash-preview", "label": "Gemini 3 Flash", "provider": "gemini", "note": "Fast and economical"},
+        {"id": "gemini-3-pro", "label": "Gemini 3 Pro", "provider": "gemini", "note": "Highest quality"},
+    ]
+
+    return {
+        "categories": [
+            {
+                "key": "transcription",
+                "label": "Transcription",
+                "description": "Model used to transcribe your videos.",
+                "models": transcription,
+                "default": os.getenv("WHISPER_MODEL_SIZE", "base"),
+            },
+            {
+                "key": "editing",
+                "label": "Review & editing",
+                "description": "Model used to review and edit transcripts in the editor.",
+                "models": editing,
+                "default": os.getenv("GEMINI_MODEL", "gemini-3-flash-preview"),
+            },
+            {
+                "key": "image",
+                "label": "Image generation",
+                "description": "Default model for AI image generation.",
+                "models": image_models,
+                "default": "gemini-3.1-flash-image-preview",
+            },
+            {
+                "key": "video",
+                "label": "Video generation",
+                "description": "Default model for AI video generation.",
+                "models": video_models,
+                "default": "veo-3.1-generate-preview",
+            },
+        ]
+    }
+
+
+@router.get("/ai/model-catalog")
+def get_ai_model_catalog(current_user: User = Depends(get_current_user)):
+    """Available AI models per capability, for the Settings → AI models picker."""
+    return _build_ai_model_catalog()
+
+
+# ---------------------------------------------------------------------------
+# Personal API tokens
+# ---------------------------------------------------------------------------
+
+
+@router.get("/me/api-tokens", response_model=list[ApiTokenResponse])
+def list_api_tokens(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return (
+        db.query(ApiToken)
+        .filter(ApiToken.user_id == current_user.id)
+        .order_by(ApiToken.created_at.desc())
+        .all()
+    )
+
+
+@router.post("/me/api-tokens", response_model=ApiTokenCreateResponse, status_code=201)
+def create_api_token(
+    payload: ApiTokenCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Token name is required")
+    if len(name) > 120:
+        name = name[:120]
+
+    # Generate a token that cannot collide; hash is unique-indexed so retry defensively.
+    for _ in range(5):
+        raw_token = f"{API_TOKEN_PREFIX}{secrets.token_hex(20)}"
+        token_hash = hash_api_token(raw_token)
+        if not db.query(ApiToken).filter(ApiToken.token_hash == token_hash).first():
+            break
+    else:  # pragma: no cover - astronomically unlikely
+        raise HTTPException(status_code=500, detail="Could not generate a unique token")
+
+    record = ApiToken(
+        user_id=current_user.id,
+        name=name,
+        token_prefix=raw_token[:12],
+        token_hash=token_hash,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+
+    # `token` is included only on this creation response and never persisted in clear.
+    return ApiTokenCreateResponse(
+        id=record.id,
+        name=record.name,
+        token_prefix=record.token_prefix,
+        last_used_at=record.last_used_at,
+        created_at=record.created_at,
+        token=raw_token,
+    )
+
+
+@router.delete("/me/api-tokens/{token_id}", status_code=204)
+def revoke_api_token(
+    token_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    record = (
+        db.query(ApiToken)
+        .filter(ApiToken.id == token_id, ApiToken.user_id == current_user.id)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="Token not found")
+    db.delete(record)
+    db.commit()
+
+
+@router.delete("/me", status_code=204)
+def delete_my_account(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Deactivate the current account.
+
+    A hard delete is unsafe here: many rows (projects, media, workspace content)
+    reference ``users.id`` without ``ON DELETE CASCADE``, and cascading would
+    destroy content shared with a workspace. Instead we soft-delete: revoke all
+    sessions/tokens, anonymize personal data, and mark the row deleted so auth
+    rejects it. Owned content remains under an anonymized tombstone user.
+    """
+    user = current_user
+    now = datetime.utcnow()
+
+    # Best-effort: cancel any active Stripe subscription so a deleted account
+    # is not billed further. Webhook/portal reconciliation is the backstop.
+    if user.stripe_subscription_id:
+        try:
+            import stripe
+
+            secret = os.getenv("STRIPE_SECRET_KEY")
+            if secret:
+                stripe.api_key = secret
+                try:
+                    stripe.Subscription.cancel(user.stripe_subscription_id)
+                except AttributeError:  # older stripe SDKs
+                    stripe.Subscription.delete(user.stripe_subscription_id)
+        except Exception:
+            pass
+
+    # Revoke every session and personal access token.
+    db.query(UserSession).filter(UserSession.user_id == user.id).update(
+        {"revoked": True, "revoked_at": now}, synchronize_session=False
+    )
+    db.query(ApiToken).filter(ApiToken.user_id == user.id).delete(synchronize_session=False)
+
+    # Anonymize personal data (keep the row so owned content stays intact).
+    user.deleted_at = now
+    user.email = f"deleted+{user.id}@deleted.local"
+    user.name = "Deleted user"
+    user.full_name = None
+    user.avatar_url = None
+    user.phone = None
+    user.hashed_password = None
+    user.google_sub = None
+    user.mfa_required = False
+    user.subscription_status = "canceled"
+
+    db.commit()
+
 
 # @router.post("/register")
 # def register_user(user_data: UserRegisterSchema, db: Session = Depends(get_db)):

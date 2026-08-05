@@ -128,7 +128,7 @@ def send_subscription_welcome_email(user: User, sub: stripe.Subscription) -> Non
     plan = _plan_label(user.plan or _subscription_plan_from_stripe(sub))
     name = user.full_name or user.name or "there"
     base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
-    manage_url = f"{base}/account?tab=billing"
+    manage_url = f"{base}/dashboard?account=billing"
 
     status_val = _sub_get(sub, "status") or getattr(sub, "status", None)
     trial_end = _sub_get(sub, "trial_end")
@@ -211,7 +211,7 @@ def send_subscription_canceled_email(
         return
     pl = _plan_label(plan)
     base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
-    billing_url = f"{base}/account?tab=billing"
+    billing_url = f"{base}/dashboard?account=billing"
     until = ""
     if access_until:
         if access_until.tzinfo is None:
@@ -253,7 +253,7 @@ def send_subscription_will_not_renew_email(
         return
     pl = _plan_label(plan)
     base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
-    billing_url = f"{base}/account?tab=billing"
+    billing_url = f"{base}/dashboard?account=billing"
     end_txt = "the end of your current billing period"
     if period_end:
         dt = period_end
@@ -421,5 +421,43 @@ def send_comment_mention_email(
     <blockquote>{preview}</blockquote>
     <p><a href="{comment_url}">Open comment</a></p>
     <p>You can update mention email preferences in Account settings.</p>
+    """
+    return send_transactional_email(to_email, subject, text, html)
+
+
+def send_new_comment_email(
+    to_email: str,
+    recipient_name: str | None,
+    actor_name: str,
+    project_name: str | None,
+    video_name: str | None,
+    comment_text: str,
+    comment_url: str,
+) -> bool:
+    """Notify a video/project owner that someone commented on their work."""
+    subject_scope = video_name or project_name or "your video"
+    subject = f"New comment on {subject_scope}"
+    greet = f"Hi {recipient_name}," if recipient_name else "Hi,"
+    preview = (comment_text or "").strip()
+    if len(preview) > 220:
+        preview = preview[:217].rstrip() + "..."
+
+    text = (
+        f"{greet}\n\n"
+        f"{actor_name} commented on your work on Editube.\n\n"
+        f"Project: {project_name or 'Unknown project'}\n"
+        f"Video: {video_name or 'Unknown video'}\n\n"
+        f"Comment:\n\"{preview}\"\n\n"
+        f"Open comment: {comment_url}\n\n"
+        "You can update comment email preferences in Account settings."
+    )
+    html = f"""
+    <p>{greet}</p>
+    <p><strong>{actor_name}</strong> commented on your work on Editube.</p>
+    <p>Project: <strong>{project_name or "Unknown project"}</strong><br/>Video: <strong>{video_name or "Unknown video"}</strong></p>
+    <p>Comment:</p>
+    <blockquote>{preview}</blockquote>
+    <p><a href="{comment_url}">Open comment</a></p>
+    <p>You can update comment email preferences in Account settings.</p>
     """
     return send_transactional_email(to_email, subject, text, html)

@@ -18,7 +18,7 @@
 # app/api/models/users.py
 
 from pydantic import BaseModel, EmailStr, ConfigDict
-from typing import Optional
+from typing import Optional, Dict
 from typing import Literal
 from sqlalchemy import Column, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
@@ -61,6 +61,9 @@ class UserSettingsResponse(BaseModel):
     two_factor: bool = False
     session_timeout: str = "30"
     allow_project_invites: bool = True
+    share_data: bool = False
+    default_publish_privacy: str = "private"
+    ai_model_preferences: Optional[Dict[str, str]] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -77,6 +80,30 @@ class UserSettingsUpdate(BaseModel):
     two_factor: Optional[bool] = None
     session_timeout: Optional[Literal["15", "30", "60", "120"]] = None
     allow_project_invites: Optional[bool] = None
+    share_data: Optional[bool] = None
+    default_publish_privacy: Optional[Literal["private", "link", "workspace"]] = None
+    ai_model_preferences: Optional[Dict[str, str]] = None
+
+
+class ApiTokenResponse(BaseModel):
+    """Public representation of a personal access token (never includes the secret)."""
+
+    id: int
+    name: str
+    token_prefix: str
+    last_used_at: Optional[datetime] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ApiTokenCreateRequest(BaseModel):
+    name: str
+
+
+class ApiTokenCreateResponse(ApiTokenResponse):
+    # The full raw token, returned exactly once at creation time.
+    token: str
 
 
 class UserMFAEnrollResponse(BaseModel):

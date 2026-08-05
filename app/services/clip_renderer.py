@@ -26,7 +26,10 @@ from app.services.clip_cuts import (
     cuts_total_duration,
     normalize_cuts,
 )
-from app.services.youtube_stream_resolve import resolve_youtube_page_to_stream_url
+from app.services.youtube_stream_resolve import (
+    is_stream_url_muxed,
+    resolve_youtube_page_to_best_video_stream_url,
+)
 from app.utils.cloudinary import (
     cloudinary_credentials_configured,
     upload_local_path_to_cloudinary,
@@ -202,10 +205,14 @@ def _resolve_video_source_url(db: Session, video: Video) -> str:
     page_url = str(video.ingest_page_url or "").strip()
     if page_url and (_is_googlevideo_url(raw) or "youtube.com/" in raw or "youtu.be/" in raw):
         try:
-            fresh = resolve_youtube_page_to_stream_url(page_url)
+            fresh = resolve_youtube_page_to_best_video_stream_url(page_url)
             if fresh:
-                video.file_path = fresh
-                db.commit()
+                # Renders want resolution, so this URL is often video-only —
+                # which a browser plays as a black frame. Only persist it when
+                # it could also serve as the video's playback source.
+                if is_stream_url_muxed(fresh):
+                    video.file_path = fresh
+                    db.commit()
                 return fresh
         except Exception:  # noqa: BLE001
             logger.exception("failed to refresh youtube stream url for video %s", video.id)

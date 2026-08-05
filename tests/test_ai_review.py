@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from app.api.routes.ai import _analyze_segments, _summarize_analysis
+from app.services.auto_edit import _analyze_segments, _summarize_analysis
 
 
 class AnalyzeSegmentsTests(unittest.TestCase):
@@ -349,12 +349,50 @@ class RoughCutEndpointOptionsTests(unittest.TestCase):
         self.assertEqual(data["keepRanges"], expected["keepRanges"])
         self.assertEqual(data["suggestions"], expected["suggestions"])
 
+    def _run_review_inline(self, body, model_response):
+        """Drive review_video down its no-Redis inline path with ffmpeg and the
+        model stubbed out."""
+        from app.api.routes import ai as ai_routes
+        from app.services import video_review
+
+        with mock.patch.object(ai_routes, "can_access_project", return_value=True), mock.patch.object(
+            ai_routes, "enqueue_ai_review_job", return_value=None
+        ), mock.patch.object(
+            video_review, "extract_and_store_frames", return_value=([], [])
+        ), mock.patch.object(
+            video_review, "generate_json_multimodal", return_value=model_response
+        ):
+            return ai_routes.review_video(
+                video_id=self.video.id,
+                body=body,
+                db=self.db,
+                current_user=self.user,
+            )
+
     def test_review_endpoint_absent_body_matches_legacy_behavior(self) -> None:
+        result = self._run_review_inline(None, {"engagement_score": 80})
+
+        data = result["result_data"]
+        self.assertEqual(data["counts"], {"fillers": 1, "silences": 1, "bad_takes": 1, "repeats": 0})
+        self.assertEqual(data["engagement_score"], 80)
+        self.assertFalse(data["needs_transcription"])
+
+    def test_review_endpoint_with_options_body_filters_counts(self) -> None:
+        from app.api.routes import ai as ai_routes
+
+        result = self._run_review_inline(
+            ai_routes.AutoEditOptions(remove_bad_takes=False), {"engagement_score": 80}
+        )
+
+        data = result["result_data"]
+        self.assertEqual(data["counts"], {"fillers": 1, "silences": 1, "bad_takes": 0, "repeats": 0})
+
+    def test_review_endpoint_enqueues_and_reports_processing(self) -> None:
         from app.api.routes import ai as ai_routes
 
         with mock.patch.object(ai_routes, "can_access_project", return_value=True), mock.patch.object(
-            ai_routes, "generate_json", return_value={"engagement_score": 80}
-        ):
+            ai_routes, "enqueue_ai_review_job", return_value="job-1"
+        ) as enqueue:
             result = ai_routes.review_video(
                 video_id=self.video.id,
                 body=None,
@@ -362,24 +400,40 @@ class RoughCutEndpointOptionsTests(unittest.TestCase):
                 current_user=self.user,
             )
 
-        data = result["result_data"]
-        self.assertEqual(data["counts"], {"fillers": 1, "silences": 1, "bad_takes": 1, "repeats": 0})
+        enqueue.assert_called_once()
+        self.assertEqual(result["status"], "processing")
 
-    def test_review_endpoint_with_options_body_filters_counts(self) -> None:
+    def test_review_endpoint_keeps_previous_report_while_rerunning(self) -> None:
+        """A re-review must not blank the panel — the old report stays visible
+        under the processing status until the job replaces it."""
         from app.api.routes import ai as ai_routes
 
+        self._run_review_inline(None, {"engagement_score": 71, "verdict": "First pass"})
         with mock.patch.object(ai_routes, "can_access_project", return_value=True), mock.patch.object(
-            ai_routes, "generate_json", return_value={"engagement_score": 80}
+            ai_routes, "enqueue_ai_review_job", return_value="job-2"
         ):
             result = ai_routes.review_video(
-                video_id=self.video.id,
-                body=ai_routes.AutoEditOptions(remove_bad_takes=False),
-                db=self.db,
-                current_user=self.user,
+                video_id=self.video.id, body=None, db=self.db, current_user=self.user
             )
 
-        data = result["result_data"]
-        self.assertEqual(data["counts"], {"fillers": 1, "silences": 1, "bad_takes": 0, "repeats": 0})
+        self.assertEqual(result["status"], "processing")
+        self.assertEqual(result["result_data"]["verdict"], "First pass")
+
+    def test_review_endpoint_without_transcript_asks_for_one(self) -> None:
+        from app.api.routes import ai as ai_routes
+
+        self.transcription.segments = []
+        self.db.commit()
+
+        with mock.patch.object(ai_routes, "can_access_project", return_value=True), mock.patch.object(
+            ai_routes, "enqueue_ai_review_job"
+        ) as enqueue:
+            result = ai_routes.review_video(
+                video_id=self.video.id, body=None, db=self.db, current_user=self.user
+            )
+
+        enqueue.assert_not_called()
+        self.assertTrue(result["result_data"]["needs_transcription"])
 
 
 if __name__ == "__main__":

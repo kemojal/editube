@@ -28,6 +28,9 @@ class User(Base):
     google_sub = Column(String, unique=True, index=True, nullable=True)
     stripe_connect_account_id = Column(String, unique=True, index=True, nullable=True)
     mfa_required = Column(Boolean, server_default="false", nullable=False)
+    # Set when the user self-deletes their account; PII is anonymized and all
+    # sessions/tokens revoked. A non-null value means the account is deactivated.
+    deleted_at = Column(TIMESTAMP, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -58,6 +61,40 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+    api_tokens = relationship(
+        "ApiToken",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+    zoom_connection = relationship(
+        "UserZoomConnection",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class UserZoomConnection(Base):
+    """A user's connected Zoom account (OAuth), for importing cloud recordings."""
+
+    __tablename__ = "user_zoom_connections"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False, index=True
+    )
+    zoom_user_id = Column(String, nullable=False)
+    email = Column(String, nullable=True)
+    display_name = Column(String, nullable=True)
+    # Fernet-encrypted refresh token; access token is short-lived and refreshed.
+    refresh_token_encrypted = Column(Text, nullable=False)
+    access_token = Column(Text, nullable=True)
+    access_expires_at = Column(TIMESTAMP, nullable=True)
+    status = Column(String, server_default="active", nullable=False)  # active | revoked
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", back_populates="zoom_connection")
 
 
 class UserSettings(Base):
@@ -77,10 +114,35 @@ class UserSettings(Base):
     two_factor = Column(Boolean, server_default="false", nullable=False)
     session_timeout = Column(String, server_default="30", nullable=False)
     allow_project_invites = Column(Boolean, server_default="true", nullable=False)
+    # Whether the user opts in to sharing usage data to improve the product.
+    share_data = Column(Boolean, server_default="false", nullable=False)
+    # Default visibility applied to newly published work: private | link | workspace.
+    default_publish_privacy = Column(String, server_default="private", nullable=False)
+    # Per-capability default AI model choices, e.g. {"transcription": "base",
+    # "editing": "gemini-3-flash-preview", "image": "...", "video": "..."}.
+    ai_model_preferences = Column(JSONB, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 
     user = relationship("User", back_populates="settings")
+
+
+class ApiToken(Base):
+    """Personal access token for programmatic API access (format: ``edt_<hex>``)."""
+
+    __tablename__ = "api_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    # First chars of the raw token kept for display, e.g. "edt_1a2b3c4d".
+    token_prefix = Column(String, nullable=False)
+    # SHA-256 hex of the full raw token; the raw token is shown once and never stored.
+    token_hash = Column(String, unique=True, index=True, nullable=False)
+    last_used_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    user = relationship("User", back_populates="api_tokens")
 
 
 class UserSession(Base):

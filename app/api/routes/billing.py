@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.db.database import get_db
 from app.db.models import StripePrice, Subscription, User, WorkspaceMember
 from app.services.pricing import PLAN_SPECS, get_plan_spec, normalize_plan_key
+from app.services.marketing_offers import active_marketing_offer, resolve_checkout_offer
 from app.services.storage_policy import workspace_usage_payload
 from app.services.stripe_catalog_sync import (
     mark_stripe_price_inactive,
@@ -96,6 +97,13 @@ def _stripe_field(obj, key: str):
 class CheckoutBody(BaseModel):
     plan: str
     interval: str  # "month" | "year"
+    campaign: str | None = None
+
+
+@router.get("/offers/active")
+def get_active_marketing_offer():
+    offer = active_marketing_offer()
+    return {"offer": offer.public_payload() if offer else None}
 
 
 @router.post("/checkout")
@@ -111,6 +119,13 @@ def create_checkout_session(
     if canonical_plan not in ("pro", "scale"):
         raise HTTPException(status_code=400, detail="Only Pro or Scale can be purchased online")
     price_id = _resolve_price_id_for_checkout(db, canonical_plan, body.interval)
+    offer = resolve_checkout_offer(
+        body.campaign,
+        plan=canonical_plan,
+        interval=body.interval,
+    )
+    if body.campaign and offer is None:
+        raise HTTPException(status_code=409, detail="This offer has expired or does not apply to the selected plan")
 
     if not current_user.stripe_customer_id:
         customer = stripe.Customer.create(
@@ -125,25 +140,32 @@ def create_checkout_session(
     success_url = f"{base}/onboarding/checkout-return?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{base}/onboarding?canceled=1&step=3"
 
-    session = stripe.checkout.Session.create(
-        customer=current_user.stripe_customer_id,
-        mode="subscription",
-        line_items=[{"price": price_id, "quantity": 1}],
-        success_url=success_url,
-        cancel_url=cancel_url,
-        client_reference_id=str(current_user.id),
-        metadata={
-            "user_id": str(current_user.id),
-            "plan": canonical_plan,
-        },
-        subscription_data={
-            "metadata": {
-                "user_id": str(current_user.id),
-                "plan": canonical_plan,
-            },
+    metadata = {
+        "user_id": str(current_user.id),
+        "plan": canonical_plan,
+    }
+    if offer:
+        metadata["campaign"] = offer.campaign_id
+
+    checkout_options = {
+        "customer": current_user.stripe_customer_id,
+        "mode": "subscription",
+        "line_items": [{"price": price_id, "quantity": 1}],
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "client_reference_id": str(current_user.id),
+        "metadata": metadata,
+        "subscription_data": {
+            "metadata": metadata,
             "trial_period_days": TRIAL_DAYS,
         },
-    )
+    }
+    if offer:
+        checkout_options["discounts"] = [{"promotion_code": offer.stripe_promotion_code_id}]
+    else:
+        checkout_options["allow_promotion_codes"] = True
+
+    session = stripe.checkout.Session.create(**checkout_options)
     return {"url": session.url}
 
 
@@ -318,9 +340,43 @@ def create_portal_session(
     base = _frontend_base()
     session = stripe.billing_portal.Session.create(
         customer=current_user.stripe_customer_id,
-        return_url=f"{base}/account?tab=billing",
+        return_url=f"{base}/dashboard?account=billing",
     )
     return {"url": session.url}
+
+
+@router.get("/invoices")
+def list_invoices(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the customer's Stripe invoices (most recent first)."""
+    if not stripe.api_key:
+        raise HTTPException(status_code=500, detail="Stripe is not configured")
+    # No Stripe customer yet simply means no billing history — not an error.
+    if not current_user.stripe_customer_id:
+        return {"invoices": []}
+
+    try:
+        resp = stripe.Invoice.list(customer=current_user.stripe_customer_id, limit=24)
+    except Exception as exc:  # pragma: no cover - surfaced to client as 502
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+    invoices = [
+        {
+            "id": _stripe_field(inv, "id"),
+            "number": _stripe_field(inv, "number"),
+            "amount_paid": _stripe_field(inv, "amount_paid"),
+            "amount_due": _stripe_field(inv, "amount_due"),
+            "currency": _stripe_field(inv, "currency"),
+            "status": _stripe_field(inv, "status"),
+            "created": _stripe_field(inv, "created"),
+            "hosted_invoice_url": _stripe_field(inv, "hosted_invoice_url"),
+            "invoice_pdf": _stripe_field(inv, "invoice_pdf"),
+        }
+        for inv in (getattr(resp, "data", None) or [])
+    ]
+    return {"invoices": invoices}
 
 
 def _stripe_dt(ts: int | float | None):

@@ -13,6 +13,7 @@ from app.services.project_access import assert_write_project_content, can_access
 from app.services.youtube_stream_resolve import (
     YoutubeStreamResolveError,
     resolve_youtube_page_to_stream_url,
+    should_refresh_stream_url,
     STREAM_REFRESH_MIN_REMAINING_SEC,
     stream_url_expire_at as _stream_url_expire_at,
 )
@@ -156,8 +157,10 @@ def refresh_video_stream(
             detail="This video has no source YouTube URL to re-resolve a stream from.",
         )
 
-    expire_at = _stream_url_expire_at(db_video.file_path)
-    if expire_at is not None and expire_at > time.time() + STREAM_REFRESH_MIN_REMAINING_SEC:
+    # Re-resolve when the URL is expiring OR when it is a DASH stream that
+    # cannot play on its own — a video-only stream is just as unplayable as an
+    # expired one, and stays that way for hours if only expiry is checked.
+    if not should_refresh_stream_url(db_video.file_path):
         return {"video_id": db_video.id, "file_path": db_video.file_path}
 
     try:
