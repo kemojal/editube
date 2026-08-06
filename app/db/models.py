@@ -78,6 +78,21 @@ class User(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+    referral_code = relationship(
+        "ReferralCode",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+        foreign_keys="ReferralCode.user_id",
+    )
+    #: Referrals this user *sent*. Referral has two FKs to users, so the join
+    #: has to name which one.
+    referrals_made = relationship(
+        "Referral",
+        back_populates="referrer",
+        cascade="all, delete-orphan",
+        foreign_keys="Referral.referrer_user_id",
+    )
 
 
 class UserZoomConnection(Base):
@@ -2377,3 +2392,139 @@ class UgcCreditLedger(Base):
     period = Column(String, nullable=True, index=True)  # YYYY-MM for monthly grant idempotency
     balance_after = Column(Integer, nullable=False, server_default="0")
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Referrals & account credits
+# ---------------------------------------------------------------------------
+
+
+class ReferralCode(Base):
+    """
+    One share link per user.
+
+    The code is the whole program's identity: it is what a friend arrives with,
+    what a guest pass is drawn against, and what a reward is attributed to. It
+    lives in its own row rather than a `users.referral_code` column so the pass
+    allowance can be raised for one person (a partner, a launch push) without a
+    schema change, and so a compromised code can be revoked without touching the
+    account.
+    """
+
+    __tablename__ = "referral_codes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False, index=True
+    )
+    #: Short, case-insensitive, unambiguous (no O/0/I/1) — it gets read aloud.
+    code = Column(String, unique=True, nullable=False, index=True)
+    #: Guest passes this code may hand out. Per-user so it can be topped up.
+    passes_total = Column(Integer, nullable=False, server_default="3")
+    #: Set when the code is retired. Existing referrals keep paying out.
+    revoked_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", back_populates="referral_code", foreign_keys=[user_id])
+
+
+class Referral(Base):
+    """
+    One redeemed guest pass: the friend who arrived on someone's link.
+
+    A row is created either when an invite is emailed (no account yet, so
+    `invitee_user_id` is null) or when someone signs up on the link directly.
+    Link *clicks* are not tracked, so "3/3 left" counts people, not opens.
+    `status` is the state machine the settings panel renders:
+
+        invited ──accepted──> signed_up -> trialing -> rewarded
+           │                                        \\-> void
+           └──> expired  (14 days, pass handed back)
+
+    `rewarded` is reached the moment the friend's subscription goes paid-active,
+    because the credits are granted in the same transaction that records it.
+    """
+
+    __tablename__ = "referrals"
+    __table_args__ = (
+        # One referral per referred account, ever. Re-signup cannot mint a
+        # second reward for the same person.
+        UniqueConstraint("invitee_user_id", name="uq_referrals_invitee_user"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    referrer_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    referral_code_id = Column(
+        Integer, ForeignKey("referral_codes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    #: Snapshot of the code as typed, so a revoked/reissued code still reads back.
+    code = Column(String, nullable=False)
+    #: Null while an emailed invite is still outstanding.
+    invitee_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    #: The address invited, or a snapshot taken at signup — so the referrer sees
+    #: who it was even after a deletion anonymizes the account.
+    invitee_email = Column(String, nullable=True)
+    #: invited | signed_up | trialing | rewarded | expired | void
+    status = Column(String, nullable=False, server_default="signed_up", index=True)
+    #: Why a referral was voided (self_referral | refunded | manual).
+    void_reason = Column(String, nullable=True)
+    #: The extended trial the pass buys, and whether it has been spent.
+    pass_trial_days = Column(Integer, nullable=False, server_default="30")
+    pass_redeemed_at = Column(TIMESTAMP, nullable=True)
+    #: Email-invite bookkeeping. `invite_sends` is capped so an invite is a
+    #: favour (one mail, one nudge) rather than a campaign.
+    invited_at = Column(TIMESTAMP, nullable=True)
+    invite_expires_at = Column(TIMESTAMP, nullable=True)
+    invite_last_sent_at = Column(TIMESTAMP, nullable=True)
+    invite_sends = Column(Integer, nullable=False, server_default="0")
+    #: Null until the invite is accepted / the account is created.
+    signed_up_at = Column(TIMESTAMP, nullable=True)
+    converted_at = Column(TIMESTAMP, nullable=True)
+    rewarded_at = Column(TIMESTAMP, nullable=True)
+    #: Credits actually granted to the referrer, snapshotted so a later change
+    #: to the program's terms does not rewrite history.
+    reward_credits = Column(Integer, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    referrer = relationship("User", foreign_keys=[referrer_user_id], back_populates="referrals_made")
+    invitee = relationship("User", foreign_keys=[invitee_user_id])
+    referral_code = relationship("ReferralCode")
+
+
+class AccountCreditLedger(Base):
+    """
+    Append-only AI credit ledger for a *user account*. Balance = sum(delta).
+
+    Distinct from :class:`UgcCreditLedger`, which meters one workspace's ad-
+    variation spend. These are the account-level AI credits referral rewards pay
+    into and the wider credit system will spend from; keeping them apart means
+    neither program can silently drain the other.
+    """
+
+    __tablename__ = "account_credit_ledger"
+    __table_args__ = (
+        # Idempotency for anything granted in response to an external event
+        # (a webhook fires twice; a job is retried).
+        UniqueConstraint("user_id", "reason", "source_ref", name="uq_account_credit_source"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    delta = Column(Integer, nullable=False)  # +grant / -debit
+    #: referral_reward | referral_signup_bonus | grant | purchase | debit | reversal
+    reason = Column(String, nullable=False)
+    #: Stable identity of what caused this entry, e.g. "referral:42". Part of the
+    #: idempotency key, so it must be null only for genuinely one-off entries.
+    source_ref = Column(String, nullable=True)
+    description = Column(String, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    user = relationship("User")

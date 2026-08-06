@@ -23,7 +23,7 @@ def _curve_points(value: Any) -> str | None:
     if not isinstance(value, list):
         return None
     points: list[tuple[float, float]] = []
-    for raw in value:
+    for raw in value[:64]:
         if not isinstance(raw, dict):
             continue
         points.append((_clamp(raw.get("x"), 0, 1), _clamp(raw.get("y"), 0, 1)))

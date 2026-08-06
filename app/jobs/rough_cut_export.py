@@ -9,6 +9,7 @@ lower-thirds / brand burn-in is requested but not yet implemented.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import subprocess
 import tempfile
@@ -21,7 +22,7 @@ from sqlalchemy.orm import Session
 from app.db.database import SessionLocal
 from app.db.models import AiResult, Video, VideoTranscription
 from app.services.mask_matte import render_matte_video
-from app.services.color_adjust import build_adjust_filter_chain
+from app.services.color_adjust_keyframes import build_keyframed_adjust_filter_chain
 from app.jobs.rough_cut_effect import _resolve_media_source
 from app.utils.cloudinary import cloudinary_credentials_configured, upload_local_path_to_cloudinary
 
@@ -147,7 +148,8 @@ def _normalize_ranges(raw: object, max_end: float | None = None) -> list[tuple[f
 
 
 def _masked_filter_complex(
-    vf: str, scale_w: int, scale_h: int, *, matte_input: int = 1
+    vf: str, scale_w: int, scale_h: int, *, matte_input: int = 1,
+    background_color: str = "black",
 ) -> str:
     """Builds the `-filter_complex` for a masked export segment.
 
@@ -168,7 +170,7 @@ def _masked_filter_complex(
         f"[{matte_input}:v]format=gray[mask_alpha];"
         f"[source_alpha][mask_alpha]blend=all_mode=multiply[combined_alpha];"
         f"[base][combined_alpha]alphamerge[m];"
-        f"color=black:s={color_size}[bg];"
+        f"color={background_color}:s={color_size}[bg];"
         f"[bg][m]overlay=shortest=1[v]"
     )
 
@@ -247,6 +249,438 @@ def _range_settings(raw: object) -> dict[tuple[float, float], dict[str, Any]]:
     return result
 
 
+def _canvas_background_color(settings: dict[str, Any] | None) -> str:
+    """Return the safe solid/fallback color for a clip's Canvas fill."""
+    video = settings.get("video") if isinstance(settings, dict) else None
+    canvas = video.get("canvas") if isinstance(video, dict) else None
+    if canvas is True:
+        return "black"
+    if not isinstance(canvas, dict) or not bool(canvas.get("enabled")):
+        return "black"
+    color = str(canvas.get("color") or "#000000").strip()
+    return f"0x{color[1:]}" if re.fullmatch(r"#[0-9a-fA-F]{6}", color) else "black"
+
+
+def _safe_canvas_color(value: Any, fallback: str = "black") -> str:
+    color = str(value or "").strip()
+    return f"0x{color[1:]}" if re.fullmatch(r"#[0-9a-fA-F]{6}", color) else fallback
+
+
+def _video_settings(settings: dict[str, Any] | None) -> dict[str, Any]:
+    video = settings.get("video") if isinstance(settings, dict) else None
+    return video if isinstance(video, dict) else {}
+
+
+def _blend_mode(settings: dict[str, Any] | None) -> str:
+    """Translate the inspector's CSS names to a safe FFmpeg blend mode."""
+    requested = str(_video_settings(settings).get("blendMode") or "normal")
+    return {
+        "normal": "normal",
+        "multiply": "multiply",
+        "screen": "screen",
+        "overlay": "overlay",
+        "soft-light": "softlight",
+        "difference": "difference",
+        "color-dodge": "dodge",
+    }.get(requested, "normal")
+
+
+def _number_between(value: Any, low: float, high: float, fallback: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(number):
+        return fallback
+    return max(low, min(high, number))
+
+
+def _keyframe_track(settings: dict[str, Any] | None, channel: str, duration: float) -> list[dict[str, Any]]:
+    keyframes = settings.get("keyframes") if isinstance(settings, dict) else None
+    raw = keyframes.get(channel) if isinstance(keyframes, dict) else None
+    if not isinstance(raw, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in raw[:200]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            at = float(item.get("t", 0))
+            value = float(item.get("v", 0))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(at) or not math.isfinite(value):
+            continue
+        result.append({
+            "t": max(0.0, min(max(0.0, duration), at)),
+            "v": value,
+            "easing": str(item.get("easing") or "linear"),
+        })
+    result.sort(key=lambda item: item["t"])
+    deduped: list[dict[str, Any]] = []
+    for item in result:
+        if deduped and abs(item["t"] - deduped[-1]["t"]) < 0.0005:
+            deduped[-1] = item
+        else:
+            deduped.append(item)
+    return deduped
+
+
+def _eased_ratio(ratio: str, easing: str) -> str:
+    if easing == "hold":
+        return "0"
+    if easing == "ease-in":
+        return f"({ratio})*({ratio})"
+    if easing == "ease-out":
+        return f"1-(1-({ratio}))*(1-({ratio}))"
+    if easing == "ease-in-out":
+        return f"if(lt(({ratio}),0.5),2*({ratio})*({ratio}),1-pow(-2*({ratio})+2,2)/2)"
+    return ratio
+
+
+def _channel_expression(
+    settings: dict[str, Any] | None,
+    channel: str,
+    base: float,
+    duration: float,
+    *,
+    low: float,
+    high: float,
+    time_var: str = "t",
+) -> str:
+    track = _keyframe_track(settings, channel, duration)
+    if not track:
+        return f"{max(low, min(high, base)):.6f}"
+    values = [{**item, "v": max(low, min(high, float(item["v"])))} for item in track]
+    expression = f"{values[-1]['v']:.6f}"
+    for index in range(len(values) - 2, -1, -1):
+        start = values[index]
+        end = values[index + 1]
+        span = max(0.0005, end["t"] - start["t"])
+        ratio = f"(({time_var})-{start['t']:.6f})/{span:.6f}"
+        eased = _eased_ratio(ratio, start["easing"])
+        interpolated = f"{start['v']:.6f}+({end['v'] - start['v']:.6f})*({eased})"
+        expression = f"if(lt(({time_var}),{end['t']:.6f}),{interpolated},{expression})"
+    return f"if(lte(({time_var}),{values[0]['t']:.6f}),{values[0]['v']:.6f},{expression})"
+
+
+def _animation_presets(settings: dict[str, Any] | None) -> tuple[str, str, str, float, float]:
+    animation = settings.get("animation") if isinstance(settings, dict) else None
+    if not isinstance(animation, dict):
+        return ("none", "none", "none", 0.55, 1.0)
+    mode = str(animation.get("mode") or "in")
+    legacy = str(animation.get("preset") or "none")
+    in_preset = str(animation.get("inPreset") or (legacy if mode == "in" else "none"))
+    out_preset = str(animation.get("outPreset") or (legacy if mode == "out" else "none"))
+    combo_preset = str(animation.get("comboPreset") or (legacy if mode == "combo" else "none"))
+    allowed = {"none", "fade", "zoom", "pop", "slide-left", "slide-right", "slide-up", "spin", "swing", "shake", "pulse", "focus"}
+    duration = _number_between(animation.get("duration"), 0.12, 3.0, 0.55)
+    intensity = _number_between(animation.get("intensity"), 0.0, 200.0, 100.0) / 100.0
+    return (
+        in_preset if in_preset in allowed else "none",
+        out_preset if out_preset in allowed else "none",
+        combo_preset if combo_preset in allowed else "none",
+        duration,
+        intensity,
+    )
+
+
+def _preset_expressions(preset: str, progress: str, intensity: float) -> dict[str, str]:
+    identity = {"x": "0", "y": "0", "scale": "1", "rotation": "0", "opacity": "1"}
+    inverse = f"pow(1-({progress}),3)"
+    if preset == "fade":
+        return {**identity, "opacity": progress}
+    if preset in {"zoom", "focus"}:
+        amount = 0.32 if preset == "zoom" else 0.06
+        return {**identity, "scale": f"1+({inverse})*{amount * intensity:.6f}", "opacity": f"min(1,({progress})*{1.8 if preset == 'zoom' else 2:.3f})"}
+    if preset == "pop":
+        overshoot = f"if(lt(({progress}),0.72),0.76+(({progress})/0.72)*0.32,1.08-((({progress})-0.72)/0.28)*0.08)"
+        return {**identity, "scale": f"1+(({overshoot})-1)*{intensity:.6f}", "opacity": f"min(1,({progress})*2.5)"}
+    if preset in {"slide-left", "slide-right", "slide-up"}:
+        sign = -42 if preset == "slide-left" else 42 if preset == "slide-right" else 34
+        axis = "y" if preset == "slide-up" else "x"
+        return {**identity, axis: f"({inverse})*{sign * intensity:.6f}", "opacity": f"min(1,({progress})*1.7)"}
+    if preset == "spin":
+        return {**identity, "rotation": f"({inverse})*{-18 * intensity:.6f}", "scale": f"1-({inverse})*{0.14 * intensity:.6f}", "opacity": f"min(1,({progress})*1.8)"}
+    if preset == "swing":
+        return {**identity, "rotation": f"sin(({progress})*PI*3)*({inverse})*{9 * intensity:.6f}", "opacity": f"min(1,({progress})*2)"}
+    return identity
+
+
+def _animation_expressions(settings: dict[str, Any] | None, duration: float) -> dict[str, str]:
+    in_preset, out_preset, combo, requested_duration, intensity = _animation_presets(settings)
+    active_duration = max(0.12, min(requested_duration, max(0.12, duration / 2)))
+    phase = f"max(0,min(1,t/{max(0.01, duration):.6f}))"
+    result = {"x": "0", "y": "0", "scale": "1", "rotation": "0", "opacity": "1"}
+    if combo == "shake":
+        result.update({"x": f"sin(({phase})*PI*8)*{2.5 * intensity:.6f}", "rotation": f"sin(({phase})*PI*6)*{0.8 * intensity:.6f}"})
+    elif combo in {"pulse", "pop"}:
+        result["scale"] = f"1+sin(({phase})*PI*2)*{0.035 * intensity:.6f}"
+    elif combo == "swing":
+        result["rotation"] = f"sin(({phase})*PI*2)*{3 * intensity:.6f}"
+    elif combo == "zoom":
+        result["scale"] = f"1+({phase})*{0.12 * intensity:.6f}"
+    elif combo == "spin":
+        result["rotation"] = f"({phase})*{12 * intensity:.6f}"
+    elif combo in {"slide-left", "slide-right"}:
+        result["x"] = f"({phase})*{(-8 if combo == 'slide-left' else 8) * intensity:.6f}"
+    elif combo == "fade":
+        result["opacity"] = f"0.75+sin(({phase})*PI)*0.25"
+
+    if in_preset != "none":
+        progress = f"max(0,min(1,t/{active_duration:.6f}))"
+        entered = _preset_expressions(in_preset, progress, intensity)
+        for key in result:
+            identity = "1" if key in {"scale", "opacity"} else "0"
+            entered[key] = f"if(lte(t,{active_duration:.6f}),{entered[key]},{identity})"
+        sample = entered
+        result = {
+            "x": f"({result['x']})+({sample['x']})", "y": f"({result['y']})+({sample['y']})",
+            "scale": f"({result['scale']})*({sample['scale']})", "rotation": f"({result['rotation']})+({sample['rotation']})",
+            "opacity": f"({result['opacity']})*({sample['opacity']})",
+        }
+    if out_preset != "none":
+        remaining = f"{duration:.6f}-t"
+        progress = f"max(0,min(1,({remaining})/{active_duration:.6f}))"
+        exited = _preset_expressions(out_preset, progress, intensity)
+        for key in result:
+            identity = "1" if key in {"scale", "opacity"} else "0"
+            exited[key] = f"if(lte(({remaining}),{active_duration:.6f}),{exited[key]},{identity})"
+        result = {
+            "x": f"({result['x']})+({exited['x']})", "y": f"({result['y']})+({exited['y']})",
+            "scale": f"({result['scale']})*({exited['scale']})", "rotation": f"({result['rotation']})+({exited['rotation']})",
+            "opacity": f"({result['opacity']})*({exited['opacity']})",
+        }
+    return result
+
+
+def _needs_clip_compositor(settings: dict[str, Any] | None) -> bool:
+    if not isinstance(settings, dict):
+        return False
+    video = _video_settings(settings)
+    if settings.get("mirror") is True or _number_between(settings.get("rotation"), 0, 270, 0) != 0:
+        return True
+    canvas = video.get("canvas")
+    if isinstance(canvas, dict) and bool(canvas.get("enabled")) and canvas.get("mode") in {"gradient", "blur"}:
+        return True
+    if _blend_mode(settings) != "normal":
+        return True
+    numeric_defaults = {"scale": 100, "scaleY": 100, "x": 0, "y": 0, "rotation": 0, "opacity": 100, "cornerRadius": 0}
+    if any(abs(_number_between(video.get(key), -10000, 10000, default) - default) > 0.0001 for key, default in numeric_defaults.items()):
+        return True
+    keyframes = settings.get("keyframes")
+    if isinstance(keyframes, dict) and any(str(key).startswith("video.") and isinstance(value, list) and value for key, value in keyframes.items()):
+        return True
+    return any(preset != "none" for preset in _animation_presets(settings)[:3])
+
+
+def _canvas_background_chain(
+    settings: dict[str, Any] | None,
+    *,
+    size: str,
+    width: int,
+    height: int,
+    duration: float,
+    frame_rate: float,
+    blur_source: str,
+) -> tuple[list[str], str]:
+    video = _video_settings(settings)
+    canvas = video.get("canvas")
+    canvas = canvas if isinstance(canvas, dict) and bool(canvas.get("enabled")) else {}
+    mode = str(canvas.get("mode") or "color")
+    if mode == "blur":
+        blur = _number_between(canvas.get("blur"), 0, 80, 28)
+        dim = _number_between(canvas.get("dim"), 0, 80, 16) / 100
+        return ([f"{blur_source}scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},gblur=sigma={blur:.3f}:steps=2,eq=brightness={-dim:.4f}[canvasbg]"], "[canvasbg]")
+    color = _safe_canvas_color(canvas.get("color"), "black")
+    if mode == "gradient":
+        color_end = _safe_canvas_color(canvas.get("colorEnd"), "0x151826")
+        angle = math.radians(_number_between(canvas.get("angle"), 0, 360, 135) - 90)
+        radius = math.hypot(width, height) / 2
+        center_x, center_y = width / 2, height / 2
+        dx, dy = math.cos(angle) * radius, math.sin(angle) * radius
+        x0 = max(0, min(width, round(center_x - dx)))
+        y0 = max(0, min(height, round(center_y - dy)))
+        x1 = max(0, min(width, round(center_x + dx)))
+        y1 = max(0, min(height, round(center_y + dy)))
+        source = (
+            f"gradients=s={size}:r={max(1, frame_rate):.6f}:d={duration:.6f}:speed=0:"
+            f"c0={color}:c1={color_end}:x0={x0}:y0={y0}:x1={x1}:y1={y1}[canvasbg]"
+        )
+        return ([source], "[canvasbg]")
+    return ([f"color={color}:s={size}:r={max(1, frame_rate):.6f}:d={duration:.6f}[canvasbg]"], "[canvasbg]")
+
+
+def _motion_blur_filter_parts(settings: dict[str, Any] | None) -> list[str]:
+    """Build a bounded temporal blur. `tmix` blends actual neighbouring
+    frames, unlike a spatial CSS blur, so moving edges trail while a static
+    shot remains sharp."""
+    video = settings.get("video") if isinstance(settings, dict) else None
+    motion = video.get("motionBlur") if isinstance(video, dict) else None
+    if motion is True:
+        motion = {"enabled": True, "amount": 20, "shutterAngle": 180}
+    if not isinstance(motion, dict) or not bool(motion.get("enabled")):
+        return []
+    try:
+        amount = max(0.0, min(100.0, float(motion.get("amount", 20))))
+        shutter = max(45.0, min(360.0, float(motion.get("shutterAngle", 180))))
+    except (TypeError, ValueError):
+        return []
+    if amount <= 0.01:
+        return []
+    frames = max(2, min(8, round(2 + (amount / 100.0) * 4 * (shutter / 180.0))))
+    return [f"tmix=frames={frames}:weights='{' '.join(['1'] * frames)}'"]
+
+
+def _clip_compositor_filter_complex(
+    *,
+    vf: str,
+    scale_w: int,
+    scale_h: int,
+    duration: float,
+    frame_rate: float,
+    settings: dict[str, Any] | None,
+    processed: bool,
+    matte_input: int | None,
+) -> str:
+    """Compose a source clip with its Canvas, transform, animation and alpha.
+
+    Every expression is constructed from clamped numbers and whitelisted
+    preset ids. No browser-provided filter text enters this graph.
+    """
+    size = f"{scale_w}x{scale_h}"
+    video = _video_settings(settings)
+    canvas = video.get("canvas")
+    blur_canvas = isinstance(canvas, dict) and bool(canvas.get("enabled")) and canvas.get("mode") == "blur"
+    graph: list[str] = []
+
+    if blur_canvas and not processed:
+        graph.append("[0:v]split=2[foreground_source][canvas_source]")
+        foreground_source = "[foreground_source]"
+        blur_source = "[canvas_source]"
+    else:
+        foreground_source = "[0:v]"
+        # A processed cutout is input 0; input 1 remains the original source.
+        blur_source = "[1:v]" if processed else "[0:v]"
+
+    graph.append(f"{foreground_source}{vf}[foreground]")
+    cutout = "[foreground]"
+    if matte_input is not None:
+        graph.extend([
+            "[foreground]split[foreground_rgb][foreground_alpha_source]",
+            "[foreground_alpha_source]alphaextract[foreground_alpha]",
+            f"[{matte_input}:v]format=gray[mask_alpha]",
+            "[foreground_alpha][mask_alpha]blend=all_mode=multiply[combined_alpha]",
+            "[foreground_rgb][combined_alpha]alphamerge[cutout]",
+        ])
+        cutout = "[cutout]"
+
+    if isinstance(settings, dict) and settings.get("mirror") is True:
+        graph.append(f"{cutout}hflip[mirrored_cutout]")
+        cutout = "[mirrored_cutout]"
+
+    animation = _animation_expressions(settings, duration)
+    scale_x = _channel_expression(settings, "video.scale", _number_between(video.get("scale"), 1, 400, 100), duration, low=1, high=400)
+    scale_y_base = _number_between(video.get("scaleY"), 1, 400, _number_between(video.get("scale"), 1, 400, 100))
+    scale_y = _channel_expression(settings, "video.scaleY", scale_y_base, duration, low=1, high=400)
+    x = _channel_expression(settings, "video.x", _number_between(video.get("x"), -1000, 1000, 0), duration, low=-1000, high=1000)
+    y = _channel_expression(settings, "video.y", _number_between(video.get("y"), -1000, 1000, 0), duration, low=-1000, high=1000)
+    root_rotation = _number_between(settings.get("rotation") if isinstance(settings, dict) else 0, 0, 270, 0)
+    rotation = _channel_expression(settings, "video.rotation", _number_between(video.get("rotation"), -3600, 3600, 0), duration, low=-3600, high=3600)
+    opacity = _channel_expression(settings, "video.opacity", _number_between(video.get("opacity"), 0, 100, 100), duration, low=0, high=100, time_var="T")
+    corner = _channel_expression(settings, "video.cornerRadius", _number_between(video.get("cornerRadius"), 0, 50, 0), duration, low=0, high=50, time_var="T")
+
+    animation_opacity_at_pixel_time = re.sub(r"\bt\b", "T", animation["opacity"])
+    opacity_expression = f"(({opacity})/100)*({animation_opacity_at_pixel_time})"
+    radius = f"min(W,H)*(({corner})/100)"
+    corner_alpha = (
+        f"if(between(X,({radius}),W-({radius})),1,"
+        f"if(between(Y,({radius}),H-({radius})),1,"
+        f"lte(pow(X-if(lt(X,({radius})),({radius}),W-({radius})),2)+"
+        f"pow(Y-if(lt(Y,({radius})),({radius}),H-({radius})),2),pow(({radius}),2))))"
+    )
+    presets = _animation_presets(settings)
+    alpha_active = (
+        abs(_number_between(video.get("opacity"), 0, 100, 100) - 100) > 0.0001
+        or abs(_number_between(video.get("cornerRadius"), 0, 50, 0)) > 0.0001
+        or bool(_keyframe_track(settings, "video.opacity", duration))
+        or bool(_keyframe_track(settings, "video.cornerRadius", duration))
+        or presets[0] != "none"
+        or presets[1] != "none"
+        or presets[2] == "fade"
+    )
+    alpha_clip = cutout
+    if alpha_active:
+        graph.append(
+            f"{cutout}geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+            f"a='alpha(X,Y)*({opacity_expression})*({corner_alpha})'[alpha_clip]"
+        )
+        alpha_clip = "[alpha_clip]"
+
+    rotation_active = (
+        abs(_number_between(video.get("rotation"), -3600, 3600, 0) + root_rotation) > 0.0001
+        or bool(_keyframe_track(settings, "video.rotation", duration))
+        or presets[0] in {"spin", "swing"}
+        or presets[1] in {"spin", "swing"}
+        or presets[2] in {"spin", "swing", "shake"}
+    )
+    transformed = alpha_clip
+    base_width, base_height = scale_w, scale_h
+    if rotation_active:
+        diagonal = max(2, int(math.ceil(math.hypot(scale_w, scale_h) / 2) * 2))
+        angle = f"(({rotation})+({root_rotation:.6f})+({animation['rotation']}))*PI/180"
+        graph.append(f"{alpha_clip}rotate=angle='{angle}':ow={diagonal}:oh={diagonal}:c=none[rotated]")
+        transformed = "[rotated]"
+        base_width = base_height = diagonal
+
+    scale_x_expression = f"min(6,max(0.01,(({scale_x})/100)*({animation['scale']})))"
+    scale_y_expression = f"min(6,max(0.01,(({scale_y})/100)*({animation['scale']})))"
+    graph.append(
+        f"{transformed}scale=w='trunc(max(2,{base_width}*({scale_x_expression}))/2)*2':"
+        f"h='trunc(max(2,{base_height}*({scale_y_expression}))/2)*2':eval=frame[scaled_clip]"
+    )
+
+    background_graph, background = _canvas_background_chain(
+        settings,
+        size=size,
+        width=scale_w,
+        height=scale_h,
+        duration=duration,
+        frame_rate=frame_rate,
+        blur_source=blur_source,
+    )
+    graph.extend(background_graph)
+    overlay_x = f"(W-w)/2+((({x})+({animation['x']}))/100)*W"
+    overlay_y = f"(H-h)/2+((({y})+({animation['y']}))/100)*H"
+    blend_mode = _blend_mode(settings)
+    if blend_mode == "normal":
+        graph.append(f"{background}[scaled_clip]overlay=x='{overlay_x}':y='{overlay_y}':shortest=1[composited]")
+    else:
+        # `blend` requires equally-sized inputs and does not honor the top
+        # input's alpha by itself. First place the transformed clip on a
+        # transparent full-frame surface, calculate the blend, then merge the
+        # result over the untouched Canvas using the clip alpha. This matches
+        # CSS mix-blend-mode outside the clip bounds instead of darkening the
+        # whole frame with transparent black.
+        graph.extend([
+            f"color=black@0:s={size}:r={max(1, frame_rate):.6f}:d={duration:.6f},format=rgba[blend_clear]",
+            f"[blend_clear][scaled_clip]overlay=x='{overlay_x}':y='{overlay_y}':shortest=1:format=auto[blend_foreground]",
+            "[blend_foreground]split[blend_foreground_rgb_source][blend_alpha_source]",
+            "[blend_alpha_source]alphaextract[blend_alpha]",
+            "[blend_foreground_rgb_source]format=gbrp[blend_foreground_rgb]",
+            f"{background}format=gbrp,split[blend_base][blend_background]",
+            f"[blend_foreground_rgb][blend_background]blend=all_mode={blend_mode}[blend_result]",
+            "[blend_base][blend_result][blend_alpha]maskedmerge[composited]",
+        ])
+
+    motion = _motion_blur_filter_parts(settings)
+    if motion:
+        graph.append(f"[composited]{','.join(motion)}[v]")
+    else:
+        graph.append("[composited]null[v]")
+    return ";".join(graph)
+
+
 def _video_segment_command(
     *,
     video_source: str,
@@ -260,6 +694,9 @@ def _video_segment_command(
     output: Path,
     processed: bool,
     matte_path: Path | None = None,
+    background_color: str = "black",
+    clip_settings: dict[str, Any] | None = None,
+    frame_rate: float = 30.0,
 ) -> list[str]:
     """Build one MP4 segment while preserving a processed source's alpha."""
     command = ["ffmpeg", "-y"]
@@ -276,10 +713,32 @@ def _video_segment_command(
         command += ["-i", str(matte_path)]
 
     command += ["-t", str(duration)]
-    if matte_input is not None:
+    if _needs_clip_compositor(clip_settings):
         command += [
             "-filter_complex",
-            _masked_filter_complex(vf, scale_w, scale_h, matte_input=matte_input),
+            _clip_compositor_filter_complex(
+                vf=vf,
+                scale_w=scale_w,
+                scale_h=scale_h,
+                duration=duration,
+                frame_rate=frame_rate,
+                settings=clip_settings,
+                processed=processed,
+                matte_input=matte_input,
+            ),
+            "-map",
+            "[v]",
+        ]
+    elif matte_input is not None:
+        command += [
+            "-filter_complex",
+            _masked_filter_complex(
+                vf,
+                scale_w,
+                scale_h,
+                matte_input=matte_input,
+                background_color=background_color,
+            ),
             "-map",
             "[v]",
         ]
@@ -287,7 +746,7 @@ def _video_segment_command(
         color_size = f"{scale_w}x{scale_h}"
         command += [
             "-filter_complex",
-            f"[0:v]{vf}[cutout];color=black:s={color_size}[bg];"
+            f"[0:v]{vf}[cutout];color={background_color}:s={color_size}[bg];"
             "[bg][cutout]overlay=shortest=1[v]",
             "-map",
             "[v]",
@@ -491,6 +950,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
             db, video_id, payload.get("processedRanges")
         )
         color_ranges = _range_settings(payload.get("colorRanges"))
+        video_ranges = _range_settings(payload.get("videoRanges"))
         # I11: tracked across segments -- if a mask was requested but any
         # segment's matte failed to render, the export still finishes
         # (fail-open: a masking bug must not fail an entire export) but the
@@ -502,7 +962,8 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
         # collected here so the result can say so instead of silently
         # shipping a different typeface than the editor previewed.
         mask_font_fallbacks: set[str] = set()
-        matte_fps = _resolve_numeric_fps(settings, media_src) if (want_mp4_video and masks) else 30.0
+        render_fps = _resolve_numeric_fps(settings, media_src) if want_mp4_video else 30.0
+        matte_fps = render_fps if (want_mp4_video and masks) else 30.0
         scale_w, scale_h = (0, 0)
         if want_mp4_video and masks:
             try:
@@ -550,13 +1011,18 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
 
                 if want_mp4_video:
                     v_out = tmp_path / f"v{index:03d}.mp4"
-                    adjust_filters = build_adjust_filter_chain(
-                        color_ranges.get((round(start, 3), round(end, 3)))
+                    adjust_filters = build_keyframed_adjust_filter_chain(
+                        color_ranges.get((round(start, 3), round(end, 3))),
+                        dur,
                     )
+                    video_settings = video_ranges.get((round(start, 3), round(end, 3)))
+                    canvas_color = _canvas_background_color(video_settings)
+                    use_clip_compositor = _needs_clip_compositor(video_settings)
                     vf_parts = [
                         f"scale={scale}:force_original_aspect_ratio=decrease",
-                        f"pad={scale}:(ow-iw)/2:(oh-ih)/2:color=black@0",
+                        f"pad={scale}:(ow-iw)/2:(oh-ih)/2:color={'black@0' if use_clip_compositor else canvas_color}",
                         *adjust_filters,
+                        *([] if use_clip_compositor else _motion_blur_filter_parts(video_settings)),
                         "format=rgba",
                     ]
                     vf = ",".join(vf_parts) + fps_extra
@@ -598,6 +1064,9 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                             output=v_out,
                             processed=processed_source is not None,
                             matte_path=matte_path,
+                            background_color=canvas_color,
+                            clip_settings=video_settings,
+                            frame_rate=render_fps,
                         )
                     )
                     vid_parts.append(v_out)

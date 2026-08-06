@@ -4,6 +4,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from datetime import datetime
+import logging
 import os
 import secrets
 from urllib.parse import quote as url_quote
@@ -61,6 +62,8 @@ from app.services.oidc_sso import (
     validate_oidc_claims,
 )
 from app.services.pricing import normalize_plan_key
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/users",
@@ -370,6 +373,22 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
     from app.services.workspace_bootstrap import ensure_personal_workspace
 
     ensure_personal_workspace(db, db_user)
+
+    # An invite link is a nice-to-have on top of an account that already exists
+    # by this point. A code that is stale, exhausted or self-referring must
+    # leave the signup itself untouched — the panel and the claim endpoint are
+    # where a user is told a code did not take.
+    if user.referral_code:
+        from app.services.referrals import ReferralRedemptionError, redeem_referral_code
+
+        try:
+            redeem_referral_code(db, db_user, user.referral_code)
+        except ReferralRedemptionError:
+            pass
+        except Exception:
+            logger.exception(
+                "referral redemption failed during registration user=%s", db_user.id
+            )
 
     session_id = create_user_session(db, db_user.id)
     access_token = create_access_token(

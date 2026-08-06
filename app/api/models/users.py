@@ -150,6 +150,9 @@ class OnboardingPlanUpdate(BaseModel):
 
 class UserCreate(UserBase):
     password: str
+    #: Invite code from a `?ref=` link, if the account arrived on one. Optional
+    #: and never fatal — a stale code must not block a signup.
+    referral_code: Optional[str] = None
 
 class UserUpdate(UserBase):
     password: str | None = None

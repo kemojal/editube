@@ -1339,6 +1339,8 @@ class RoughCutExportBody(BaseModel):
     # Non-destructive per-source-range color settings. The worker validates and
     # translates these into a deterministic ffmpeg filter chain.
     colorRanges: list[dict[str, Any]] = Field(default_factory=list)
+    # Non-destructive Canvas and temporal-motion settings per source range.
+    videoRanges: list[dict[str, Any]] = Field(default_factory=list)
     # When true, the rendered output registers as the NEXT VERSION of this
     # video (same version_group_id, version = max+1) once the export
     # completes. Back-compat default off — existing callers keep getting
@@ -1366,6 +1368,7 @@ def start_rough_cut_export(
         "masks": body.masks,
         "processedRanges": body.processedRanges,
         "colorRanges": body.colorRanges,
+        "videoRanges": body.videoRanges,
         "progress": 0,
     }
 

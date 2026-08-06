@@ -8,6 +8,7 @@ import smtplib
 from datetime import date, datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html import escape as html_escape
 
 import stripe
 from sqlalchemy.orm import Session
@@ -42,10 +43,16 @@ def send_transactional_email(
     subject: str,
     body_text: str,
     body_html: str | None = None,
+    reply_to: str | None = None,
 ) -> bool:
     """
     Send a single email. Returns False if SMTP is not configured or send fails.
     Failures are logged; callers should not raise for webhook safety.
+
+    ``reply_to`` lets a person-to-person mail (a referral invite) come back to
+    the human who triggered it. The `From` header stays our own address in every
+    case — putting a user's address there is spoofing, and SPF/DMARC will send
+    the message straight to spam or bin it outright.
     """
     if not is_smtp_configured():
         logger.warning("SMTP not configured; skipping email to %s", to)
@@ -64,6 +71,10 @@ def send_transactional_email(
     msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = to
+    # Header injection guard: a newline in a user-supplied address would let the
+    # rest of the headers be rewritten.
+    if reply_to and "\n" not in reply_to and "\r" not in reply_to:
+        msg["Reply-To"] = reply_to
 
     try:
         with smtplib.SMTP(host, port, timeout=30) as server:
@@ -351,6 +362,85 @@ def send_workspace_invite_email(
     <p>If you were not expecting this, you can ignore this email.</p>
     """
     return send_transactional_email(to_email, subject, text, html)
+
+
+def send_referral_invite_email(
+    to_email: str,
+    referrer_name: str,
+    referrer_email: str,
+    invite_url: str,
+    trial_days: int,
+    signup_credits: int,
+    expires_days: int,
+) -> bool:
+    """
+    "Kemo sent you a guest pass."
+
+    The copy is fixed — there is no message field anywhere in the flow. An
+    invite form that forwards free text is a way to send anonymous harassment
+    over someone else's domain, and it is not worth the conversion.
+
+    Every interpolated value is escaped: `referrer_name` is a display name the
+    sender controls, and it lands inside an HTML body.
+    """
+    name = html_escape(referrer_name or "Someone")
+    url = html_escape(invite_url, quote=True)
+    subject = f"{referrer_name or 'Someone'} sent you a guest pass for Editube"
+
+    text = (
+        f"Hi,\n\n"
+        f"{referrer_name or 'Someone'} ({referrer_email}) uses Editube to edit video and "
+        f"sent you a guest pass.\n\n"
+        f"It gets you {trial_days} days of Editube Pro and {signup_credits} AI credits — "
+        f"more than the standard trial.\n\n"
+        f"Claim it here (expires in {expires_days} days):\n{invite_url}\n\n"
+        "If this doesn't look like something you'd use, you can ignore this email "
+        "and we won't send another."
+    )
+    html = f"""
+    <p>Hi,</p>
+    <p><strong>{name}</strong> ({html_escape(referrer_email)}) uses Editube to edit video
+    and sent you a guest pass.</p>
+    <p>It gets you <strong>{trial_days} days of Editube Pro</strong> and
+    <strong>{signup_credits} AI credits</strong> — more than the standard trial.</p>
+    <p><a href="{url}">Claim your guest pass</a></p>
+    <p>This link expires in {expires_days} days.</p>
+    <p>If this doesn't look like something you'd use, you can ignore this email and
+    we won't send another.</p>
+    """
+    return send_transactional_email(to_email, subject, text, html, reply_to=referrer_email)
+
+
+def send_referral_invite_existing_account_email(
+    to_email: str,
+    referrer_name: str,
+    referrer_email: str,
+) -> bool:
+    """
+    The invited address already has an Editube account.
+
+    A guest pass would be a promise we can't keep — they can't sign up twice —
+    but the sender is never told the address is taken. Refusing the invite, or
+    skipping the mail, would turn this form into an account-enumeration oracle:
+    "did the pending invite appear?" answers "is this person a customer?". So
+    the invite is recorded and shown as normal, and the recipient just gets an
+    accurate mail instead of an inapplicable offer.
+    """
+    name = html_escape(referrer_name or "Someone")
+    subject = f"{referrer_name or 'Someone'} mentioned you on Editube"
+    text = (
+        f"Hi,\n\n"
+        f"{referrer_name or 'Someone'} ({referrer_email}) wanted to send you a guest pass "
+        "for Editube — but you already have an account, so there's nothing to claim.\n\n"
+        "Nothing has changed on your account. You can ignore this email."
+    )
+    html = f"""
+    <p>Hi,</p>
+    <p><strong>{name}</strong> ({html_escape(referrer_email)}) wanted to send you a guest
+    pass for Editube — but you already have an account, so there's nothing to claim.</p>
+    <p>Nothing has changed on your account. You can ignore this email.</p>
+    """
+    return send_transactional_email(to_email, subject, text, html, reply_to=referrer_email)
 
 
 def send_workspace_provisioned_account_email(

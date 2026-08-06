@@ -11,6 +11,11 @@ from app.db.database import get_db
 from app.db.models import StripePrice, Subscription, User, WorkspaceMember
 from app.services.pricing import PLAN_SPECS, get_plan_spec, normalize_plan_key
 from app.services.marketing_offers import active_marketing_offer, resolve_checkout_offer
+from app.services.referrals import (
+    mark_pass_redeemed,
+    sync_referral_from_subscription,
+    trial_days_for_user,
+)
 from app.services.storage_policy import workspace_usage_payload
 from app.services.workspace_bootstrap import ensure_personal_workspace
 from app.services.stripe_catalog_sync import (
@@ -148,6 +153,15 @@ def create_checkout_session(
     if offer:
         metadata["campaign"] = offer.campaign_id
 
+    # A guest pass buys a longer trial than the standing one. This is the moment
+    # it is actually spent, so it is marked here rather than at signup — someone
+    # who never reaches checkout keeps their pass.
+    trial_days = trial_days_for_user(db, current_user.id, TRIAL_DAYS)
+    if trial_days != TRIAL_DAYS:
+        metadata["referral_pass"] = "1"
+        mark_pass_redeemed(db, current_user.id)
+        db.commit()
+
     checkout_options = {
         "customer": current_user.stripe_customer_id,
         "mode": "subscription",
@@ -158,7 +172,7 @@ def create_checkout_session(
         "metadata": metadata,
         "subscription_data": {
             "metadata": metadata,
-            "trial_period_days": TRIAL_DAYS,
+            "trial_period_days": trial_days,
         },
     }
     if offer:
@@ -507,6 +521,11 @@ def _sync_user_from_subscription(
 
     db.commit()
     db.refresh(user)
+
+    # If this user arrived on someone's invite link, this is where that referral
+    # advances and — once the subscription is paid-active — where the referrer
+    # is credited. A no-op for anyone who was not referred, and it never raises.
+    sync_referral_from_subscription(db, user, user.subscription_status, user.plan)
 
 
 @router.post("/webhook")
