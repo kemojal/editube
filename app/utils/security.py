@@ -39,9 +39,17 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 REFRESH_TOKEN_EXPIRE_DAYS = 30
 
-def create_access_token(data: dict):
+def create_access_token(data: dict, expires_minutes: int | None = None):
+    """Mint a signed token.
+
+    `expires_minutes` overrides the default lifetime. Short-lived tokens that
+    are not sessions — the MFA challenge handed out between password and second
+    factor — pass a few minutes here rather than living as long as a real
+    access token.
+    """
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    minutes = ACCESS_TOKEN_EXPIRE_MINUTES if expires_minutes is None else expires_minutes
+    expire = datetime.utcnow() + timedelta(minutes=minutes)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt

@@ -1,15 +1,22 @@
 # Optional ML/AI dependencies (transcription + generative features).
-# Install only on machines that run these workloads.
+#
+# IMPORTANT: use Python 3.11-3.13. rembg intentionally declares Python <3.14
+# because its scientific stack is not compatible with 3.14 yet. The repository
+# pins local development to 3.12 in `.python-version`; `scripts/setup_ml_env.sh`
+# validates this before spending time downloading model runtimes.
 faster-whisper>=1.0.0
 google-genai
-opencv-python-headless>=4.9.0
+# Retouch uses the OpenCV 4.x FaceDetectorYN ABI for YuNet landmarks and Haar
+# as its no-model fallback. Keep this pinned until the OpenCV 5 DNN migration
+# (and the matching dynamic-input YuNet export) is deliberately completed.
+opencv-python-headless>=4.9.0,<5
 numpy>=1.26.0
 
 # Background removal / matting. rembg wraps ONNX models (u2netp for the Faster
 # tier, birefnet-general for Better) and needs only onnxruntime rather than a
 # full torch install, which keeps the API image an order of magnitude smaller.
 # Selected via SEGMENTATION_PROVIDER; see app/services/segmentation/.
-rembg>=2.0.50
+rembg[cpu]>=2.0.75
 onnxruntime>=1.17.0
 
 # Point-prompt segmentation for custom background removal: click a subject,
@@ -18,6 +25,7 @@ onnxruntime>=1.17.0
 #
 # Pulls torch, so this is by far the heaviest entry here. Install only where
 # custom removal actually runs; SEGMENTATION_PROVIDER=http moves it elsewhere.
-torch>=2.3.1
-torchvision
+torch>=2.5.1
+torchvision>=0.20.1
+huggingface-hub>=0.27.0
 sam2>=1.1.0

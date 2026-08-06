@@ -21,6 +21,8 @@ from sqlalchemy.orm import Session
 from app.db.database import SessionLocal
 from app.db.models import AiResult, Video, VideoTranscription
 from app.services.mask_matte import render_matte_video
+from app.services.color_adjust import build_adjust_filter_chain
+from app.jobs.rough_cut_effect import _resolve_media_source
 from app.utils.cloudinary import cloudinary_credentials_configured, upload_local_path_to_cloudinary
 
 logger = logging.getLogger(__name__)
@@ -144,7 +146,9 @@ def _normalize_ranges(raw: object, max_end: float | None = None) -> list[tuple[f
     return out
 
 
-def _masked_filter_complex(vf: str, scale_w: int, scale_h: int) -> str:
+def _masked_filter_complex(
+    vf: str, scale_w: int, scale_h: int, *, matte_input: int = 1
+) -> str:
     """Builds the `-filter_complex` for a masked export segment.
 
     Trap: `scale`/`pad` (baked into `vf`) genuinely take colon-separated
@@ -159,11 +163,158 @@ def _masked_filter_complex(vf: str, scale_w: int, scale_h: int) -> str:
     """
     color_size = f"{scale_w}x{scale_h}"
     return (
-        f"[0:v]{vf}[base];"
-        f"[base][1:v]alphamerge[m];"
+        f"[0:v]{vf},split[base][alpha_source];"
+        f"[alpha_source]alphaextract[source_alpha];"
+        f"[{matte_input}:v]format=gray[mask_alpha];"
+        f"[source_alpha][mask_alpha]blend=all_mode=multiply[combined_alpha];"
+        f"[base][combined_alpha]alphamerge[m];"
         f"color=black:s={color_size}[bg];"
         f"[bg][m]overlay=shortest=1[v]"
     )
+
+
+def _approved_processed_ranges(
+    db: Session,
+    video_id: int,
+    requested: object,
+) -> dict[tuple[float, float], str]:
+    """Return requested processed visuals backed by completed owned jobs.
+
+    `processedRanges` crosses a trust boundary. Resolving a browser-provided URL
+    directly would turn the worker into an SSRF/local-file reader. A source is
+    usable only when its URL, effect type, and range exactly match a completed
+    Remove BG or Retouch row for this video.
+    """
+    if not isinstance(requested, list):
+        return {}
+
+    approved: set[tuple[float, float, str, str]] = set()
+    rows = (
+        db.query(AiResult)
+        .filter(
+            AiResult.video_id == video_id,
+            AiResult.result_type == "rough_cut_effect",
+            AiResult.status == "completed",
+        )
+        .all()
+    )
+    for row in rows:
+        data = row.result_data if isinstance(row.result_data, dict) else {}
+        effect_type = str(data.get("effectType") or "")
+        if effect_type not in {"remove_bg", "retouch"}:
+            continue
+        target = data.get("clipTarget") if isinstance(data.get("clipTarget"), dict) else {}
+        url = data.get("outputUrl")
+        try:
+            start = round(float(target.get("start", 0)), 3)
+            end = round(float(target.get("end", 0)), 3)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(url, str) and url.strip() and end > start:
+            approved.add((start, end, url.strip(), effect_type))
+
+    result: dict[tuple[float, float], str] = {}
+    for item in requested:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("sourceUrl")
+        effect_type = str(item.get("effectType") or "remove_bg")
+        try:
+            start = round(float(item.get("start", 0)), 3)
+            end = round(float(item.get("end", 0)), 3)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(url, str) and (start, end, url.strip(), effect_type) in approved:
+            result[(start, end)] = _resolve_media_source(url.strip())
+    return result
+
+
+def _range_settings(raw: object) -> dict[tuple[float, float], dict[str, Any]]:
+    """Map an export payload's exact source ranges to plain settings objects."""
+    if not isinstance(raw, list):
+        return {}
+    result: dict[tuple[float, float], dict[str, Any]] = {}
+    for item in raw:
+        if not isinstance(item, dict) or not isinstance(item.get("settings"), dict):
+            continue
+        try:
+            start = round(float(item.get("start", 0)), 3)
+            end = round(float(item.get("end", 0)), 3)
+        except (TypeError, ValueError):
+            continue
+        if end > start:
+            result[(start, end)] = dict(item["settings"])
+    return result
+
+
+def _video_segment_command(
+    *,
+    video_source: str,
+    audio_source: str,
+    source_start: float,
+    duration: float,
+    vf: str,
+    scale_w: int,
+    scale_h: int,
+    crf: int,
+    output: Path,
+    processed: bool,
+    matte_path: Path | None = None,
+) -> list[str]:
+    """Build one MP4 segment while preserving a processed source's alpha."""
+    command = ["ffmpeg", "-y"]
+    if processed:
+        command += ["-i", video_source, "-ss", str(source_start), "-i", audio_source]
+        audio_input = 1
+    else:
+        command += ["-ss", str(source_start), "-i", video_source]
+        audio_input = 0
+
+    matte_input: int | None = None
+    if matte_path is not None:
+        matte_input = 2 if processed else 1
+        command += ["-i", str(matte_path)]
+
+    command += ["-t", str(duration)]
+    if matte_input is not None:
+        command += [
+            "-filter_complex",
+            _masked_filter_complex(vf, scale_w, scale_h, matte_input=matte_input),
+            "-map",
+            "[v]",
+        ]
+    elif processed:
+        color_size = f"{scale_w}x{scale_h}"
+        command += [
+            "-filter_complex",
+            f"[0:v]{vf}[cutout];color=black:s={color_size}[bg];"
+            "[bg][cutout]overlay=shortest=1[v]",
+            "-map",
+            "[v]",
+        ]
+    else:
+        command += ["-vf", vf, "-map", "0:v"]
+
+    command += [
+        "-map",
+        f"{audio_input}:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        str(crf),
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        str(output),
+    ]
+    return command
 
 
 def _fps_filter_part(settings: dict[str, Any], source_video: str) -> str:
@@ -336,6 +487,10 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
 
         fps_extra = _fps_filter_part(settings, media_src) if want_mp4_video else ""
         masks = payload.get("masks") if isinstance(payload.get("masks"), list) else []
+        processed_ranges = _approved_processed_ranges(
+            db, video_id, payload.get("processedRanges")
+        )
+        color_ranges = _range_settings(payload.get("colorRanges"))
         # I11: tracked across segments -- if a mask was requested but any
         # segment's matte failed to render, the export still finishes
         # (fail-open: a masking bug must not fail an entire export) but the
@@ -367,6 +522,9 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
 
             for index, (start, end) in enumerate(normalized):
                 dur = max(0.04, end - start)
+                processed_source = processed_ranges.get(
+                    (round(start, 3), round(end, 3))
+                )
                 w_out = tmp_path / f"w{index:03d}.wav"
                 _run_ffmpeg(
                     [
@@ -392,11 +550,16 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
 
                 if want_mp4_video:
                     v_out = tmp_path / f"v{index:03d}.mp4"
-                    vf = (
-                        f"scale={scale}:force_original_aspect_ratio=decrease,"
-                        f"pad={scale}:(ow-iw)/2:(oh-ih)/2"
-                        f"{fps_extra}"
+                    adjust_filters = build_adjust_filter_chain(
+                        color_ranges.get((round(start, 3), round(end, 3)))
                     )
+                    vf_parts = [
+                        f"scale={scale}:force_original_aspect_ratio=decrease",
+                        f"pad={scale}:(ow-iw)/2:(oh-ih)/2:color=black@0",
+                        *adjust_filters,
+                        "format=rgba",
+                    ]
+                    vf = ",".join(vf_parts) + fps_extra
 
                     matte_path: Path | None = None
                     if masks:
@@ -422,73 +585,21 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                             matte_path = None
                             mask_render_failed_for_segment = True
 
-                    if matte_path is not None:
-                        filter_complex = _masked_filter_complex(vf, scale_w, scale_h)
-                        _run_ffmpeg(
-                            [
-                                "ffmpeg",
-                                "-y",
-                                "-ss",
-                                str(start),
-                                "-i",
-                                media_src,
-                                "-i",
-                                str(matte_path),
-                                "-t",
-                                str(dur),
-                                "-filter_complex",
-                                filter_complex,
-                                "-map",
-                                "[v]",
-                                "-map",
-                                "0:a?",
-                                "-c:v",
-                                "libx264",
-                                "-preset",
-                                "veryfast",
-                                "-crf",
-                                str(crf),
-                                "-pix_fmt",
-                                "yuv420p",
-                                "-c:a",
-                                "aac",
-                                "-b:a",
-                                "192k",
-                                "-movflags",
-                                "+faststart",
-                                str(v_out),
-                            ]
+                    _run_ffmpeg(
+                        _video_segment_command(
+                            video_source=processed_source or media_src,
+                            audio_source=media_src,
+                            source_start=start,
+                            duration=dur,
+                            vf=vf,
+                            scale_w=int(scale.split(":", 1)[0]),
+                            scale_h=int(scale.split(":", 1)[1]),
+                            crf=crf,
+                            output=v_out,
+                            processed=processed_source is not None,
+                            matte_path=matte_path,
                         )
-                    else:
-                        _run_ffmpeg(
-                            [
-                                "ffmpeg",
-                                "-y",
-                                "-ss",
-                                str(start),
-                                "-i",
-                                media_src,
-                                "-t",
-                                str(dur),
-                                "-vf",
-                                vf,
-                                "-c:v",
-                                "libx264",
-                                "-preset",
-                                "veryfast",
-                                "-crf",
-                                str(crf),
-                                "-pix_fmt",
-                                "yuv420p",
-                                "-c:a",
-                                "aac",
-                                "-b:a",
-                                "192k",
-                                "-movflags",
-                                "+faststart",
-                                str(v_out),
-                            ]
-                        )
+                    )
                     vid_parts.append(v_out)
 
                 progress = min(72, int(8 + ((index + 1) / max(total, 1)) * 64))

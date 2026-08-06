@@ -10,10 +10,27 @@ from jose import ExpiredSignatureError, JWTError, jwt
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.db.models import User
+from app.db.models import User, UserMFAMethod
 from app.utils.security import ALGORITHM, SECRET_KEY, create_access_token, create_refresh_token, create_user_session
 
 router = APIRouter(prefix="/users", tags=["Users"])
+
+#: Kept in step with `users.MFA_CHALLENGE_TTL_MINUTES`. Imported lazily at the
+#: call site to avoid a circular import between the two route modules.
+_MFA_CHALLENGE_TTL_MINUTES = 10
+
+
+def _has_verified_mfa(db: Session, user_id: int) -> bool:
+    return (
+        db.query(UserMFAMethod)
+        .filter(
+            UserMFAMethod.user_id == user_id,
+            UserMFAMethod.disabled_at.is_(None),
+            UserMFAMethod.verified_at.isnot(None),
+        )
+        .first()
+        is not None
+    )
 
 
 def _require_google_env() -> tuple[str, str]:
@@ -181,6 +198,23 @@ def google_oauth_callback(
             db.add(user)
         db.commit()
         db.refresh(user)
+
+    # Google proving the address is only the first factor. Without this, anyone
+    # who enrolled an authenticator could skip it entirely by clicking
+    # "Continue with Google", which made the whole feature advisory.
+    if _has_verified_mfa(db, user.id):
+        challenge_token = create_access_token(
+            data={
+                "user_id": user.id,
+                "onboarding_completed": user.onboarding_completed,
+                "mfa_pending": True,
+            },
+            expires_minutes=_MFA_CHALLENGE_TTL_MINUTES,
+        )
+        redirect_url = f"{frontend_callback}?mfa_challenge={parse.quote(challenge_token)}"
+        if return_next:
+            redirect_url += f"&next={parse.quote(return_next, safe='')}"
+        return RedirectResponse(url=redirect_url, status_code=302)
 
     session_id = create_user_session(db, user.id)
     app_access_token = create_access_token(

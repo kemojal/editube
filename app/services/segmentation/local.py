@@ -12,7 +12,6 @@ bar, not an interactive effect. Interactive speed needs the GPU runtime.
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import subprocess
 from pathlib import Path
@@ -24,26 +23,27 @@ from .base import (
     CAPABILITY_PROPAGATE,
     SegmentationError,
     SegmentationResult,
+    module_available,
 )
 from .matte_ops import matte_settings_from_attributes, refine_matte
 from .matte_stride import StrideDecider, blend_mattes, motion_probe, stride_for_quality
+from .chroma_matte import chroma_keep_matte, combine_keep_mattes
 
 #: Frame-by-frame matting is slow on CPU; refuse very long clips rather than
 #: appearing to hang for an hour with no way to tell whether it is progressing.
 MAX_LOCAL_SECONDS = float(os.environ.get("SEGMENTATION_LOCAL_MAX_SECONDS", "120") or "120")
+TRACKING_MAX_EDGE = max(
+    256,
+    min(2048, int(os.environ.get("SEGMENTATION_TRACK_MAX_EDGE", "1024") or "1024")),
+)
 
 
 def _has(module: str) -> bool:
-    return importlib.util.find_spec(module) is not None
+    return module_available(module)
 
 
 class LocalSegmentationProvider:
     name = "local"
-
-    #: Maps the quality toggle in the UI onto concrete models. `Faster` is the
-    #: lighter u2net; `Better` is BiRefNet, which holds hair and soft edges far
-    #: better and costs proportionally more.
-    MODELS = {"faster": "u2netp", "better": "birefnet-general"}
 
     def supports(self, capability: str) -> bool:
         """rembg does whole-subject matting only.
@@ -54,24 +54,26 @@ class LocalSegmentationProvider:
         showing one that silently does nothing.
         """
         if capability == CAPABILITY_AUTO_MATTE:
-            return _has("rembg")
+            from . import auto_backend
+
+            return auto_backend.is_installed()
         if capability == CAPABILITY_POINT_PROMPT:
             from . import sam2_backend
 
             return sam2_backend.is_installed()
         if capability == CAPABILITY_PROPAGATE:
-            # Video propagation needs SAM 2's memory predictor, which is a
-            # separate code path from the image predictor wired up here.
-            return False
+            from . import video_backend
+
+            return video_backend.is_installed()
         return False
 
     def is_available(self) -> tuple[bool, str]:
-        missing = [name for name in ("rembg", "cv2", "numpy", "PIL") if not _has(name)]
-        if missing:
+        missing = [name for name in ("cv2", "numpy", "PIL") if not _has(name)]
+        if missing or not (self.supports(CAPABILITY_AUTO_MATTE) or self.supports(CAPABILITY_POINT_PROMPT)):
             return False, (
-                "Background removal is not installed on this server. Run "
-                "`pip install -r requirements-ml.txt` in the API environment, "
-                f"then restart the worker. Missing: {', '.join(missing)}."
+                "Background removal is not ready. Use Python 3.11-3.13, run "
+                "`./scripts/setup_ml_env.sh`, then restart the API and worker."
+                + (f" Missing: {', '.join(missing)}." if missing else "")
             )
         return True, ""
 
@@ -85,13 +87,22 @@ class LocalSegmentationProvider:
         output_dir: Path,
         progress: Any = None,
     ) -> SegmentationResult:
-        ready, reason = self.is_available()
-        if not ready:
-            raise SegmentationError(reason)
-
         if effect_type != "remove_bg":
             raise SegmentationError(
                 f"{effect_type.replace('_', ' ')} is not available on this server yet."
+            )
+
+        custom = bool(settings.get("customRemoval")) and self._selection_prompts(settings) is not None
+        required = CAPABILITY_POINT_PROMPT if custom else CAPABILITY_AUTO_MATTE
+        if not self.supports(required):
+            if custom:
+                raise SegmentationError(
+                    "Custom video removal needs Torch and SAM 2. Use Python 3.11-3.13, "
+                    "run `./scripts/setup_ml_env.sh`, then restart the API and worker."
+                )
+            raise SegmentationError(
+                "Automatic background removal needs rembg and OpenCV. Use Python 3.11-3.13, "
+                "run `./scripts/setup_ml_env.sh`, then restart the API and worker."
             )
 
         return self._remove_background(source, clip_target, settings, output_dir, progress=progress)
@@ -184,9 +195,6 @@ class LocalSegmentationProvider:
 
         import cv2  # type: ignore
         import numpy as np  # type: ignore
-        # Imported lazily and only used on the automatic path, so a SAM 2-only
-        # deployment does not need rembg at all.
-        from rembg import new_session, remove  # type: ignore
 
         step(6)
 
@@ -202,27 +210,7 @@ class LocalSegmentationProvider:
         prompts = self._selection_prompts(settings)
         use_prompts = prompts is not None and bool(settings.get("customRemoval"))
 
-        if use_prompts:
-            from . import sam2_backend
-
-            if not sam2_backend.is_installed():
-                raise SegmentationError(
-                    "Point-based selection needs SAM 2, which is not installed on "
-                    "this server. Run `pip install torch sam2` in the API "
-                    "environment and restart the worker, or switch to Auto removal."
-                )
-            # Load the checkpoint now rather than lazily on the first frame.
-            # Same total time, but it stops several seconds of weight loading from
-            # being billed to "frame 1", where it looked like the first frame had
-            # hung. Progress can move across it instead.
-            step(8)
-            sam2_backend.warm_up(quality=quality)
-            step(10)
-            session = None
-        else:
-            step(8)
-            session = new_session(self.MODELS.get(quality, self.MODELS["faster"]))
-            step(10)
+        step(8)
 
         capture = cv2.VideoCapture(source)
         if not capture.isOpened():
@@ -260,6 +248,56 @@ class LocalSegmentationProvider:
 
         output = output_dir / "cutout.webm"
 
+        propagated = None
+        frame_directory = output_dir / "sam2-frames"
+        if use_prompts:
+            from . import video_backend
+
+            frame_directory.mkdir(parents=True, exist_ok=True)
+            tracking_scale = min(1.0, TRACKING_MAX_EDGE / max(width, height))
+            tracking_size = (
+                max(1, int(round(width * tracking_scale))),
+                max(1, int(round(height * tracking_scale))),
+            )
+            saved = 0
+            while True:
+                if total and saved >= total:
+                    break
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                tracking_frame = (
+                    cv2.resize(frame, tracking_size, interpolation=cv2.INTER_AREA)
+                    if tracking_scale < 1.0
+                    else frame
+                )
+                if not cv2.imwrite(
+                    str(frame_directory / f"{saved:06d}.jpg"),
+                    tracking_frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, 92],
+                ):
+                    capture.release()
+                    raise SegmentationError("Could not prepare frames for custom background removal.")
+                saved += 1
+                if progress and total:
+                    progress(min(13, 8 + int((saved / total) * 5)))
+            capture.release()
+            if saved == 0:
+                raise SegmentationError("No frames could be read from the clip's range.")
+            total = saved
+            anchor_seconds = float(settings.get("selectionAnchorSeconds") or start)
+            anchor_frame = round((anchor_seconds - start) * fps)
+            assert prompts is not None
+            propagated = video_backend.propagate_masks(
+                frame_directory,
+                anchor_frame=anchor_frame,
+                points=prompts[0],
+                labels=prompts[1],
+                quality=quality,
+                output_directory=output_dir / "sam2-masks",
+                progress=progress,
+            )
+
         # The matte is piped straight into ffmpeg as raw greyscale frames rather
         # than written to an intermediate video.
         #
@@ -284,7 +322,14 @@ class LocalSegmentationProvider:
             "-s", f"{width}x{height}",
             "-r", f"{fps:.6f}",
             "-i", "-",
-            "-filter_complex", "[0:v][1:v]alphamerge[out]",
+            "-filter_complex",
+            "[0:v][1:v]alphamerge"
+            + (
+                f",despill=type=green:mix={max(0.0, min(1.0, float(settings.get('spill') or 0.0))):.4f}"
+                if settings.get("chromaKey") and float(settings.get("spill") or 0.0) > 0
+                else ""
+            )
+            + "[out]",
             "-map", "[out]",
             # VP9/WebM is what a browser can actually play with transparency.
             # Note for anyone verifying this file: ffmpeg's *native* vp9 decoder
@@ -305,27 +350,31 @@ class LocalSegmentationProvider:
         ]
 
         process = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
         assert process.stdin is not None
 
+        def finish_encoder() -> bytes:
+            """Close the raw-video pipe without asking communicate() to flush it.
+
+            Python's `communicate()` flushes stdin when it starts; calling it
+            after we closed the pipe raises `ValueError: flush of closed file`
+            and turns a valid render into a failed job.
+            """
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            process.stdin = None
+            stderr = process.stderr.read() if process.stderr is not None else b""
+            process.wait()
+            return stderr
+
         def segment(frame):
             """Runs the chosen model on one frame and normalises the result."""
-            if use_prompts:
-                from . import sam2_backend
+            from .auto_backend import segment_auto
 
-                assert prompts is not None
-                points, labels = prompts
-                # SAM wants RGB; OpenCV hands back BGR.
-                cut = sam2_backend.segment_at_points(
-                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                    points,
-                    labels,
-                    quality=quality,
-                    box=None,
-                )
-            else:
-                cut = remove(frame, session=session, only_mask=True)
+            cut = segment_auto(frame, quality=quality)
 
             matte = np.ascontiguousarray(np.asarray(cut, dtype=np.uint8))
             if matte.ndim == 3:
@@ -336,17 +385,69 @@ class LocalSegmentationProvider:
                 matte = cv2.resize(matte, (width, height), interpolation=cv2.INTER_LINEAR)
             return matte
 
-        def emit(matte) -> None:
+        def emit(matte, frame=None) -> None:
             """Refines and writes one matte. Every frame leaves through here, so
             refinement cannot be applied inconsistently across the reuse path."""
             assert process.stdin is not None
-            process.stdin.write(refine_matte(matte, refine).tobytes())
+            result = refine_matte(matte, refine)
+            if settings.get("chromaKey"):
+                if frame is None:
+                    raise SegmentationError("A chroma-keyed matte is missing its source frame.")
+                result = combine_keep_mattes(result, chroma_keep_matte(frame, settings))
+            process.stdin.write(result.tobytes())
+
+        if propagated is not None:
+            from .auto_backend import fuse_identity_with_detail, is_installed as auto_installed, segment_auto
+
+            # Tracking frames are intentionally bounded to SAM's useful input
+            # resolution. Re-read the original source for final colour, chroma
+            # and BiRefNet detail rather than encoding the JPEG proxies.
+            source_capture = cv2.VideoCapture(source)
+            if not source_capture.isOpened():
+                raise SegmentationError("Could not reopen the source for the final cutout pass.")
+            if start > 0:
+                source_capture.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
+            try:
+                for index in range(propagated.frame_count):
+                    ok, frame = source_capture.read()
+                    matte = cv2.imread(str(propagated.path_for(index)), cv2.IMREAD_GRAYSCALE)
+                    if not ok or frame is None or matte is None:
+                        raise SegmentationError(f"Could not read propagated frame {index}.")
+                    if matte.shape != (height, width):
+                        matte = cv2.resize(
+                            matte,
+                            (width, height),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                    if quality == "better" and auto_installed():
+                        matte = fuse_identity_with_detail(
+                            matte,
+                            segment_auto(frame, quality="better"),
+                        )
+                    emit(matte, frame)
+                    if progress:
+                        progress(min(92, 78 + int(((index + 1) / propagated.frame_count) * 14)))
+            except BrokenPipeError:
+                pass
+            finally:
+                source_capture.release()
+                stderr = finish_encoder()
+            if process.returncode != 0:
+                raise SegmentationError(
+                    "Background removal failed while writing the cutout: "
+                    + (stderr.decode("utf-8", "replace").strip().splitlines() or ["unknown error"])[-1]
+                )
+            return SegmentationResult(path=output)
 
         # Motion-adaptive segmentation: the model is the entire cost (~100ms/frame
         # against 1.6ms to decode one), so frames that barely changed reuse an
         # interpolated matte instead. See matte_stride.py for what was measured,
         # including the two approaches that did not work.
-        decider = StrideDecider(max_stride=stride_for_quality(quality))
+        # A chroma matte depends on every colour frame, so it cannot use the
+        # matte-only interpolation shortcut without retaining those frames.
+        decider = StrideDecider(
+            max_stride=1 if settings.get("chromaKey") else stride_for_quality(quality)
+        )
 
         index = 0
         # Frames waiting for the *next* segmented matte to interpolate towards.
@@ -374,7 +475,7 @@ class LocalSegmentationProvider:
                         for _ in range(pending):
                             emit(matte)
                     pending = 0
-                    emit(matte)
+                    emit(matte, frame)
                     previous_matte = matte
                 else:
                     # Held back until the next real segmentation gives us
@@ -396,12 +497,7 @@ class LocalSegmentationProvider:
             pass
         finally:
             capture.release()
-            try:
-                process.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
-
-        _, stderr = process.communicate()
+            stderr = finish_encoder()
         if process.returncode != 0:
             raise SegmentationError(
                 "Background removal failed while writing the cutout: "

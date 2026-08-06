@@ -12,12 +12,11 @@ theoretical.
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import threading
 from typing import Any
 
-from .base import SegmentationError
+from .base import SegmentationError, module_available
 
 #: Checkpoint per quality tier. Tiny is genuinely interactive; large is for a
 #: final pass where edge quality matters more than latency.
@@ -35,7 +34,7 @@ def is_installed() -> bool:
     # find_spec rather than import: the capability handshake calls this on every
     # job, and importing torch to answer "no" would cost seconds per job — and,
     # worse, would poison the process for forking (see `_assert_fork_safe`).
-    return all(importlib.util.find_spec(name) is not None for name in ("torch", "sam2"))
+    return all(module_available(name) for name in ("torch", "sam2"))
 
 
 def _assert_fork_safe() -> None:

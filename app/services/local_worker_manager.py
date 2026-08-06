@@ -43,7 +43,16 @@ def start_local_worker(redis_url: str) -> subprocess.Popen[bytes] | None:
     env["PYTHONUNBUFFERED"] = "1"
     project_root = Path(__file__).resolve().parents[2]
     return subprocess.Popen(
-        [executable, "worker", "--verbose", "-u", redis_url, "default"],
+        [
+            executable,
+            "worker",
+            "--worker-class",
+            "rq.SimpleWorker",
+            "--verbose",
+            "-u",
+            redis_url,
+            "default",
+        ],
         cwd=project_root,
         env=env,
         start_new_session=True,

@@ -10,12 +10,13 @@ from typing import Any
 from app.db.database import SessionLocal
 from app.db.models import AiResult, Video
 from app.services.chroma_key import build_chroma_key_filter, chroma_key_from_attributes
+from app.services.color_adjust import build_adjust_filter_chain
 from app.services.segmentation import get_provider
 from app.utils.cloudinary import cloudinary_credentials_configured, upload_local_path_to_cloudinary
 
 
 FFMPEG_EFFECTS = {"speed", "audio", "adjust"}
-ML_EFFECTS = {"remove_bg", "retouch", "voice_changer", "ai_stylize", "video_enhance", "mask"}
+ML_EFFECTS = {"remove_bg", "voice_changer", "ai_stylize", "video_enhance", "mask"}
 
 
 def build_ffmpeg_effect_command(
@@ -55,11 +56,7 @@ def build_ffmpeg_effect_command(
         if fade_out > 0 and duration > 0:
             af.append(f"afade=t=out:st={max(0, duration - fade_out):.3f}:d={fade_out:.3f}")
     elif effect_type == "adjust":
-        exposure = _num(settings.get("exposure"), 0) / 200
-        contrast = max(0, 1 + _num(settings.get("contrast"), 0) / 100)
-        saturation = max(0, 1 + _num(settings.get("saturation"), 0) / 100)
-        brightness = exposure + _num(settings.get("brilliance"), 0) / 500
-        vf.append(f"eq=brightness={brightness:.4f}:contrast={contrast:.4f}:saturation={saturation:.4f}")
+        vf.extend(build_adjust_filter_chain(settings))
 
     if vf:
         cmd += ["-vf", ",".join(vf)]
@@ -118,7 +115,10 @@ def build_chroma_key_command(
         "-c:v", "libvpx-vp9",
         "-pix_fmt", "yuva420p",
         "-b:v", "0", "-crf", "30",
-        "-c:a", "copy",
+        # The processed layer is visual-only; the original media remains the
+        # playback/audio clock. Copying common AAC audio into WebM is invalid
+        # and made chroma-only removal fail at the final mux step.
+        "-an",
         out_path,
     ]
 
@@ -141,6 +141,26 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
 
         _update_row(db, row, status="processing", progress=8)
         source = _resolve_media_source(video.file_path)
+        run_target = dict(clip_target)
+        run_settings = dict(settings)
+
+        # Beauty is intentionally before background removal in the visual
+        # stack. If this clip has an approved completed retouch, use that
+        # clip-only file as the removal source and translate the source-time
+        # target/prompt to its zero-based timeline.
+        if effect_type == "remove_bg":
+            retouched = _completed_effect_source(db, row.video_id, clip_key, "retouch")
+            if retouched:
+                source = retouched
+                original_start = max(0.0, _num(clip_target.get("start"), 0))
+                original_end = _num(clip_target.get("end"), original_start)
+                run_target["start"] = 0.0
+                run_target["end"] = max(0.05, original_end - original_start)
+                if "selectionAnchorSeconds" in run_settings:
+                    run_settings["selectionAnchorSeconds"] = max(
+                        0.0,
+                        _num(run_settings.get("selectionAnchorSeconds"), original_start) - original_start,
+                    )
 
         # Chroma key needs no model — it is a pure ffmpeg filter. A removal that
         # only keys should therefore work on any server, with no provider
@@ -153,6 +173,23 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
             and not settings.get("customRemoval")
         )
 
+        if effect_type == "retouch":
+            from app.services.retouch import render_retouch_video
+
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / f"rough-cut-effect-{row.id}.mp4"
+                render_retouch_video(
+                    source,
+                    clip_target,
+                    settings,
+                    out,
+                    progress=lambda value: _update_row(db, row, status="processing", progress=value),
+                    cancel=lambda: _was_canceled(db, row),
+                )
+                output_url = _publish_output(out, row.video_id, row.id)
+            _complete(db, row, clip_key, effect_type, output_url)
+            return
+
         if effect_type in ML_EFFECTS and not chroma_only:
             # Providers produce a file or a URL; publishing stays here, because
             # this is what already knows Cloudinary, the uploads directory and
@@ -162,8 +199,8 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
                 result = provider.run_effect(
                     source,
                     effect_type,
-                    clip_target,
-                    settings,
+                    run_target,
+                    run_settings,
                     output_dir=Path(tmp),
                     progress=lambda value: _update_row(db, row, status="processing", progress=value),
                 )
@@ -184,7 +221,7 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
             suffix = "webm" if chroma_only else "mp4"
             out = Path(tmp) / f"rough-cut-effect-{row.id}.{suffix}"
             if chroma_only:
-                cmd = build_chroma_key_command(source, str(out), clip_target, settings)
+                cmd = build_chroma_key_command(source, str(out), run_target, run_settings)
             else:
                 cmd = build_ffmpeg_effect_command(
                     source,
@@ -205,6 +242,39 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
             raise
     finally:
         db.close()
+
+
+def _completed_effect_source(
+    db: Any,
+    video_id: int,
+    clip_key: str,
+    effect_type: str,
+) -> str | None:
+    """Resolve an earlier visual effect only from completed owned result rows."""
+    rows = (
+        db.query(AiResult)
+        .filter(
+            AiResult.video_id == video_id,
+            AiResult.result_type == "rough_cut_effect",
+        )
+        .all()
+    )
+    matches: list[Any] = []
+    for candidate in rows:
+        data = candidate.result_data if isinstance(candidate.result_data, dict) else {}
+        if (
+            data.get("effectType") == effect_type
+            and data.get("clipKey") == clip_key
+        ):
+            matches.append(candidate)
+    if not matches:
+        return None
+    latest = max(matches, key=lambda item: int(item.id))
+    data = latest.result_data if isinstance(latest.result_data, dict) else {}
+    url = data.get("outputUrl")
+    if latest.status != "completed" or not isinstance(url, str) or not url.strip():
+        return None
+    return _resolve_media_source(url.strip())
 
 
 # `_run_ml_provider` moved to app/services/segmentation/http.py, which speaks
@@ -285,6 +355,10 @@ def _attach_to_draft(db, video_id: int, clip_key: str, effect_type: str, process
     clip_attrs = dict(data.get("clipAttributes") or {})
     attrs = dict(clip_attrs.get(clip_key) or {})
     current_processing = dict(attrs.get("processing") or {})
+    if effect_type == "retouch":
+        # Remove BG consumes the retouched visual. Its old matte cannot remain
+        # authoritative after a new beauty pass finishes or fails.
+        current_processing.pop("remove_bg", None)
     current_processing[effect_type] = processing
     attrs["processing"] = current_processing
     clip_attrs[clip_key] = attrs
@@ -304,7 +378,12 @@ def _publish_output(path: Path, video_id: int, result_id: int) -> str:
         )
     uploads = Path(os.environ.get("UPLOADS_DIR", "./uploads")).resolve() / "rough_cut_effects" / str(video_id)
     uploads.mkdir(parents=True, exist_ok=True)
-    dest = uploads / f"effect_{result_id}.mp4"
+    # Keep the actual container extension. Background removal produces WebM
+    # because browser-playable alpha needs VP9; renaming those bytes to `.mp4`
+    # made StaticFiles send the wrong MIME type and many browsers refused to
+    # decode the otherwise valid result.
+    suffix = path.suffix.lower() if path.suffix.lower() in {".webm", ".mp4", ".mov"} else ".mp4"
+    dest = uploads / f"effect_{result_id}{suffix}"
     shutil.copyfile(path, dest)
     return f"/uploads/rough_cut_effects/{video_id}/{dest.name}"
 

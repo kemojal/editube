@@ -51,6 +51,8 @@ class LocalWorkerConfigurationTests(unittest.TestCase):
             [
                 "/venv/bin/rq",
                 "worker",
+                "--worker-class",
+                "rq.SimpleWorker",
                 "--verbose",
                 "-u",
                 "redis://localhost:6379/0",

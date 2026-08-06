@@ -8,6 +8,8 @@ environment change rather than a rewrite.
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -19,6 +21,22 @@ from typing import Any, Protocol, runtime_checkable
 CAPABILITY_AUTO_MATTE = "auto_matte"
 CAPABILITY_POINT_PROMPT = "point_prompt"
 CAPABILITY_PROPAGATE = "propagate"
+
+
+def module_available(name: str) -> bool:
+    """Checks optional ML dependencies without importing heavyweight modules.
+
+    `find_spec()` raises `ValueError` when a dependency has already been placed
+    in `sys.modules` by a shim with `__spec__ = None` (OpenCV can arrive this way
+    through another ML package). A capability endpoint must report availability,
+    never become a 500 merely because the module is already loaded.
+    """
+    if name in sys.modules:
+        return sys.modules[name] is not None
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (AttributeError, ImportError, ValueError):
+        return False
 
 
 class SegmentationError(RuntimeError):

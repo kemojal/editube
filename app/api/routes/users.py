@@ -40,9 +40,14 @@ from ...utils.security import (
 )
 from app.utils.cloudinary import upload_file_to_cloudinary
 from app.services.mfa_totp import (
+    TOTP_ISSUER,
+    build_otpauth_url,
+    clear_mfa_attempts,
     generate_recovery_codes,
     generate_totp_secret,
     hash_recovery_codes,
+    mfa_attempts_remaining,
+    record_failed_mfa_attempt,
     verify_recovery_code,
     verify_totp_code,
 )
@@ -87,6 +92,11 @@ ALLOWED_TIMEZONES = {
     "Asia/Singapore",
 }
 ALLOWED_DATE_FORMATS = {"MMM d, yyyy", "yyyy-MM-dd", "MM/dd/yyyy"}
+
+#: Lifetime of the token handed out between password and second factor. It is
+#: not a session, so it should not live as long as one — long enough to fetch a
+#: code from a phone, short enough that a leaked challenge token is worthless.
+MFA_CHALLENGE_TTL_MINUTES = 10
 
 
 def get_or_create_user_settings(db: Session, user_id: int) -> UserSettings:
@@ -388,25 +398,20 @@ def login_user(user_credentials: UserLoginSchema, db: Session = Depends(get_db))
     if not verify_password(user_credentials.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
-    mfa_method = (
-        db.query(UserMFAMethod)
-        .filter(
-            UserMFAMethod.user_id == user.id,
-            UserMFAMethod.disabled_at.is_(None),
-            UserMFAMethod.verified_at.isnot(None),
-        )
-        .first()
-    )
+    mfa_method = _mfa_method(db, user.id, verified_only=True)
     settings = get_or_create_user_settings(db, user.id)
-    if user.mfa_required or bool(getattr(settings, "two_factor", False)):
-        if not mfa_method:
-            raise HTTPException(status_code=400, detail="Two-factor is required but not configured")
+    # A verified authenticator gates sign-in on its own. The two flags are only
+    # consulted as a backstop, and a flag set without an enrolled method can no
+    # longer strand the account: there is nothing to prove, so let them in and
+    # let the Security panel put it right.
+    if mfa_method:
         challenge_token = create_access_token(
             data={
                 "user_id": user.id,
                 "onboarding_completed": user.onboarding_completed,
                 "mfa_pending": True,
-            }
+            },
+            expires_minutes=MFA_CHALLENGE_TTL_MINUTES,
         )
         log_security_audit_event(
             db,
@@ -418,6 +423,14 @@ def login_user(user_credentials: UserLoginSchema, db: Session = Depends(get_db))
         )
         db.commit()
         return {"mfa_required": True, "challenge_token": challenge_token}
+
+    # Flag set with nothing enrolled — the old code raised a 400 here, which
+    # locked the account out permanently with no way to reach the settings that
+    # would fix it. Clear the stale flag and let them in.
+    if user.mfa_required or bool(getattr(settings, "two_factor", False)):
+        user.mfa_required = False
+        settings.two_factor = False
+        db.commit()
 
     session_id = create_user_session(db, user.id)
     access_token = create_access_token(
@@ -436,31 +449,190 @@ def login_user(user_credentials: UserLoginSchema, db: Session = Depends(get_db))
     }
 
 
+RECOVERY_CODE_COUNT = 10
+
+
+def _mfa_method(db: Session, user_id: int, *, verified_only: bool = False) -> UserMFAMethod | None:
+    query = db.query(UserMFAMethod).filter(
+        UserMFAMethod.user_id == user_id,
+        UserMFAMethod.disabled_at.is_(None),
+    )
+    if verified_only:
+        query = query.filter(UserMFAMethod.verified_at.isnot(None))
+    return query.order_by(UserMFAMethod.id.desc()).first()
+
+
+def _unused_recovery_code_count(db: Session, user_id: int) -> int:
+    return (
+        db.query(UserMFARecoveryCode)
+        .filter(
+            UserMFARecoveryCode.user_id == user_id,
+            UserMFARecoveryCode.used_at.is_(None),
+        )
+        .count()
+    )
+
+
+def _issue_recovery_codes(db: Session, user_id: int) -> list[str]:
+    """Replace the user's recovery codes and return the new plaintext set.
+
+    The plaintext is returned exactly once — only hashes are stored, so a lost
+    set can be regenerated but never re-read.
+    """
+    raw_codes = generate_recovery_codes(RECOVERY_CODE_COUNT)
+    db.query(UserMFARecoveryCode).filter(UserMFARecoveryCode.user_id == user_id).delete(
+        synchronize_session=False
+    )
+    for hashed in hash_recovery_codes(raw_codes):
+        db.add(UserMFARecoveryCode(user_id=user_id, code_hash=hashed))
+    return raw_codes
+
+
+def _workspace_requires_mfa(db: Session, user_id: int) -> bool:
+    """True when a workspace the user belongs to mandates a second factor.
+
+    Such a user must not be able to turn their own authenticator off — they
+    would be locked out at the next sign-in with no way back in.
+    """
+    return (
+        db.query(WorkspaceAuthPolicy)
+        .join(
+            WorkspaceMember,
+            WorkspaceMember.workspace_id == WorkspaceAuthPolicy.workspace_id,
+        )
+        .filter(
+            WorkspaceMember.user_id == user_id,
+            WorkspaceAuthPolicy.mfa_required.is_(True),
+        )
+        .first()
+        is not None
+    )
+
+
+def _disable_mfa_rows(db: Session, user: User) -> None:
+    now = datetime.utcnow()
+    db.query(UserMFAMethod).filter(
+        UserMFAMethod.user_id == user.id,
+        UserMFAMethod.disabled_at.is_(None),
+    ).update({"disabled_at": now}, synchronize_session=False)
+    db.query(UserMFARecoveryCode).filter(UserMFARecoveryCode.user_id == user.id).delete(
+        synchronize_session=False
+    )
+    user.mfa_required = False
+    settings = get_or_create_user_settings(db, user.id)
+    settings.two_factor = False
+
+
+def _verify_second_factor(
+    db: Session,
+    user: User,
+    *,
+    code: str = "",
+    recovery_code: str = "",
+) -> bool:
+    """Check a TOTP code or a recovery code against the user's active method.
+
+    A matched recovery code is burned here — single use is the whole point of
+    the list.
+    """
+    method = _mfa_method(db, user.id, verified_only=True)
+    if not method:
+        return False
+    if code:
+        return verify_totp_code(method.secret_encrypted, code)
+    if recovery_code:
+        rows = (
+            db.query(UserMFARecoveryCode)
+            .filter(
+                UserMFARecoveryCode.user_id == user.id,
+                UserMFARecoveryCode.used_at.is_(None),
+            )
+            .all()
+        )
+        matched_hash = verify_recovery_code(recovery_code, [row.code_hash for row in rows])
+        if not matched_hash:
+            return False
+        for row in rows:
+            if row.code_hash == matched_hash:
+                row.used_at = datetime.utcnow()
+                break
+        return True
+    return False
+
+
+def _guard_mfa_attempts(db: Session, user_id: int, scope: str) -> None:
+    """Refuse further attempts once the per-user budget is spent."""
+    if mfa_attempts_remaining(f"{scope}:{user_id}") > 0:
+        return
+    log_security_audit_event(
+        db,
+        action="auth.mfa.rate_limited",
+        resource_type="user",
+        resource_id=str(user_id),
+        actor_user_id=user_id,
+        actor_type="user",
+        outcome="denied",
+        metadata={"scope": scope},
+    )
+    db.commit()
+    raise HTTPException(
+        status_code=429,
+        detail="Too many incorrect codes. Wait a few minutes and try again.",
+    )
+
+
+@router.get("/me/mfa")
+def get_mfa_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """What the Security panel renders: is a second factor active, and how many
+    recovery codes are left."""
+    method = _mfa_method(db, current_user.id)
+    verified = bool(method and method.verified_at)
+    return {
+        "enabled": verified,
+        "pending_setup": bool(method and not method.verified_at),
+        "method_type": method.method_type if method else None,
+        "label": method.label if method else None,
+        "verified_at": method.verified_at.isoformat() if method and method.verified_at else None,
+        "created_at": method.created_at.isoformat() if method and method.created_at else None,
+        "recovery_codes_remaining": _unused_recovery_code_count(db, current_user.id) if verified else 0,
+        "recovery_codes_total": RECOVERY_CODE_COUNT,
+        # The switch is rendered locked when a workspace policy mandates MFA.
+        "enforced_by_workspace": _workspace_requires_mfa(db, current_user.id),
+    }
+
+
 @router.post("/mfa/enroll")
 def enroll_mfa(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Start (or restart) authenticator setup and hand back the QR payload.
+
+    Refuses while a verified method is active. The previous version overwrote
+    the live secret on every call, so re-opening the setup dialog silently
+    invalidated the authenticator the user was already relying on. Recovery
+    codes are no longer minted here either — an abandoned setup used to wipe
+    the working codes of an already-enrolled account.
+    """
+    active = _mfa_method(db, current_user.id, verified_only=True)
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail="Two-factor authentication is already on. Turn it off before setting up a new authenticator.",
+        )
+
     secret = generate_totp_secret()
-    method = (
-        db.query(UserMFAMethod)
-        .filter(UserMFAMethod.user_id == current_user.id, UserMFAMethod.disabled_at.is_(None))
-        .first()
-    )
+    method = _mfa_method(db, current_user.id)
     if method:
         method.secret_encrypted = secret
         method.verified_at = None
     else:
         method = UserMFAMethod(user_id=current_user.id, method_type="totp", secret_encrypted=secret)
         db.add(method)
-    raw_codes = generate_recovery_codes(10)
-    db.query(UserMFARecoveryCode).filter(UserMFARecoveryCode.user_id == current_user.id).delete(synchronize_session=False)
-    for hashed in hash_recovery_codes(raw_codes):
-        db.add(UserMFARecoveryCode(user_id=current_user.id, code_hash=hashed))
-    otpauth_url = (
-        f"otpauth://totp/Editube:{current_user.email}"
-        f"?secret={secret}&issuer=Editube&algorithm=SHA1&digits=6&period=30"
-    )
+
     log_security_audit_event(
         db,
         action="auth.mfa.enroll_started",
@@ -470,7 +642,12 @@ def enroll_mfa(
         actor_type="user",
     )
     db.commit()
-    return {"secret": secret, "otpauth_url": otpauth_url, "backup_codes": raw_codes}
+    return {
+        "secret": secret,
+        "otpauth_url": build_otpauth_url(secret, current_user.email),
+        "account": current_user.email,
+        "issuer": TOTP_ISSUER,
+    }
 
 
 @router.post("/mfa/verify")
@@ -479,20 +656,41 @@ def verify_mfa_setup(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Confirm the authenticator is in sync, activate it, and issue recovery codes."""
     code = (body.get("code") or "").strip()
-    method = (
-        db.query(UserMFAMethod)
-        .filter(UserMFAMethod.user_id == current_user.id, UserMFAMethod.disabled_at.is_(None))
-        .first()
-    )
+    method = _mfa_method(db, current_user.id)
     if not method:
-        raise HTTPException(status_code=404, detail="No MFA method pending verification")
+        raise HTTPException(status_code=404, detail="Start setup before entering a code")
+    if method.verified_at:
+        raise HTTPException(status_code=409, detail="Two-factor authentication is already on")
+
+    _guard_mfa_attempts(db, current_user.id, "enroll")
     if not verify_totp_code(method.secret_encrypted, code):
-        raise HTTPException(status_code=400, detail="Invalid TOTP code")
-    method.verified_at = method.verified_at or datetime.utcnow()
+        remaining = record_failed_mfa_attempt(f"enroll:{current_user.id}")
+        log_security_audit_event(
+            db,
+            action="auth.mfa.enroll_code_rejected",
+            resource_type="user",
+            resource_id=str(current_user.id),
+            actor_user_id=current_user.id,
+            actor_type="user",
+            outcome="failure",
+            metadata={"attempts_remaining": remaining},
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail="That code didn't match. Check your authenticator and try the current code.",
+        )
+
+    clear_mfa_attempts(f"enroll:{current_user.id}")
+    method.verified_at = datetime.utcnow()
+    method.label = method.label or "Authenticator app"
     current_user.mfa_required = True
     settings = get_or_create_user_settings(db, current_user.id)
     settings.two_factor = True
+    backup_codes = _issue_recovery_codes(db, current_user.id)
+
     log_security_audit_event(
         db,
         action="auth.mfa.enabled",
@@ -502,11 +700,104 @@ def verify_mfa_setup(
         actor_type="user",
     )
     db.commit()
+    return {"ok": True, "backup_codes": backup_codes}
+
+
+@router.post("/mfa/disable")
+def disable_mfa(
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Turn off two-factor. Requires a current code — a hijacked session must
+    not be able to strip the second factor off the account."""
+    method = _mfa_method(db, current_user.id, verified_only=True)
+    if not method:
+        raise HTTPException(status_code=404, detail="Two-factor authentication is not on")
+    if _workspace_requires_mfa(db, current_user.id):
+        raise HTTPException(
+            status_code=409,
+            detail="A Drive you belong to requires two-factor authentication. Ask an owner to lift the policy first.",
+        )
+
+    _guard_mfa_attempts(db, current_user.id, "disable")
+    code = (body.get("code") or "").strip()
+    recovery_code = (body.get("recovery_code") or "").strip()
+    if not _verify_second_factor(db, current_user, code=code, recovery_code=recovery_code):
+        remaining = record_failed_mfa_attempt(f"disable:{current_user.id}")
+        log_security_audit_event(
+            db,
+            action="auth.mfa.disable_rejected",
+            resource_type="user",
+            resource_id=str(current_user.id),
+            actor_user_id=current_user.id,
+            actor_type="user",
+            outcome="failure",
+            metadata={"attempts_remaining": remaining},
+        )
+        db.commit()
+        raise HTTPException(status_code=400, detail="That code didn't match.")
+
+    clear_mfa_attempts(f"disable:{current_user.id}")
+    _disable_mfa_rows(db, current_user)
+    log_security_audit_event(
+        db,
+        action="auth.mfa.disabled",
+        resource_type="user",
+        resource_id=str(current_user.id),
+        actor_user_id=current_user.id,
+        actor_type="user",
+    )
+    db.commit()
     return {"ok": True}
+
+
+@router.post("/mfa/recovery-codes")
+def regenerate_recovery_codes(
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Issue a fresh set, invalidating the old one. Requires a current TOTP
+    code — recovery codes are a login credential, not a display value."""
+    method = _mfa_method(db, current_user.id, verified_only=True)
+    if not method:
+        raise HTTPException(status_code=404, detail="Two-factor authentication is not on")
+
+    _guard_mfa_attempts(db, current_user.id, "recovery")
+    code = (body.get("code") or "").strip()
+    if not verify_totp_code(method.secret_encrypted, code):
+        remaining = record_failed_mfa_attempt(f"recovery:{current_user.id}")
+        log_security_audit_event(
+            db,
+            action="auth.mfa.recovery_regenerate_rejected",
+            resource_type="user",
+            resource_id=str(current_user.id),
+            actor_user_id=current_user.id,
+            actor_type="user",
+            outcome="failure",
+            metadata={"attempts_remaining": remaining},
+        )
+        db.commit()
+        raise HTTPException(status_code=400, detail="That code didn't match.")
+
+    clear_mfa_attempts(f"recovery:{current_user.id}")
+    backup_codes = _issue_recovery_codes(db, current_user.id)
+    log_security_audit_event(
+        db,
+        action="auth.mfa.recovery_codes_regenerated",
+        resource_type="user",
+        resource_id=str(current_user.id),
+        actor_user_id=current_user.id,
+        actor_type="user",
+    )
+    db.commit()
+    return {"backup_codes": backup_codes}
 
 
 @router.post("/mfa/challenge")
 def complete_mfa_challenge(body: dict, db: Session = Depends(get_db)):
+    """Second leg of sign-in: exchange the challenge token plus a code for a session."""
     challenge_token = body.get("challenge_token")
     if not challenge_token:
         raise HTTPException(status_code=400, detail="Missing challenge token")
@@ -514,45 +805,31 @@ def complete_mfa_challenge(body: dict, db: Session = Depends(get_db)):
     if not payload.get("mfa_pending"):
         raise HTTPException(status_code=400, detail="Invalid MFA challenge token")
     user_id = int(payload.get("user_id"))
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).filter(User.id == user_id, User.deleted_at.is_(None)).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    method = (
-        db.query(UserMFAMethod)
-        .filter(
-            UserMFAMethod.user_id == user.id,
-            UserMFAMethod.disabled_at.is_(None),
-            UserMFAMethod.verified_at.isnot(None),
-        )
-        .first()
-    )
-    if not method:
+    if not _mfa_method(db, user.id, verified_only=True):
         raise HTTPException(status_code=400, detail="No verified MFA method")
+
+    _guard_mfa_attempts(db, user.id, "challenge")
     code = (body.get("code") or "").strip()
     recovery_code = (body.get("recovery_code") or "").strip()
-    verified = False
-    if code:
-        verified = verify_totp_code(method.secret_encrypted, code)
-    elif recovery_code:
-        hashed_codes = [
-            row.code_hash
-            for row in db.query(UserMFARecoveryCode)
-            .filter(UserMFARecoveryCode.user_id == user.id, UserMFARecoveryCode.used_at.is_(None))
-            .all()
-        ]
-        matched_hash = verify_recovery_code(recovery_code, hashed_codes)
-        if matched_hash:
-            row = (
-                db.query(UserMFARecoveryCode)
-                .filter(UserMFARecoveryCode.user_id == user.id, UserMFARecoveryCode.code_hash == matched_hash)
-                .first()
-            )
-            if row:
-                row.used_at = datetime.utcnow()
-            verified = True
-    if not verified:
+    if not _verify_second_factor(db, user, code=code, recovery_code=recovery_code):
+        remaining = record_failed_mfa_attempt(f"challenge:{user.id}")
+        log_security_audit_event(
+            db,
+            action="auth.mfa.challenge_failed",
+            resource_type="user",
+            resource_id=str(user.id),
+            actor_user_id=user.id,
+            actor_type="user",
+            outcome="failure",
+            metadata={"attempts_remaining": remaining},
+        )
+        db.commit()
         raise HTTPException(status_code=401, detail="Invalid MFA code")
 
+    clear_mfa_attempts(f"challenge:{user.id}")
     session_id = create_user_session(db, user.id)
     access_token = create_access_token(
         data={"user_id": user.id, "onboarding_completed": user.onboarding_completed, "sid": session_id}
@@ -572,6 +849,8 @@ def complete_mfa_challenge(body: dict, db: Session = Depends(get_db)):
         "token_type": "bearer",
         "refresh_token": refresh_token,
         "onboarding_completed": user.onboarding_completed,
+        # Surfaced as a warning banner once the list runs low.
+        "recovery_codes_remaining": _unused_recovery_code_count(db, user.id),
     }
 
 
@@ -694,6 +973,13 @@ def update_current_user_settings(
         "weekly",
     }:
         raise HTTPException(status_code=400, detail="Invalid mention digest setting")
+
+    # `two_factor` mirrors whether an authenticator is enrolled; it is not an
+    # independent preference. Writing it here used to be enough to require a
+    # second factor the account had no way to produce, locking the user out at
+    # the next sign-in. Enrollment owns this flag — see /mfa/verify and
+    # /mfa/disable.
+    update_data.pop("two_factor", None)
 
     for key, value in update_data.items():
         setattr(settings, key, value)
@@ -1021,6 +1307,37 @@ def sso_callback(
         db.add(WorkspaceMember(workspace_id=provider.workspace_id, user_id=user.id, role="editor"))
     elif (user.auth_provider or "local") == "local":
         user.auth_provider = "sso"
+
+    # An enrolled authenticator applies here too — the identity provider proves
+    # who they are, not that they hold the second factor this account requires.
+    if _mfa_method(db, user.id, verified_only=True):
+        challenge_token = create_access_token(
+            data={
+                "user_id": user.id,
+                "onboarding_completed": user.onboarding_completed,
+                "mfa_pending": True,
+            },
+            expires_minutes=MFA_CHALLENGE_TTL_MINUTES,
+        )
+        log_security_audit_event(
+            db,
+            action="auth.sso.callback_mfa_required",
+            resource_type="workspace_sso_provider",
+            resource_id=str(provider.id),
+            actor_user_id=user.id,
+            actor_type="user",
+            workspace_id=provider.workspace_id,
+            metadata={"email": email},
+        )
+        db.commit()
+        return RedirectResponse(
+            url=(
+                f"{frontend_base}/google/callback?mfa_challenge={url_quote(challenge_token, safe='')}"
+                f"&next={url_quote(return_path, safe='')}"
+            ),
+            status_code=302,
+        )
+
     session_id = create_user_session(db, user.id)
     app_access_token = create_access_token(
         data={"user_id": user.id, "onboarding_completed": user.onboarding_completed, "sid": session_id}
@@ -1116,6 +1433,29 @@ def sso_google_mobile(payload: GoogleMobileTokenRequest, db: Session = Depends(g
         created_new = True
     elif (user.auth_provider or "local") == "local":
         user.auth_provider = "sso"
+
+    # Same shape the password login returns, so the mobile client can reuse its
+    # existing challenge screen rather than skipping the second factor.
+    if _mfa_method(db, user.id, verified_only=True):
+        challenge_token = create_access_token(
+            data={
+                "user_id": user.id,
+                "onboarding_completed": user.onboarding_completed,
+                "mfa_pending": True,
+            },
+            expires_minutes=MFA_CHALLENGE_TTL_MINUTES,
+        )
+        log_security_audit_event(
+            db,
+            action="auth.sso.google_mobile_mfa_required",
+            resource_type="user",
+            resource_id=str(user.id),
+            actor_user_id=user.id,
+            actor_type="user",
+            metadata={"email": email},
+        )
+        db.commit()
+        return {"mfa_required": True, "challenge_token": challenge_token}
 
     session_id = create_user_session(db, user.id)
     access_token = create_access_token(

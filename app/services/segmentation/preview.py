@@ -125,20 +125,51 @@ def preview_mask_png(
 
     if not sam2_backend.is_installed():
         raise SegmentationError(
-            "Click-to-select needs SAM 2, which is not installed on this server. "
-            "Run `pip install torch sam2` in the API environment and restart it."
+            "Click-to-select needs SAM 2. Use Python 3.11-3.13, run "
+            "`./scripts/setup_ml_env.sh`, then restart the API and worker."
         )
 
     frame = extract_frame(source, at_seconds)
     mask = sam2_backend.segment_at_points(frame, points, labels, quality=quality)
 
-    # The same refinement the export applies, from the same settings, through the
-    # same function. Invert, grow/shrink and feather are exactly the controls a
-    # user tunes by eye, so showing an unrefined preview beside a refined render
-    # would be the WYSIWYG bug this codebase already fixed once for chroma key.
+    return _encode_preview(frame, mask, settings)
+
+
+def preview_auto_mask_png(
+    source: str,
+    at_seconds: float,
+    *,
+    quality: str = "faster",
+    settings: dict[str, Any] | None = None,
+) -> tuple[bytes, int, int]:
+    """Automatic one-frame preview using the same model as the queued render."""
+    import cv2  # type: ignore
+
+    from .auto_backend import segment_auto
+
+    frame_rgb = extract_frame(source, at_seconds)
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    mask = segment_auto(frame_bgr, quality=quality)
+    return _encode_preview(frame_rgb, mask, settings)
+
+
+def _encode_preview(
+    frame_rgb: Any,
+    mask: Any,
+    settings: dict[str, Any] | None,
+) -> tuple[bytes, int, int]:
+    """Applies shared refinement/keying and encodes a greyscale PNG."""
+    import cv2  # type: ignore
+
+    # The same refinement the export applies, from the same settings, through
+    # the same function. This is the WYSIWYG boundary for mask tuning.
     from .matte_ops import matte_settings_from_attributes, refine_matte
+    from .chroma_matte import chroma_keep_matte, combine_keep_mattes
 
     mask = refine_matte(mask, matte_settings_from_attributes(settings))
+    if (settings or {}).get("chromaKey"):
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        mask = combine_keep_mattes(mask, chroma_keep_matte(frame_bgr, settings or {}))
 
     ok, buffer = cv2.imencode(".png", mask)
     if not ok:

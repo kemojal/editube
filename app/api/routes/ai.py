@@ -622,12 +622,203 @@ class SegmentPreviewBody(BaseModel):
     """One-frame preview request. `selection` is the editor's stored shape."""
 
     at_seconds: float = 0.0
+    mode: str = "custom"
     selection: dict[str, Any] = Field(default_factory=dict)
     quality: str = "faster"
     #: The clip's `removeBg` attributes, so the preview applies the same invert /
     #: grow / feather / strength the export will. Sent whole rather than as named
     #: fields so adding a control does not require changing this contract.
     refine: dict[str, Any] = Field(default_factory=dict)
+
+
+class RetouchPreviewBody(BaseModel):
+    at_seconds: float = 0.0
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class VisualPreviewBody(BaseModel):
+    """Exact paused-frame preview for the visual inspector stack."""
+
+    at_seconds: float = 0.0
+    clip_start: float = 0.0
+    retouch_settings: dict[str, Any] = Field(default_factory=dict)
+    adjust_settings: dict[str, Any] = Field(default_factory=dict)
+    # Opening Retouch requests analysis even before a slider is non-zero. This
+    # lets the UI gate controls and draw targets instead of asking users to
+    # make a blind adjustment first.
+    analyze_retouch: bool = False
+    # A completed Retouch row is a clip-local source beginning at t=0. Remove
+    # BG is deliberately excluded because decoding to BGR would destroy alpha.
+    processed_result_id: int | None = None
+
+
+class RetouchTargetBox(BaseModel):
+    x: float
+    y: float
+    width: float
+    height: float
+
+
+class RetouchPoint(BaseModel):
+    x: float
+    y: float
+
+
+class RetouchPartsResponse(BaseModel):
+    eyes: bool = False
+    nose: bool = False
+    mouth: bool = False
+
+
+class RetouchLandmarksResponse(BaseModel):
+    eyes: list[RetouchPoint] = Field(default_factory=list)
+    nose: RetouchPoint
+    mouth: RetouchPoint
+
+
+class RetouchDetectionResponse(BaseModel):
+    id: str
+    kind: str
+    box: RetouchTargetBox
+    parts: RetouchPartsResponse
+    landmarks: RetouchLandmarksResponse
+
+
+class RetouchCapabilitiesResponse(BaseModel):
+    face: bool = False
+    skin: bool = False
+    eyes: bool = False
+    nose: bool = False
+    mouth: bool = False
+    multipleFaces: bool = False
+
+
+class RetouchAnalysisResponse(BaseModel):
+    width: int
+    height: int
+    detections: list[RetouchDetectionResponse] = Field(default_factory=list)
+    capabilities: RetouchCapabilitiesResponse
+
+
+class VisualPreviewResponse(BaseModel):
+    width: int
+    height: int
+    image_png: str
+    face_count: int | None = None
+    retouch_analysis: RetouchAnalysisResponse | None = None
+
+
+@router.post("/{video_id}/ai/retouch-preview")
+def retouch_preview(
+    video_id: int,
+    body: RetouchPreviewBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Render one exact beauty frame for responsive paused-frame tuning."""
+    video = _check_video_access(video_id, db, current_user)
+    from app.jobs.rough_cut_effect import _resolve_media_source
+    from app.services.retouch import encode_preview_png
+    from app.services.segmentation.preview import extract_frame
+
+    try:
+        import base64
+        import cv2  # type: ignore
+
+        frame_rgb = extract_frame(
+            _resolve_media_source(video.file_path),
+            max(0.0, float(body.at_seconds or 0.0)),
+        )
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        png, width, height, face_count = encode_preview_png(frame_bgr, body.settings)
+        return {
+            "width": width,
+            "height": height,
+            "image_png": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+            "face_count": face_count,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/{video_id}/ai/visual-preview", response_model=VisualPreviewResponse)
+def visual_preview(
+    video_id: int,
+    body: VisualPreviewBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Render Retouch then Adjust with the same engines as the final export."""
+    video = _check_video_access(video_id, db, current_user)
+    from app.jobs.rough_cut_effect import _resolve_media_source
+    from app.services.color_adjust import apply_adjust_frame
+    from app.services.retouch.beauty import (
+        BeautyState,
+        analyze_faces,
+        beautify_frame,
+        serialize_face_analysis,
+    )
+    from app.services.retouch.settings import has_retouch_adjustments
+    from app.services.segmentation.preview import extract_frame
+
+    source = _resolve_media_source(video.file_path)
+    at_seconds = max(0.0, float(body.at_seconds or 0.0))
+    if body.processed_result_id is not None:
+        row = (
+            db.query(AiResult)
+            .filter(
+                AiResult.id == body.processed_result_id,
+                AiResult.video_id == video_id,
+                AiResult.result_type == "rough_cut_effect",
+                AiResult.status == "completed",
+            )
+            .first()
+        )
+        data = row.result_data if row is not None and isinstance(row.result_data, dict) else {}
+        url = data.get("outputUrl")
+        if data.get("effectType") != "retouch" or not isinstance(url, str) or not url.strip():
+            raise HTTPException(status_code=422, detail="The processed Retouch preview is no longer available.")
+        source = _resolve_media_source(url.strip())
+        at_seconds = max(0.0, at_seconds - max(0.0, float(body.clip_start or 0.0)))
+
+    try:
+        import base64
+        import cv2  # type: ignore
+
+        frame_rgb = extract_frame(source, at_seconds)
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        analysis: dict[str, Any] | None = None
+        should_retouch = (
+            body.processed_result_id is None
+            and has_retouch_adjustments(body.retouch_settings)
+        )
+        if body.analyze_retouch or should_retouch:
+            state = BeautyState()
+            detections = analyze_faces(frame_bgr, state, target="all")
+            analysis = serialize_face_analysis(frame_bgr, detections)
+            if should_retouch:
+                frame_bgr = beautify_frame(
+                    frame_bgr,
+                    body.retouch_settings,
+                    state,
+                    detections=detections,
+                )
+        frame_bgr = apply_adjust_frame(frame_bgr, body.adjust_settings)
+        ok, encoded = cv2.imencode(".png", frame_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 4])
+        if not ok:
+            raise RuntimeError("Could not encode the exact visual preview.")
+        height, width = frame_bgr.shape[:2]
+        return {
+            "width": width,
+            "height": height,
+            "image_png": "data:image/png;base64," + base64.b64encode(encoded.tobytes()).decode("ascii"),
+            "face_count": len(analysis["detections"]) if analysis is not None else None,
+            "retouch_analysis": analysis,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/{video_id}/ai/segment-preview")
@@ -652,26 +843,37 @@ def segment_preview(
     from app.jobs.rough_cut_effect import _resolve_media_source
     from app.services.segmentation.base import SegmentationError
     from app.services.segmentation.local import LocalSegmentationProvider
-    from app.services.segmentation.preview import preview_mask_png
-
-    prompts = LocalSegmentationProvider._selection_prompts({"selection": body.selection})
-    if prompts is None:
-        raise HTTPException(status_code=400, detail="Click the subject to select it first.")
-    points, labels = prompts
+    from app.services.segmentation.preview import preview_auto_mask_png, preview_mask_png
 
     quality = "better" if str(body.quality).strip().lower() == "better" else "faster"
+    mode = "auto" if str(body.mode).strip().lower() == "auto" else "custom"
 
     try:
-        png, width, height = preview_mask_png(
-            _resolve_media_source(video.file_path),
-            float(body.at_seconds or 0.0),
-            points,
-            labels,
-            quality=quality,
-            # Invert / grow / feather come from the same stored attributes the
-            # export reads, so the preview shows the refined matte, not a raw one.
-            settings=body.refine,
-        )
+        source = _resolve_media_source(video.file_path)
+        if mode == "auto":
+            png, width, height = preview_auto_mask_png(
+                source,
+                float(body.at_seconds or 0.0),
+                quality=quality,
+                settings=body.refine,
+            )
+            point_count = 0
+        else:
+            prompts = LocalSegmentationProvider._selection_prompts({"selection": body.selection})
+            if prompts is None:
+                raise HTTPException(status_code=400, detail="Click the subject to select it first.")
+            points, labels = prompts
+            png, width, height = preview_mask_png(
+                source,
+                float(body.at_seconds or 0.0),
+                points,
+                labels,
+                quality=quality,
+                # Invert / grow / feather come from the same stored attributes the
+                # export reads, so the preview shows the refined matte, not a raw one.
+                settings=body.refine,
+            )
+            point_count = len(points)
     except SegmentationError as exc:
         # 422, not 500: these are all "the request cannot be satisfied as asked"
         # — model missing, unreadable frame, nothing selected — and the editor
@@ -684,7 +886,34 @@ def segment_preview(
         "width": width,
         "height": height,
         "mask_png": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
-        "point_count": len(points),
+        "point_count": point_count,
+    }
+
+
+@router.get("/{video_id}/ai/segmentation-capabilities")
+def segmentation_capabilities(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Reports what this deployment can actually offer before a user clicks it."""
+    _check_video_access(video_id, db, current_user)
+    from app.services.segmentation import get_provider
+    from app.services.segmentation.base import (
+        CAPABILITY_AUTO_MATTE,
+        CAPABILITY_POINT_PROMPT,
+        CAPABILITY_PROPAGATE,
+    )
+
+    provider = get_provider()
+    ready, reason = provider.is_available()
+    return {
+        "provider": provider.name,
+        "ready": ready,
+        "reason": reason or None,
+        "auto": provider.supports(CAPABILITY_AUTO_MATTE),
+        "custom": provider.supports(CAPABILITY_POINT_PROMPT),
+        "propagate": provider.supports(CAPABILITY_PROPAGATE),
     }
 
 
@@ -1104,6 +1333,12 @@ class RoughCutExportBody(BaseModel):
     # Source-clip masks (Task 13). Sanitized server-side in
     # app.services.mask_matte before ever reaching Pillow/ffmpeg.
     masks: list[dict[str, Any]] = Field(default_factory=list)
+    # Completed Remove BG / Retouch visual renders keyed to their source range.
+    # The job verifies every URL against this video's effect rows before use.
+    processedRanges: list[dict[str, Any]] = Field(default_factory=list)
+    # Non-destructive per-source-range color settings. The worker validates and
+    # translates these into a deterministic ffmpeg filter chain.
+    colorRanges: list[dict[str, Any]] = Field(default_factory=list)
     # When true, the rendered output registers as the NEXT VERSION of this
     # video (same version_group_id, version = max+1) once the export
     # completes. Back-compat default off — existing callers keep getting
@@ -1129,6 +1364,8 @@ def start_rough_cut_export(
         "keepRanges": body.keepRanges,
         "exportSettings": body.exportSettings,
         "masks": body.masks,
+        "processedRanges": body.processedRanges,
+        "colorRanges": body.colorRanges,
         "progress": 0,
     }
 
