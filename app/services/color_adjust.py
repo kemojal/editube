@@ -99,14 +99,21 @@ def build_adjust_filter_chain(settings: dict[str, Any] | None) -> list[str]:
     filters: list[str] = []
     temperature = _clamp(settings.get("temp"), -100, 100)
     if abs(temperature) > 0.001:
-        kelvin = max(2500.0, min(11000.0, 6500.0 + temperature * 45.0))
+        # `colortemperature` simulates the ambient light, so a *low* Kelvin
+        # produces a warm frame. Editors label the slider by the result, so a
+        # positive value has to walk the temperature down, not up.
+        kelvin = max(2500.0, min(11000.0, 6500.0 - temperature * 40.0))
         filters.append(f"colortemperature=temperature={kelvin:.1f}:mix={min(1.0, abs(temperature) / 70):.4f}:pl=0.65")
 
     tint = _clamp(settings.get("tint"), -100, 100) / 100
     wheels = settings.get("wheels") if isinstance(settings.get("wheels"), dict) else {}
-    shadow_rgb = _wheel_vector(wheels.get("shadows"))
-    mid_rgb = _wheel_vector(wheels.get("midtones"))
-    high_rgb = _wheel_vector(wheels.get("highlights"))
+    offset_wheel = wheels.get("offset") if isinstance(wheels.get("offset"), dict) else {}
+    # Offset moves the whole signal, so it lands on all three colorbalance
+    # ranges at once rather than getting a filter of its own.
+    offset_rgb = _wheel_vector(offset_wheel)
+    shadow_rgb = tuple(a + b for a, b in zip(_wheel_vector(wheels.get("shadows")), offset_rgb))
+    mid_rgb = tuple(a + b for a, b in zip(_wheel_vector(wheels.get("midtones")), offset_rgb))
+    high_rgb = tuple(a + b for a, b in zip(_wheel_vector(wheels.get("highlights")), offset_rgb))
     mid_rgb = (mid_rgb[0] + tint * 0.11, mid_rgb[1] - tint * 0.16, mid_rgb[2] + tint * 0.11)
     if any(abs(value) > 0.0001 for value in (*shadow_rgb, *mid_rgb, *high_rgb)):
         values = (*shadow_rgb, *mid_rgb, *high_rgb)
@@ -120,7 +127,10 @@ def build_adjust_filter_chain(settings: dict[str, Any] | None) -> list[str]:
         )
 
     exposure = _clamp(settings.get("exposure"), -100, 100) * 0.022
-    black = max(-0.25, min(0.25, -_clamp(settings.get("blacks"), -100, 100) / 550))
+    # A negative black level lifts the signal, which is what a positive offset
+    # luminance asks for.
+    offset_luma = _clamp(offset_wheel.get("luminance"), -100, 100) / 100
+    black = max(-0.25, min(0.25, -_clamp(settings.get("blacks"), -100, 100) / 550 - offset_luma * 0.12))
     if abs(exposure) > 0.0001 or abs(black) > 0.0001:
         filters.append(f"exposure=exposure={exposure:.4f}:black={black:.4f}")
 
@@ -176,6 +186,11 @@ def build_adjust_filter_chain(settings: dict[str, Any] | None) -> list[str]:
             "curves=master='"
             f"0.0000/{lift:.4f} 0.5000/{0.5 + lift * 0.18:.4f} 1.0000/{1.0 - lift * 0.45:.4f}'"
         )
+    # Clarity and sharpen are the same operator at two scales: a wide mask
+    # lifts local contrast across a face, a tight one cuts edges.
+    clarity = _clamp(settings.get("clarity"), 0, 100) / 100
+    if clarity > 0:
+        filters.append(f"unsharp=13:13:{clarity * 0.9:.4f}:13:13:0")
     sharpen = _clamp(settings.get("sharpen"), 0, 100) / 100
     if sharpen > 0:
         filters.append(f"unsharp=5:5:{sharpen * 1.35:.4f}:5:5:0")

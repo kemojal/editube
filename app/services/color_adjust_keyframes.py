@@ -16,7 +16,7 @@ _FILTER_BUDGET = 80_000
 _SETTING_KEYS = {
     "enabled", "preset", "temp", "tint", "saturation", "vibrance",
     "exposure", "contrast", "highlight", "shadow", "whites", "blacks",
-    "brilliance", "fade", "sharpen", "vignette", "grain", "hsl",
+    "brilliance", "fade", "clarity", "sharpen", "vignette", "grain", "hsl",
     "curves", "wheels",
 }
 

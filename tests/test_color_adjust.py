@@ -38,6 +38,24 @@ class ColorAdjustTests(unittest.TestCase):
         for expected in ("colortemperature=", "colorbalance=", "exposure=", "eq=", "vibrance=", "huesaturation=", "curves=", "unsharp=", "vignette=", "noise="):
             self.assertIn(expected, rendered)
 
+    def test_offset_wheel_pushes_every_range_and_lifts_the_black_point(self):
+        rendered = build_adjust_filter({"wheels": {"offset": {"hue": 0, "saturation": 40, "luminance": 30}}})
+        balance = dict(
+            pair.split("=") for pair in rendered.split("colorbalance=")[1].split(",")[0].split(":")
+        )
+        # Hue 0 is a red push, and an offset applies it to shadows, midtones,
+        # and highlights alike.
+        for shade in ("s", "m", "h"):
+            self.assertGreater(float(balance[f"r{shade}"]), 0)
+            self.assertLess(float(balance[f"g{shade}"]), 0)
+        self.assertIn("black=-0.0360", rendered)
+
+    def test_clarity_and_sharpen_are_separate_scales(self):
+        rendered = build_adjust_filter({"clarity": 50, "sharpen": 50})
+        self.assertIn("unsharp=13:13:0.4500:13:13:0", rendered)
+        self.assertIn("unsharp=5:5:0.6750:5:5:0", rendered)
+        self.assertEqual(build_adjust_filter({"clarity": 0}), "")
+
     def test_nonfinite_and_out_of_range_values_are_safe(self):
         rendered = build_adjust_filter({"exposure": math.inf, "contrast": -99999, "grain": 99999})
         self.assertNotIn("inf", rendered.lower())
@@ -64,6 +82,20 @@ class ColorAdjustTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required")
+    def test_positive_temperature_renders_warmer(self):
+        """`colortemperature` warms as Kelvin falls, so the slider has to invert it."""
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("numpy is required")
+        frame = np.full((16, 16, 3), 128, dtype=np.uint8)
+        warm = apply_adjust_frame(frame, {"temp": 60})
+        cool = apply_adjust_frame(frame, {"temp": -60})
+        # Frames are BGR: channel 2 is red, channel 0 is blue.
+        self.assertGreater(float(warm[..., 2].mean()), float(warm[..., 0].mean()))
+        self.assertLess(float(cool[..., 2].mean()), float(cool[..., 0].mean()))
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required")
     def test_exact_frame_preview_uses_the_export_filter_chain(self):
