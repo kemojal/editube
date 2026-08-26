@@ -80,6 +80,25 @@ class PointPromptTests(unittest.TestCase):
         self.assertGreater(left, 0.9)
         self.assertGreater(right, 0.9)
 
+    def test_additive_groups_preserve_the_existing_subject(self):
+        mask = sam2_backend.segment_prompt_groups(
+            two_subjects(),
+            [[(0.22, 0.5)], [(0.78, 0.5)]],
+        )
+        left, right = coverage(mask)
+        self.assertGreater(left, 0.9)
+        self.assertGreater(right, 0.9)
+
+    def test_negative_context_is_applied_to_every_additive_group(self):
+        mask = sam2_backend.segment_prompt_groups(
+            two_subjects(),
+            [[(0.22, 0.5)]],
+            [(0.78, 0.5)],
+        )
+        left, right = coverage(mask)
+        self.assertGreater(left, 0.9)
+        self.assertLess(right, 0.1)
+
     def test_a_negative_click_subtracts(self):
         mask = sam2_backend.segment_at_points(
             two_subjects(), [(0.22, 0.5), (0.78, 0.5)], [1, 0]

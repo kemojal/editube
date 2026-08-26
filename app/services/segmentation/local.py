@@ -28,6 +28,7 @@ from .base import (
 from .matte_ops import matte_settings_from_attributes, refine_matte
 from .matte_stride import StrideDecider, blend_mattes, motion_probe, stride_for_quality
 from .chroma_matte import chroma_keep_matte, combine_keep_mattes
+from .selection_prompts import SelectionPrompts, selection_prompts
 
 #: Frame-by-frame matting is slow on CPU; refuse very long clips rather than
 #: appearing to hang for an hour with no way to tell whether it is progressing.
@@ -36,6 +37,129 @@ TRACKING_MAX_EDGE = max(
     256,
     min(2048, int(os.environ.get("SEGMENTATION_TRACK_MAX_EDGE", "1024") or "1024")),
 )
+
+
+class _RawFrameReader:
+    """Sequential BGR frames from ffmpeg, one clip range at a time.
+
+    A pipe, not random access: this pass walks the clip forward exactly once, so
+    a decoder that can only go forward is all it needs — and it avoids OpenCV's
+    per-frame stream handling on a remote source.
+    """
+
+    def __init__(self, source: str, start: float, clip_seconds: float, width: int, height: int):
+        self._size = width * height * 3
+        self._shape = (height, width, 3)
+        self._process = subprocess.Popen(
+            [
+                "ffmpeg", "-nostdin",
+                *(["-ss", f"{start:.3f}"] if start > 0 else []),
+                "-i", source,
+                *(["-t", f"{clip_seconds:.3f}"] if clip_seconds > 0 else []),
+                "-f", "rawvideo", "-pix_fmt", "bgr24",
+                "-loglevel", "error",
+                "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def read(self):
+        """The next frame, or `None` once the stream ends."""
+        import numpy as np  # type: ignore
+
+        stream = self._process.stdout
+        if stream is None:
+            return None
+        # `read(n)` on a pipe returns what is available, not what was asked for,
+        # so a short read is normal mid-stream and must not be read as EOF —
+        # doing that would truncate the render at an arbitrary frame.
+        buffer = bytearray()
+        while len(buffer) < self._size:
+            chunk = stream.read(self._size - len(buffer))
+            if not chunk:
+                return None
+            buffer.extend(chunk)
+        # Copied out of the buffer it was read into: the next frame reuses that
+        # buffer, and the matting backends hold on to what they are given.
+        return np.frombuffer(bytes(buffer), dtype=np.uint8).reshape(self._shape).copy()
+
+    def close(self) -> None:
+        if self._process.stdout is not None:
+            try:
+                self._process.stdout.close()
+            except OSError:
+                pass
+        if self._process.poll() is None:
+            self._process.terminate()
+        self._process.wait()
+
+
+def _extract_tracking_frames(
+    source: str,
+    frame_directory: Path,
+    *,
+    start: float,
+    clip_seconds: float,
+    size: tuple[int, int] | None,
+    expected: int,
+    progress: Any = None,
+) -> int:
+    """Writes the clip's range as numbered JPEGs and returns how many there are.
+
+    One ffmpeg pass, replacing a per-frame `VideoCapture.read()` + `imwrite()`
+    loop. The loop was not slow because of JPEG encoding — it was slow because
+    `source` is usually a URL, and OpenCV re-reads and re-seeks that stream frame
+    by frame. On an object-store origin that turns "prepare 300 frames" into
+    minutes of network, which is exactly where the progress bar was seen sitting
+    at 10%. ffmpeg opens the source once, seeks once, and decodes forward.
+
+    `-ss` before `-i` so the seek is a seek rather than a decode of everything
+    before the clip; ffmpeg's input seek is accurate by default, so frame 0 here
+    is the frame at `start` — the same one the colour pass and the alphamerge
+    below start from. Getting that wrong offsets the matte from the picture.
+    """
+    command = [
+        "ffmpeg", "-nostdin", "-y",
+        *(["-ss", f"{start:.3f}"] if start > 0 else []),
+        "-i", source,
+        *(["-t", f"{clip_seconds:.3f}"] if clip_seconds > 0 else []),
+        # INTER_AREA's equivalent: the tracking proxy is a downscale, and area
+        # is what keeps thin edges from aliasing into the model's input.
+        *(["-vf", f"scale={size[0]}:{size[1]}:flags=area"] if size else []),
+        "-q:v", "2",
+        "-start_number", "0",
+        # Frame counts on stdout so the phase can report real progress instead of
+        # parking on one number for the whole extraction.
+        "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+        str(frame_directory / "%06d.jpg"),
+    ]
+
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        if not line.startswith("frame=") or not progress or not expected:
+            continue
+        try:
+            done = int(line.split("=", 1)[1].strip())
+        except ValueError:
+            continue
+        progress(min(13, 8 + int((done / expected) * 5)))
+    process.stdout.close()
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    process.wait()
+    if process.returncode != 0:
+        tail = (stderr.strip().splitlines() or ["unknown error"])[-1]
+        raise SegmentationError(
+            "Could not prepare frames for custom background removal: " + tail
+        )
+
+    # Count what actually landed rather than trusting the frame-rate arithmetic:
+    # a clip that ends early gives fewer frames than `expected`, and tracking
+    # then has to iterate over the real number.
+    return sum(1 for _ in frame_directory.glob("*.jpg"))
 
 
 def _has(module: str) -> bool:
@@ -108,39 +232,9 @@ class LocalSegmentationProvider:
         return self._remove_background(source, clip_target, settings, output_dir, progress=progress)
 
     @staticmethod
-    def _selection_prompts(settings: dict[str, Any]):
-        """Normalised prompts from the editor's selection, or None.
-
-        Returning None rather than empty lists is what lets the caller choose
-        between prompted and automatic matting on one condition.
-        """
-        selection = settings.get("selection") or {}
-        raw_points = selection.get("points") or []
-        strokes = selection.get("strokes") or []
-
-        points: list[tuple[float, float]] = []
-        labels: list[int] = []
-
-        for point in raw_points:
-            if isinstance(point, dict) and "x" in point and "y" in point:
-                points.append((float(point["x"]), float(point["y"])))
-                labels.append(1 if point.get("include", True) else 0)
-
-        # A brush stroke becomes a run of point prompts. Sampling rather than
-        # sending every vertex keeps the prompt count sane on a long stroke,
-        # which SAM is sensitive to.
-        for stroke in strokes:
-            stroke_points = stroke.get("points") or []
-            label = 1 if stroke.get("include", True) else 0
-            step = max(1, len(stroke_points) // 12)
-            for vertex in stroke_points[::step]:
-                if isinstance(vertex, dict) and "x" in vertex and "y" in vertex:
-                    points.append((float(vertex["x"]), float(vertex["y"])))
-                    labels.append(label)
-
-        if not points:
-            return None
-        return points, labels
+    def _selection_prompts(settings: dict[str, Any]) -> SelectionPrompts | None:
+        """Compatibility entry point for callers and prompt extraction tests."""
+        return selection_prompts(settings)
 
     def _remove_background(
         self,
@@ -239,7 +333,10 @@ class LocalSegmentationProvider:
             )
 
         total = int(round(clip_seconds * fps)) if fps else 0
-        if start > 0:
+        # Only the automatic path reads frames through this capture. Seeking it
+        # is itself a round trip on a remote source, so the prompted path — which
+        # hands decoding to ffmpeg below — must not pay for a seek it never uses.
+        if start > 0 and not use_prompts:
             capture.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
 
         if not width or not height:
@@ -259,40 +356,37 @@ class LocalSegmentationProvider:
                 max(1, int(round(width * tracking_scale))),
                 max(1, int(round(height * tracking_scale))),
             )
-            saved = 0
-            while True:
-                if total and saved >= total:
-                    break
-                ok, frame = capture.read()
-                if not ok:
-                    break
-                tracking_frame = (
-                    cv2.resize(frame, tracking_size, interpolation=cv2.INTER_AREA)
-                    if tracking_scale < 1.0
-                    else frame
-                )
-                if not cv2.imwrite(
-                    str(frame_directory / f"{saved:06d}.jpg"),
-                    tracking_frame,
-                    [cv2.IMWRITE_JPEG_QUALITY, 92],
-                ):
-                    capture.release()
-                    raise SegmentationError("Could not prepare frames for custom background removal.")
-                saved += 1
-                if progress and total:
-                    progress(min(13, 8 + int((saved / total) * 5)))
             capture.release()
+            saved = _extract_tracking_frames(
+                source,
+                frame_directory,
+                start=start,
+                clip_seconds=clip_seconds,
+                size=tracking_size if tracking_scale < 1.0 else None,
+                expected=total,
+                progress=progress,
+            )
             if saved == 0:
                 raise SegmentationError("No frames could be read from the clip's range.")
             total = saved
             anchor_seconds = float(settings.get("selectionAnchorSeconds") or start)
-            anchor_frame = round((anchor_seconds - start) * fps)
+            anchor_frame = max(0, min(saved - 1, round((anchor_seconds - start) * fps)))
             assert prompts is not None
+            anchor_bgr = cv2.imread(str(frame_directory / f"{anchor_frame:06d}.jpg"))
+            if anchor_bgr is None:
+                raise SegmentationError("Could not read the selected frame for mask tracking.")
+            from . import sam2_backend
+
+            anchor_mask = sam2_backend.segment_prompt_groups(
+                cv2.cvtColor(anchor_bgr, cv2.COLOR_BGR2RGB),
+                prompts.positive_groups,
+                prompts.negative_points,
+                quality=quality,
+            )
             propagated = video_backend.propagate_masks(
                 frame_directory,
                 anchor_frame=anchor_frame,
-                points=prompts[0],
-                labels=prompts[1],
+                anchor_mask=anchor_mask,
                 quality=quality,
                 output_directory=output_dir / "sam2-masks",
                 progress=progress,
@@ -402,16 +496,20 @@ class LocalSegmentationProvider:
             # Tracking frames are intentionally bounded to SAM's useful input
             # resolution. Re-read the original source for final colour, chroma
             # and BiRefNet detail rather than encoding the JPEG proxies.
-            source_capture = cv2.VideoCapture(source)
-            if not source_capture.isOpened():
-                raise SegmentationError("Could not reopen the source for the final cutout pass.")
-            if start > 0:
-                source_capture.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
+            #
+            # Through ffmpeg rather than `cv2.VideoCapture`, for the same reason
+            # the extraction above is: this is the second full pass over a source
+            # that is usually a URL, and OpenCV's per-frame reads over HTTP cost
+            # far more than the decode. It also puts every pass in this function
+            # on one seek implementation — extraction, this, and the alphamerge
+            # encoder all now start at `start` the same way, so the matte cannot
+            # drift a frame away from the picture it belongs to.
+            source_reader = _RawFrameReader(source, start, clip_seconds, width, height)
             try:
                 for index in range(propagated.frame_count):
-                    ok, frame = source_capture.read()
+                    frame = source_reader.read()
                     matte = cv2.imread(str(propagated.path_for(index)), cv2.IMREAD_GRAYSCALE)
-                    if not ok or frame is None or matte is None:
+                    if frame is None or matte is None:
                         raise SegmentationError(f"Could not read propagated frame {index}.")
                     if matte.shape != (height, width):
                         matte = cv2.resize(
@@ -430,7 +528,7 @@ class LocalSegmentationProvider:
             except BrokenPipeError:
                 pass
             finally:
-                source_capture.release()
+                source_reader.close()
                 stderr = finish_encoder()
             if process.returncode != 0:
                 raise SegmentationError(

@@ -48,6 +48,8 @@ class VideoResponse(BaseModel):
     uploader_id: int
     created_at: datetime
     updated_at: datetime
+    # Lets the project grid badge review state without a request per card.
+    status: str = "in_progress"
     comment_count: int = 0
     task_count: int = 0
     contributors: List[ContributorInfo] = []

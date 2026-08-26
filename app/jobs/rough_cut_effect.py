@@ -143,6 +143,12 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
         source = _resolve_media_source(video.file_path)
         run_target = dict(clip_target)
         run_settings = dict(settings)
+        if effect_type == "adjust" and run_settings.get("lut"):
+            from app.services.lut import resolve_adjust_lut, video_workspace_ids
+
+            resolve_adjust_lut(
+                db, run_settings, allowed_workspace_ids=video_workspace_ids(db, video)
+            )
 
         # Beauty is intentionally before background removal in the visual
         # stack. If this clip has an approved completed retouch, use that
@@ -188,6 +194,29 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
                 )
                 output_url = _publish_output(out, row.video_id, row.id)
             _complete(db, row, clip_key, effect_type, output_url)
+            return
+
+        if effect_type == "audio":
+            from app.services.audio_enhancement import render_audio_enhancement
+
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / f"rough-cut-effect-{row.id}.m4a"
+                result = render_audio_enhancement(
+                    source,
+                    run_target,
+                    run_settings,
+                    out,
+                    progress=lambda value: _update_row(db, row, status="processing", progress=value),
+                )
+                output_url = _publish_output(result.path, row.video_id, row.id)
+            _complete(
+                db,
+                row,
+                clip_key,
+                effect_type,
+                output_url,
+                metadata={"provider": result.provider},
+            )
             return
 
         if effect_type in ML_EFFECTS and not chroma_only:
@@ -295,15 +324,30 @@ def _was_canceled(db, row: AiResult) -> bool:
     return bool((row.result_data or {}).get("canceled")) or row.status == "canceled"
 
 
-def _complete(db, row: AiResult, clip_key: str, effect_type: str, output_url: str) -> None:
+def _complete(
+    db,
+    row: AiResult,
+    clip_key: str,
+    effect_type: str,
+    output_url: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> None:
     if _was_canceled(db, row):
         return
     _update_row(db, row, status="completed", progress=100, output_url=output_url)
+    extra = dict(metadata or {})
+    if extra:
+        payload = dict(row.result_data or {})
+        payload.update(extra)
+        row.result_data = payload
+        db.commit()
     _attach_to_draft(db, row.video_id, clip_key, effect_type, {
         "resultId": row.id,
         "status": "completed",
         "progress": 100,
         "outputUrl": output_url,
+        **extra,
     })
 
 
@@ -382,7 +426,7 @@ def _publish_output(path: Path, video_id: int, result_id: int) -> str:
     # because browser-playable alpha needs VP9; renaming those bytes to `.mp4`
     # made StaticFiles send the wrong MIME type and many browsers refused to
     # decode the otherwise valid result.
-    suffix = path.suffix.lower() if path.suffix.lower() in {".webm", ".mp4", ".mov"} else ".mp4"
+    suffix = path.suffix.lower() if path.suffix.lower() in {".webm", ".mp4", ".mov", ".m4a"} else ".mp4"
     dest = uploads / f"effect_{result_id}{suffix}"
     shutil.copyfile(path, dest)
     return f"/uploads/rough_cut_effects/{video_id}/{dest.name}"

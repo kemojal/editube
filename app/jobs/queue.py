@@ -700,3 +700,31 @@ def enqueue_ai_review_job(video_id: int, options: dict | None = None) -> str | N
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to enqueue AI review for video %s: %s", video_id, e)
         return None
+
+
+def enqueue_director_job(plan_id: int) -> str | None:
+    """Enqueue an AI creative director run. Returns RQ job id, or None when
+    Redis is unset — the caller marks the run failed with that reason rather
+    than leaving a row queued forever with nothing to pick it up."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; director run %s not enqueued", plan_id)
+        return None
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        # Planning is minutes at high effort; asset generation (M3) is longer
+        # still, so this is sized for the whole run rather than the first stage.
+        timeout_sec = max(900, int(os.environ.get("DIRECTOR_TIMEOUT_SEC", "3600") or "3600"))
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=timeout_sec)
+        job = q.enqueue(
+            "app.jobs.director.director_job",
+            plan_id,
+            job_timeout=timeout_sec,
+        )
+        return job.id if job else None
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to enqueue director run %s: %s", plan_id, e)
+        return None

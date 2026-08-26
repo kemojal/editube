@@ -28,6 +28,10 @@ from app.services.video_review import build_review, empty_review
 from app.utils.cloudinary import upload_image_bytes
 from app.utils.security import get_current_user
 from app.services.project_access import can_access_project
+from app.services.rough_cut_workspace import (
+    get_workspace_draft,
+    prepare_workspace_save,
+)
 
 router = APIRouter(
     prefix="/videos",
@@ -372,6 +376,9 @@ def save_auto_edit_prefs(
                 segments=list(transcription.segments),
                 video_duration=float(video.duration) if video and video.duration else None,
                 transcription_id=transcription.id,
+                audio_analysis=transcription.audio_analysis
+                if isinstance(transcription.audio_analysis, dict)
+                else None,
             )
     return result
 
@@ -414,13 +421,16 @@ def rough_cut(
     tr = db.query(VideoTranscription).filter(VideoTranscription.video_id == video_id).first()
     segments = list(tr.segments) if tr and tr.segments else []
     duration = float(getattr(video, "duration", 0) or 0)
+    audio_analysis = tr.audio_analysis if tr and isinstance(tr.audio_analysis, dict) else None
     analysis = _analyze_segments(
         segments,
         duration,
         remove_fillers=body.remove_fillers,
         remove_silences=body.remove_silences,
         remove_bad_takes=body.remove_bad_takes,
+        remove_repeats=body.remove_repeats,
         aggressiveness=body.aggressiveness,
+        vad_silences=audio_analysis.get("silences") if audio_analysis else None,
     )
     return _upsert_result(
         db,
@@ -533,15 +543,11 @@ def get_rough_cut_draft(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _check_video_access(video_id, db, current_user)
-    row = (
-        db.query(AiResult)
-        .filter(AiResult.video_id == video_id, AiResult.result_type == "rough_cut_draft")
-        .first()
-    )
+    requested_video = _check_video_access(video_id, db, current_user)
+    workspace_video, row = get_workspace_draft(db, requested_video)
     if row is None:
         return {
-            "video_id": video_id,
+            "video_id": workspace_video.id,
             "result_type": "rough_cut_draft",
             "status": "pending",
             "result_data": None,
@@ -601,12 +607,17 @@ def save_rough_cut_draft(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _check_video_access(video_id, db, current_user)
+    requested_video = _check_video_access(video_id, db, current_user)
+    workspace_video, payload = prepare_workspace_save(
+        db,
+        requested_video,
+        body.model_dump(mode="json", exclude_none=False),
+    )
     return _upsert_result(
         db,
-        video_id,
+        workspace_video.id,
         "rough_cut_draft",
-        body.model_dump(mode="json", exclude_none=False),
+        payload,
         status="completed",
     )
 
@@ -803,7 +814,12 @@ def visual_preview(
                     state,
                     detections=detections,
                 )
-        frame_bgr = apply_adjust_frame(frame_bgr, body.adjust_settings)
+        from app.services.lut import resolve_adjust_lut
+
+        adjust_settings = resolve_adjust_lut(
+            db, dict(body.adjust_settings or {}), user_id=current_user.id
+        )
+        frame_bgr = apply_adjust_frame(frame_bgr, adjust_settings)
         ok, encoded = cv2.imencode(".png", frame_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 4])
         if not ok:
             raise RuntimeError("Could not encode the exact visual preview.")
@@ -843,7 +859,10 @@ def segment_preview(
     from app.jobs.rough_cut_effect import _resolve_media_source
     from app.services.segmentation.base import SegmentationError
     from app.services.segmentation.local import LocalSegmentationProvider
-    from app.services.segmentation.preview import preview_auto_mask_png, preview_mask_png
+    from app.services.segmentation.preview import (
+        preview_auto_mask_png,
+        preview_selection_mask_png,
+    )
 
     quality = "better" if str(body.quality).strip().lower() == "better" else "faster"
     mode = "auto" if str(body.mode).strip().lower() == "auto" else "custom"
@@ -862,18 +881,16 @@ def segment_preview(
             prompts = LocalSegmentationProvider._selection_prompts({"selection": body.selection})
             if prompts is None:
                 raise HTTPException(status_code=400, detail="Click the subject to select it first.")
-            points, labels = prompts
-            png, width, height = preview_mask_png(
+            png, width, height = preview_selection_mask_png(
                 source,
                 float(body.at_seconds or 0.0),
-                points,
-                labels,
+                prompts,
                 quality=quality,
                 # Invert / grow / feather come from the same stored attributes the
                 # export reads, so the preview shows the refined matte, not a raw one.
                 settings=body.refine,
             )
-            point_count = len(points)
+            point_count = prompts.point_count
     except SegmentationError as exc:
         # 422, not 500: these are all "the request cannot be satisfied as asked"
         # — model missing, unreadable frame, nothing selected — and the editor
@@ -1326,6 +1343,13 @@ def cancel_mask_track(
     return {"ok": True, "video_id": video_id, "ai_result_id": result_id}
 
 
+# Rasterized overlay frames the browser sends as base64 PNGs. There is no
+# global body-size limit in this app, so the count and per-frame size are
+# bounded here, before the payload is persisted onto the AiResult row.
+_MAX_BURN_INS = 32
+_MAX_BURN_IN_PNG_BYTES = 6 * 1024 * 1024
+
+
 class RoughCutExportBody(BaseModel):
     format: str = "mp4"  # "mp4" | "wav"
     keepRanges: list[dict[str, Any]] = Field(default_factory=list)
@@ -1341,6 +1365,26 @@ class RoughCutExportBody(BaseModel):
     colorRanges: list[dict[str, Any]] = Field(default_factory=list)
     # Non-destructive Canvas and temporal-motion settings per source range.
     videoRanges: list[dict[str, Any]] = Field(default_factory=list)
+    # Per-clip A-roll audio aligned with keepRanges by exact source range:
+    # {start, end, volume?(dB), fadeIn?(sec), fadeOut?(sec)}. Flat on purpose --
+    # the worker sanitizes every number before it reaches an ffmpeg filter.
+    audioRanges: list[dict[str, Any]] = Field(default_factory=list)
+    # Source spans the editor silenced entirely: {start, end} in source seconds.
+    mutedRanges: list[dict[str, Any]] = Field(default_factory=list)
+    # First-class clips placed on tracks above the source: picture
+    # (kind "video"/"image") and audio lanes (kind "audio" -- music/SFX, no
+    # picture, mixed rather than composited, audible unless `audioEnabled` is
+    # explicitly false). The browser sends ids/timing/settings only; the worker
+    # resolves owned media and completed effect outputs instead of trusting
+    # client URLs.
+    timelineLayers: list[dict[str, Any]] = Field(default_factory=list)
+    # Pre-rasterized full-frame transparent PNG overlays (text, lower thirds,
+    # brand) with their output-timeline spans:
+    # {png (base64, no data: prefix), start, end, fadeIn?, fadeOut?}.
+    # The browser has already positioned and alpha-composited each frame; the
+    # worker only decodes, validates and overlays it at 0:0.
+    burnIns: list[dict[str, Any]] = Field(default_factory=list)
+    burnInsIncludeLowerThirds: bool = False
     # When true, the rendered output registers as the NEXT VERSION of this
     # video (same version_group_id, version = max+1) once the export
     # completes. Back-compat default off — existing callers keep getting
@@ -1361,6 +1405,29 @@ def start_rough_cut_export(
     if fmt not in ("mp4", "wav"):
         raise HTTPException(status_code=400, detail="format must be mp4 or wav")
 
+    # Bound the burn-in frames before they are written to the AiResult row.
+    # Oversize is measured on the encoded string -- base64 carries 3 bytes per
+    # 4 characters -- so a 50 MB blob is rejected without ever being decoded.
+    # The worker re-validates everything (magic bytes, spans); this is only
+    # about not storing megabytes the render would throw away.
+    burn_ins: list[dict[str, Any]] = []
+    burn_ins_rejected = 0
+    for item in body.burnIns:
+        if len(burn_ins) >= _MAX_BURN_INS:
+            burn_ins_rejected += 1
+            continue
+        if not isinstance(item, dict):
+            burn_ins_rejected += 1
+            continue
+        png = item.get("png")
+        if not isinstance(png, str) or not png.strip():
+            burn_ins_rejected += 1
+            continue
+        if (len(png.strip()) * 3) // 4 > _MAX_BURN_IN_PNG_BYTES:
+            burn_ins_rejected += 1
+            continue
+        burn_ins.append(item)
+
     payload = {
         "format": fmt,
         "keepRanges": body.keepRanges,
@@ -1369,6 +1436,12 @@ def start_rough_cut_export(
         "processedRanges": body.processedRanges,
         "colorRanges": body.colorRanges,
         "videoRanges": body.videoRanges,
+        "audioRanges": body.audioRanges,
+        "mutedRanges": body.mutedRanges,
+        "timelineLayers": body.timelineLayers[:64],
+        "burnIns": burn_ins,
+        "burnInsRejected": burn_ins_rejected,
+        "burnInsIncludeLowerThirds": body.burnInsIncludeLowerThirds,
         "progress": 0,
     }
 

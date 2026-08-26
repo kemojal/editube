@@ -116,10 +116,10 @@ def _plan_label(plan: str | None) -> str:
         return "your plan"
     return {
         "free": "Free",
+        "basic": "Basic",
         "pro": "Pro",
         "scale": "Scale",
         "enterprise": "Enterprise",
-        "basic": "Free",
         "elite": "Scale",
     }.get(plan.lower(), plan)
 
@@ -130,6 +130,21 @@ def _sub_get(sub: stripe.Subscription, key: str):
         return sub[key]
     except (KeyError, TypeError, AttributeError):
         return None
+
+
+def _item_period_end(sub: stripe.Subscription):
+    """`current_period_end` from the first subscription item (basil+ location)."""
+    items = _sub_get(sub, "items") or getattr(sub, "items", None)
+    data = _sub_get(items, "data") if items is not None else None
+    if data is None and items is not None:
+        data = getattr(items, "data", None)
+    for item in data or []:
+        end = _sub_get(item, "current_period_end") or getattr(
+            item, "current_period_end", None
+        )
+        if end:
+            return end
+    return None
 
 
 def send_subscription_welcome_email(user: User, sub: stripe.Subscription) -> None:
@@ -144,7 +159,11 @@ def send_subscription_welcome_email(user: User, sub: stripe.Subscription) -> Non
     status_val = _sub_get(sub, "status") or getattr(sub, "status", None)
     trial_end = _sub_get(sub, "trial_end")
     trial_start = _sub_get(sub, "trial_start")
-    current_period_end = _sub_get(sub, "current_period_end")
+    # Stripe moved the billing period onto subscription *items* in API version
+    # 2025-03-31.basil. Reading it off the subscription (as this did) returns
+    # None on every modern API version, so the renewal line silently vanished
+    # from every welcome email.
+    current_period_end = _sub_get(sub, "current_period_end") or _item_period_end(sub)
     sub_id = _sub_get(sub, "id") or getattr(sub, "id", None)
     created_ts = _sub_get(sub, "created")
 
@@ -198,10 +217,8 @@ def _subscription_plan_from_stripe(sub: stripe.Subscription) -> str | None:
         return None
     try:
         p = meta.get("plan") if hasattr(meta, "get") else meta["plan"]
-        if p in ("free", "pro", "scale", "enterprise"):
+        if p in ("free", "basic", "pro", "scale", "enterprise"):
             return p
-        if p == "basic":
-            return "free"
         if p == "elite":
             return "scale"
         return None
@@ -289,6 +306,74 @@ def send_subscription_will_not_renew_email(
         "Your Editube subscription will not renew",
         text,
     )
+
+
+def send_trial_ending_email(
+    to_email: str,
+    display_name: str,
+    plan: str | None,
+    trial_end: datetime | None,
+) -> None:
+    """Three days before a trial converts. Stripe emits this; we were ignoring it.
+
+    A trial that turns into a charge nobody expected is a chargeback and a
+    refund request, and it was the single most avoidable one here.
+    """
+    if not to_email:
+        return
+    pl = _plan_label(plan)
+    base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+    billing_url = f"{base}/dashboard?account=billing"
+    when = "in a few days"
+    if trial_end:
+        dt = trial_end if trial_end.tzinfo else trial_end.replace(tzinfo=timezone.utc)
+        when = f"on {_fmt_long_date_utc(dt.astimezone(timezone.utc))} (UTC)"
+
+    text = (
+        f"Hi {display_name},\n\n"
+        f"Your Editube {pl} trial ends {when}, and your subscription will begin "
+        f"billing automatically at that point.\n\n"
+        f"Nothing to do if you would like to continue. To change your plan or "
+        f"cancel before you are charged: {billing_url}\n\n"
+        f"Best,\n"
+        f"The Editube team\n"
+    )
+    send_transactional_email(to_email, f"Your Editube {pl} trial ends soon", text)
+
+
+def send_payment_failed_email(
+    to_email: str,
+    display_name: str,
+    plan: str | None,
+    hosted_invoice_url: str | None = None,
+) -> None:
+    """A renewal charge was declined; Stripe is retrying.
+
+    Access is deliberately kept during `past_due` — this email is the only
+    warning the customer gets before dunning gives up and the plan drops.
+    """
+    if not to_email:
+        return
+    pl = _plan_label(plan)
+    base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+    billing_url = f"{base}/dashboard?account=billing"
+    pay_line = (
+        f"Pay the outstanding invoice: {hosted_invoice_url}\n"
+        if hosted_invoice_url
+        else ""
+    )
+
+    text = (
+        f"Hi {display_name},\n\n"
+        f"We could not charge the card on file for your Editube {pl} subscription.\n\n"
+        f"Your account is still active while we retry, but it will be downgraded "
+        f"if the payment cannot be collected.\n\n"
+        f"{pay_line}"
+        f"Update your payment method: {billing_url}\n\n"
+        f"Best,\n"
+        f"The Editube team\n"
+    )
+    send_transactional_email(to_email, "Action needed: Editube payment failed", text)
 
 
 def send_review_magic_link_email(

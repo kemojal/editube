@@ -27,3 +27,10 @@ Pillow>=10.0.0
 
 # Cloudflare R2 (S3-compatible) storage
 boto3>=1.34
+
+# Claude (AI creative director). Pure Python, no native deps, so unlike the
+# heavier model runtimes in requirements-ml.txt it belongs here: the director's
+# API surface is part of the core app, not an optional worker extra. The import
+# itself is still lazy (see app/services/claude_client.py), so a deployment
+# without a key never pays for it.
+anthropic>=0.75

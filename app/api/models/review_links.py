@@ -259,6 +259,17 @@ class PublicReviewCommentDeltaResponse(BaseModel):
 class PublicReviewApproveRequest(BaseModel):
     session_id: int
     approved: bool = True
+    note: Optional[str] = None
+
+
+class PublicReviewRequestChangesRequest(BaseModel):
+    """POST /review/{token}/request-changes — the guest saying "not yet"."""
+
+    session_id: int
+    note: Optional[str] = None
+    # Turn the note into a change request on the timeline, so it lands in the
+    # editor's revision checklist rather than only in a status field.
+    create_comment: bool = True
 
 
 class PublicReviewMagicSendRequest(BaseModel):

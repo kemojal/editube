@@ -14,7 +14,7 @@ import logging
 import os
 import threading
 
-from .base import StorageBackend, UploadResult, build_key, guess_content_type
+from .base import PresignedUpload, StorageBackend, UploadResult, build_key, guess_content_type
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,31 @@ def storage_available() -> bool:
         return False
 
 
+def create_presigned_upload(
+    *, key: str, content_type: str, expires_in: int = 15 * 60
+) -> PresignedUpload | None:
+    """Return a direct-upload target when the selected backend supports one."""
+    backend = get_storage()
+    creator = getattr(backend, "create_presigned_upload", None)
+    if creator is None:
+        return None
+    return creator(key=key, content_type=content_type, expires_in=expires_in)
+
+
+def multipart_supported() -> bool:
+    """Whether the active backend can run a resumable multipart upload.
+
+    The frontend probes this (via the create endpoint's 501) and falls back to
+    the legacy single-request path, so a Cloudinary- or local-disk-configured
+    install keeps working exactly as before.
+    """
+    try:
+        backend = get_storage()
+        return backend.available() and hasattr(backend, "create_multipart_upload")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def reset_storage_cache() -> None:
     """Testing helper — drop cached instances so env changes take effect."""
     with _lock:
@@ -89,9 +114,12 @@ def reset_storage_cache() -> None:
 __all__ = [
     "StorageBackend",
     "UploadResult",
+    "PresignedUpload",
     "build_key",
     "guess_content_type",
     "get_storage",
     "storage_available",
+    "create_presigned_upload",
+    "multipart_supported",
     "reset_storage_cache",
 ]

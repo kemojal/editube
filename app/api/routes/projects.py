@@ -44,7 +44,10 @@ from app.services.project_access import (
     can_manage_project_settings,
     get_project_for_user,
     get_workspace_member,
+    list_users_for_mentions,
 )
+from app.services.rough_cut_workspace import latest_project_source_video
+from app.services.mentions import user_mention_handles
 from app.services.project_template_apply import apply_project_template
 from app.services.workspace_bootstrap import ensure_personal_workspace
 from app.services.activity import log_activity
@@ -58,6 +61,11 @@ router = APIRouter(
     prefix="/projects",
     tags=["Projects"],
 )
+
+def _latest_project_source_video(db: Session, project_id: int) -> Video | None:
+    """Compatibility wrapper for callers and focused selector tests."""
+
+    return latest_project_source_video(db, project_id)
 
 
 def convert_project_to_response(db_project: Project, db: Session | None = None) -> ProjectResponse:
@@ -95,12 +103,7 @@ def convert_project_to_response(db_project: Project, db: Session | None = None) 
     thumbnail_url = None
     latest_video_id = None
     if db:
-        latest_video = (
-            db.query(Video)
-            .filter(Video.project_id == db_project.id)
-            .order_by(Video.updated_at.desc())
-            .first()
-        )
+        latest_video = _latest_project_source_video(db, db_project.id)
         if latest_video:
             thumbnail_url = latest_video.thumbnail_url
             latest_video_id = latest_video.id
@@ -392,6 +395,40 @@ def _pipeline_status_for_video(db: Session, video: Video) -> dict:
         "analysis": analysis_state,
         "clips": {"state": clips_state, "ready": ready, "total": total},
     }
+
+
+@router.get("/{project_id}/mentionable-users")
+def list_mentionable_users(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Everyone who can be @mentioned on this project.
+
+    The composer used to build its own candidate list from the uploader plus
+    whoever had already commented, so a teammate who had not yet said anything
+    was unmentionable — including, often, the very person you needed to pull
+    in. The backend has always known the real roster; it just had no way to
+    hand it over.
+
+    Each entry carries the handles the resolver will actually match, so the
+    picker cannot offer a name that then fails to notify anyone. Clients are
+    excluded: they participate through guest review links, not @mentions.
+    """
+    project = get_project_for_user(db, project_id, current_user)
+    users = list_users_for_mentions(db, project)
+    return [
+        {
+            "id": user.id,
+            "name": user.name or user.email,
+            "email": user.email,
+            "avatar_url": user.avatar_url,
+            # Sorted so the primary handle is stable between renders.
+            "handles": sorted(user_mention_handles(user)),
+            "is_you": user.id == current_user.id,
+        }
+        for user in users
+    ]
 
 
 @router.get("/{project_id}/pipeline")

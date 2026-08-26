@@ -59,6 +59,34 @@ Notes:
   Cloudinary assets keep working regardless (dual-read). Flip to `r2` only after
   the smoke test below passes.
 
+### Browser upload CORS
+
+Project creation uploads videos directly to R2, avoiding API temporary-disk
+limits. In the bucket's **Settings → CORS Policy**, allow the frontend origins:
+
+```json
+[
+  {
+    "AllowedOrigins": [
+      "http://localhost:3000",
+      "http://localhost:3001",
+      "http://localhost:3002",
+      "http://localhost:3003",
+      "http://127.0.0.1:3000",
+      "http://127.0.0.1:3001",
+      "http://127.0.0.1:3002",
+      "http://127.0.0.1:3003",
+      "https://editube-kemojals-projects.vercel.app"
+    ],
+    "AllowedMethods": ["PUT"],
+    "AllowedHeaders": ["Content-Type"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+Add every deployed frontend origin explicitly; do not use `*` in production.
+
 ## 5. Verify (smoke test)
 
 `boto3` is required (`pip install boto3`, added to `requirements.txt`). Round-trip

@@ -151,6 +151,33 @@ class R2BackendConfigTests(unittest.TestCase):
         self.assertEqual(backend.public_url("/leading.mp4"),
                          "https://pub-x.r2.dev/leading.mp4")
 
+    def test_presigned_upload_binds_key_and_content_type(self):
+        class FakeS3:
+            def generate_presigned_url(self, operation, *, Params, ExpiresIn):
+                self.call = (operation, Params, ExpiresIn)
+                return "https://signed.example/upload"
+
+        backend = R2Backend()
+        backend._bucket = "media"
+        backend._public_base = "https://cdn.example"
+        fake = FakeS3()
+        backend._client = fake
+
+        target = backend.create_presigned_upload(
+            key="videos/a.mp4", content_type="video/mp4", expires_in=60
+        )
+
+        self.assertEqual(target.upload_url, "https://signed.example/upload")
+        self.assertEqual(target.public_url, "https://cdn.example/videos/a.mp4")
+        self.assertEqual(target.headers, {"Content-Type": "video/mp4"})
+        self.assertEqual(
+            fake.call,
+            (
+                "put_object",
+                {"Bucket": "media", "Key": "videos/a.mp4", "ContentType": "video/mp4"},
+                60,
+            ),
+        )
     def test_s3_raises_when_unconfigured(self):
         backend = R2Backend()
         backend._account_id = None

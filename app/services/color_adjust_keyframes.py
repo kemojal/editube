@@ -17,7 +17,7 @@ _SETTING_KEYS = {
     "enabled", "preset", "temp", "tint", "saturation", "vibrance",
     "exposure", "contrast", "highlight", "shadow", "whites", "blacks",
     "brilliance", "fade", "clarity", "sharpen", "vignette", "grain", "hsl",
-    "curves", "wheels",
+    "curves", "wheels", "lut",
 }
 
 
@@ -50,7 +50,26 @@ def _track(value: Any, duration: float) -> list[dict[str, Any]]:
     return deduped
 
 
+# Same constants `rough_cut_export.py` uses for its ffmpeg-expression easing;
+# `tests/fixtures/easing_curves.json` is the contract that keeps this file, the
+# export expressions, and the editor's `easingRatio` in agreement.
+_EASE_C1 = 1.70158
+_EASE_C3 = _EASE_C1 + 1.0
+_EASE_OVERSHOOT_C1 = _EASE_C1 * 1.525
+_EASE_OVERSHOOT_C3 = _EASE_OVERSHOOT_C1 + 1.0
+
+
+def _back_out(ratio: float, c1: float, c3: float) -> float:
+    return 1 + c3 * (ratio - 1) ** 3 + c1 * (ratio - 1) ** 2
+
+
 def _ease(ratio: float, easing: str) -> float:
+    """One keyframe segment's easing.
+
+    The full craft set, not just the quadratics: color keyframes sample through
+    this, and a curve the geometry channels honour but the grade silently
+    linearises would export motion and colour drifting apart on the same clip.
+    """
     ratio = max(0.0, min(1.0, ratio))
     if easing == "hold":
         return 0.0
@@ -60,6 +79,18 @@ def _ease(ratio: float, easing: str) -> float:
         return 1 - (1 - ratio) * (1 - ratio)
     if easing == "ease-in-out":
         return 2 * ratio * ratio if ratio < 0.5 else 1 - ((-2 * ratio + 2) ** 2) / 2
+    if easing == "smooth":
+        return 4 * ratio ** 3 if ratio < 0.5 else 1 - ((-2 * ratio + 2) ** 3) / 2
+    if easing == "glide":
+        return 1 - (1 - ratio) ** 3
+    if easing == "snappy":
+        return 1 - (1 - ratio) ** 5
+    if easing == "anticipate":
+        return _EASE_C3 * ratio ** 3 - _EASE_C1 * ratio ** 2
+    if easing == "settle":
+        return _back_out(ratio, _EASE_C1, _EASE_C3)
+    if easing == "overshoot":
+        return _back_out(ratio, _EASE_OVERSHOOT_C1, _EASE_OVERSHOOT_C3)
     return ratio
 
 

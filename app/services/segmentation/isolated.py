@@ -33,6 +33,7 @@ seconds per click would defeat the point of a preview.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -40,6 +41,9 @@ from pathlib import Path
 from typing import Any
 
 from .base import SegmentationError, SegmentationResult
+
+
+logger = logging.getLogger(__name__)
 
 #: Set to "0" to run in-process. Useful when debugging, since a subprocess hides
 #: the traceback; unsafe in a forking worker, which is why it defaults on.
@@ -154,6 +158,8 @@ def remove_background_isolated(
         )
 
     if "error" in outcome:
+        if stderr.strip():
+            logger.error("Isolated background removal failed:\n%s", stderr.rstrip())
         raise SegmentationError(str(outcome["error"]))
 
     if outcome.get("url"):

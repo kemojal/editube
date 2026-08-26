@@ -1,10 +1,14 @@
+import re
+import sys
+import time
 from logging.config import fileConfig
 from sqlalchemy import create_engine
 from sqlalchemy import pool
+from sqlalchemy.exc import OperationalError
 from alembic import context
 
 # Import the Base and URL from app.db.database so migrations use the same DB as the app
-from app.db.database import Base, SQLALCHEMY_DATABASE_URL
+from app.db.database import Base, SQLALCHEMY_DATABASE_URL, connect_args_for
 # Import all models so Alembic can detect them for autogenerate
 import app.db.models  # noqa: F401
 
@@ -18,6 +22,53 @@ fileConfig(config.config_file_name)
 
 # Add your model's MetaData object here
 target_metadata = Base.metadata
+
+CONNECT_ATTEMPTS = 3
+
+
+def _redacted_target() -> str:
+    """host/dbname of the migration target, with credentials stripped."""
+    return re.sub(r"://[^@/]*@", "://", SQLALCHEMY_DATABASE_URL).split("?")[0]
+
+
+def _connect_with_retry(connectable):
+    """Connect, retrying transient network failures.
+
+    Neon sits behind DNS and a pooler that both blip: a laptop waking up, a VPN
+    reconnecting, or a cold serverless endpoint all surface as OperationalError
+    on the first attempt and succeed on the next. Retrying beats making someone
+    re-read a sixty-frame traceback to learn their wifi dropped.
+    """
+    delay = 2
+    for attempt in range(1, CONNECT_ATTEMPTS + 1):
+        try:
+            return connectable.connect()
+        except OperationalError as exc:
+            detail = str(exc.orig).strip() if exc.orig is not None else str(exc)
+            if attempt == CONNECT_ATTEMPTS:
+                sys.stderr.write(
+                    f"\nalembic: cannot reach the database after {CONNECT_ATTEMPTS} "
+                    f"attempts.\n"
+                    f"  target: {_redacted_target()}\n"
+                    f"  cause:  {detail}\n"
+                )
+                if "translate host name" in detail or "Name or service not known" in detail:
+                    sys.stderr.write(
+                        "  DNS could not resolve the host. Check your network/VPN, "
+                        "then retry.\n"
+                    )
+                sys.stderr.write(
+                    "  No migrations ran; the database is unchanged.\n\n"
+                )
+                raise SystemExit(1) from None
+            sys.stderr.write(
+                f"alembic: database unreachable ({detail.splitlines()[0]}); "
+                f"retrying in {delay}s "
+                f"[attempt {attempt + 1}/{CONNECT_ATTEMPTS}]\n"
+            )
+            time.sleep(delay)
+            delay *= 2
+
 
 def run_migrations_offline():
     """Run migrations in 'offline' mode.
@@ -44,9 +95,10 @@ def run_migrations_online():
     connectable = create_engine(
         SQLALCHEMY_DATABASE_URL,
         poolclass=pool.NullPool,
+        connect_args=connect_args_for(SQLALCHEMY_DATABASE_URL),
     )
 
-    with connectable.connect() as connection:
+    with _connect_with_retry(connectable) as connection:
         context.configure(
             connection=connection, target_metadata=target_metadata, include_schemas=True
         )

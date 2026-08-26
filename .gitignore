@@ -5,3 +5,4 @@
 **/__pycache__/
 .venv/
 .venv312/
+.venv-audio-enhance/

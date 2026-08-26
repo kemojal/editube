@@ -9,12 +9,17 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.db.models import StripePrice, StripeProduct
-from app.services.pricing import normalize_plan_key
+from app.services.pricing import (
+    SELF_SERVE_PLANS,
+    is_editube_product,
+    normalize_plan_key,
+    resolve_plan_key,
+)
 
 logger = logging.getLogger(__name__)
 
 _LOOKUP_KEY_RE = re.compile(
-    r"^editube_(?P<plan>pro|scale|free|enterprise)_(?P<iv>monthly|month|annual|annually|yearly|year)$",
+    r"^editube_(?P<plan>basic|pro|scale|free|enterprise)_(?P<iv>monthly|month|annual|annually|yearly|year)$",
     re.IGNORECASE,
 )
 
@@ -44,9 +49,10 @@ def parse_editube_mapping_from_price(price: dict[str, Any]) -> tuple[str | None,
     interval: str | None = None
 
     if plan_raw:
-        plan = normalize_plan_key(plan_raw)
-        if plan not in ("free", "pro", "scale", "enterprise"):
-            plan = None
+        # `resolve_plan_key` so an unrecognised value stays unrecognised;
+        # `normalize_plan_key` would turn "premium" into "free" and map the
+        # price to a tier nobody asked for.
+        plan = resolve_plan_key(plan_raw)
 
     if interval_raw in ("month", "monthly"):
         interval = "month"
@@ -57,16 +63,12 @@ def parse_editube_mapping_from_price(price: dict[str, Any]) -> tuple[str | None,
     if lookup and (not plan or not interval):
         m = _LOOKUP_KEY_RE.match(lookup)
         if m:
-            plan = normalize_plan_key(m.group("plan"))
+            plan = resolve_plan_key(m.group("plan"))
             iv = m.group("iv").lower()
             if iv in ("monthly", "month"):
                 interval = "month"
             elif iv in ("annual", "annually", "yearly", "year"):
                 interval = "year"
-
-    if plan and plan not in ("pro", "scale"):
-        # Only paid checkout SKUs need strict mapping; keep free/enterprise in DB for display if set
-        pass
 
     return plan, interval
 
@@ -111,6 +113,17 @@ def ensure_stripe_product_row(
         metadata_json=metadata or {},
     )
     db.add(row)
+    # Flushed immediately, for two reasons that both bit in production.
+    #
+    # `SessionLocal` is built with `autoflush=False`, so the SELECT above does
+    # not see rows added earlier in this same transaction. Without the flush,
+    # syncing a product and then its price added the *same* product twice.
+    #
+    # And `stripe_prices.stripe_product_id` carries an FK to this table, so the
+    # product must physically exist before the price INSERT runs — the catalog
+    # sync died on `ForeignKeyViolation ... is not present in table
+    # "stripe_products"` and imported nothing at all.
+    db.flush()
     return row
 
 
@@ -137,7 +150,7 @@ def upsert_stripe_price_from_object(db: Session, obj: dict[str, Any]) -> StripeP
         logger.warning("stripe price missing product id: %s", price_id)
         return None
 
-    ensure_stripe_product_row(db, stripe_product_id=str(product_id))
+    product_row = ensure_stripe_product_row(db, stripe_product_id=str(product_id))
 
     recurring = obj.get("recurring") or {}
     stripe_interval = recurring.get("interval") if isinstance(recurring, dict) else None
@@ -148,6 +161,21 @@ def upsert_stripe_price_from_object(db: Session, obj: dict[str, Any]) -> StripeP
     interval = mapped_interval or stripe_interval
     if interval not in ("month", "year"):
         interval = None
+
+    # Only products named "Editube" are ours. This Stripe account also carries
+    # several unrelated products, and without the check a price of theirs that
+    # happened to carry an `editube_plan` key — or a `lookup_key` the regex
+    # liked — would map itself into our catalog and start granting tiers.
+    # `None` means the product name has not synced yet, which is not a reason
+    # to refuse: that would break a genuine price whose product webhook is
+    # simply late.
+    if plan is not None and is_editube_product(product_row.name) is False:
+        logger.info(
+            "ignoring editube_plan on price %s: product %r is not an Editube product",
+            price_id,
+            product_row.name,
+        )
+        plan = None
 
     row = (
         db.query(StripePrice).filter(StripePrice.stripe_price_id == str(price_id)).first()
@@ -206,13 +234,41 @@ def mark_stripe_price_inactive(db: Session, stripe_price_id: str) -> None:
 
 
 def stripe_object_to_dict(obj: Any) -> dict[str, Any]:
-    if isinstance(obj, dict):
-        return obj
-    if hasattr(obj, "to_dict_recursive"):
-        return obj.to_dict_recursive()  # type: ignore[no-any-return]
-    if hasattr(obj, "to_dict"):
-        return obj.to_dict()  # type: ignore[no-any-return]
-    return dict(obj)
+    """Plain, deeply-converted dict from a Stripe object, dict, or mapping.
+
+    Everything below this line indexes with `.get()`, so it needs real dicts
+    all the way down. `StripeObject` is not a dict in stripe>=12 and has
+    neither `.get()` nor `.items()`, and `to_dict_recursive` was removed in
+    stripe 15 — the old implementation silently fell through to a shallow
+    `to_dict()`, leaving nested `metadata` and `product` as StripeObjects that
+    blew up on the next `.get()`.
+    """
+    return _deep_plain(obj) if not isinstance(obj, dict) else _deep_plain(dict(obj))
+
+
+def _deep_plain(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _deep_plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_deep_plain(v) for v in value]
+    if isinstance(value, (str, bytes, int, float, bool)) or value is None:
+        return value
+
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return _deep_plain(dict(to_dict()))
+        except (TypeError, ValueError):
+            pass
+    # `StripeObject` keeps its payload on `_data`; reachable when `to_dict`
+    # is absent or refuses.
+    data = getattr(value, "_data", None)
+    if isinstance(data, dict):
+        return _deep_plain(data)
+    try:
+        return _deep_plain(dict(value))
+    except (TypeError, ValueError):
+        return value
 
 
 def sync_catalog_from_stripe_api(db: Session) -> int:
@@ -248,7 +304,7 @@ def sync_catalog_from_stripe_api(db: Session) -> int:
 def resolve_checkout_price_id(db: Session, *, plan: str, interval: str) -> str | None:
     """Return Stripe Price id for checkout, or None if not synced."""
     canonical = normalize_plan_key(plan)
-    if canonical not in ("pro", "scale"):
+    if canonical not in SELF_SERVE_PLANS:
         return None
     if interval not in ("month", "year"):
         return None

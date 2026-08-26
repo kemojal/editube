@@ -48,5 +48,71 @@ class ReferralTermsTests(unittest.TestCase):
         self.assertNotIn("void", referrals._PASS_CONSUMING_STATUSES)
 
 
+class EmailInviteTests(unittest.TestCase):
+    def test_outstanding_invites_hold_a_pass(self) -> None:
+        """
+        Reserving the pass at send time is the *only* thing bounding outbound
+        mail to three addresses. If `invited` ever stops consuming a pass, the
+        invite form becomes an open relay.
+        """
+        self.assertIn("invited", referrals._PASS_CONSUMING_STATUSES)
+
+    def test_expired_invites_hand_the_pass_back(self) -> None:
+        self.assertNotIn("expired", referrals._PASS_CONSUMING_STATUSES)
+
+    def test_send_caps_are_a_nudge_not_a_campaign(self) -> None:
+        self.assertEqual(referrals.MAX_INVITE_SENDS, 2)  # first mail + one reminder
+        self.assertGreaterEqual(referrals.MAX_INVITE_SENDS_PER_DAY, referrals.MAX_INVITE_SENDS)
+
+    def test_email_shape_check(self) -> None:
+        for good in ("a@b.co", "first.last+tag@studio.example.com"):
+            self.assertTrue(referrals._EMAIL_RE.match(good), good)
+        for bad in ("", "nope", "a@b", "a b@c.com", "@c.com", "a@.com "):
+            self.assertFalse(referrals._EMAIL_RE.match(bad), bad)
+
+    def test_addresses_are_normalized_before_comparison(self) -> None:
+        """Duplicate detection and invite matching both key off this."""
+        self.assertEqual(referrals._normalize_email("  Friend@Studio.COM "), "friend@studio.com")
+
+
+class PassAccountingTests(unittest.TestCase):
+    """
+    Regression cover for the three ways pass accounting went wrong in review.
+
+    These assert on the queries the functions build rather than on live rows —
+    the models need Postgres (JSONB, partial indexes), so a real session isn't
+    available here. They still catch the specific mistakes that were made: a
+    filter being dropped, or a lock going missing.
+    """
+
+    def test_signup_banner_tolerates_passes_held_by_invites(self) -> None:
+        """
+        The friend sent the last pass arrives on a code with zero free — held by
+        their own invite. A strict check showed them no banner and then let them
+        redeem anyway, which is backwards.
+        """
+        import inspect
+
+        source = inspect.getsource(referrals.describe_code_for_signup)
+        self.assertIn("_has_outstanding_invite", source)
+
+    def test_pass_spending_paths_lock_the_code_row(self) -> None:
+        """Without the lock, two requests both see the last pass and both take it."""
+        import inspect
+
+        for fn in (referrals.send_email_invite, referrals.redeem_referral_code):
+            self.assertIn("_lock_code", inspect.getsource(fn), fn.__name__)
+
+    def test_expired_invites_are_not_claimable(self) -> None:
+        """
+        `passes_used` stops counting an invite the moment it times out, so
+        claiming one afterwards would revive a reservation already given back.
+        """
+        import inspect
+
+        source = inspect.getsource(referrals._claim_pending_invite)
+        self.assertIn("invite_expires_at", source)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -186,6 +186,13 @@ def build_adjust_filter_chain(settings: dict[str, Any] | None) -> list[str]:
             "curves=master='"
             f"0.0000/{lift:.4f} 0.5000/{0.5 + lift * 0.18:.4f} 1.0000/{1.0 - lift * 0.45:.4f}'"
         )
+    lut = settings.get("lut") if isinstance(settings.get("lut"), dict) else {}
+    lut_path = lut.get("path")
+    if isinstance(lut_path, str) and lut_path:
+        # Creative LUT after the corrective stages, before finishing. The path
+        # is always a server-derived cache file (see app/services/lut.py) with
+        # intensity already baked in — client references never reach ffmpeg.
+        filters.append(f"lut3d=file={lut_path}:interp=tetrahedral")
     # Clarity and sharpen are the same operator at two scales: a wide mask
     # lifts local contrast across a face, a tight one cuts edges.
     clarity = _clamp(settings.get("clarity"), 0, 100) / 100

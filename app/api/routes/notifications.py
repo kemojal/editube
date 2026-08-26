@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -151,6 +151,9 @@ async def mark_notification_as_read(
 
     if not notification.read:
         notification.read = True
+        # `read_at` records *when*, not just that it happened — the boolean
+        # alone cannot answer "how long did this sit unread".
+        notification.read_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(notification)
         await _emit_notification_event(
@@ -174,8 +177,10 @@ async def mark_all_notifications_as_read(
     )
     changed_ids = [notification.id for notification in notifications]
     if changed_ids:
+        now = datetime.now(timezone.utc)
         for notification in notifications:
             notification.read = True
+            notification.read_at = now
         db.commit()
         await _emit_notification_event(
             current_user.id,

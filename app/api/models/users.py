@@ -39,7 +39,12 @@ class UserResponse(BaseModel):
     phone: Optional[str] = None
     workflow_type: Optional[str] = None  # retired; historical answers only
     workflow_types: Optional[List[str]] = None
+    #: The tier the account is entitled to. Set only from Stripe subscription
+    #: state — never from a client request.
     plan: Optional[str] = None
+    #: The tier picked during onboarding, which may not be paid for yet. The
+    #: onboarding wizard restores its selection from this, not from `plan`.
+    selected_plan: Optional[str] = None
     onboarding_completed: bool = False
     subscription_status: Optional[str] = None
     stripe_customer_id: Optional[str] = None

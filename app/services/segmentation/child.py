@@ -19,6 +19,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 
@@ -91,6 +92,9 @@ def main() -> int:
         _emit({"done": str(result.path) if result.path else None, "url": result.url})
         return 0
     except BaseException as exc:  # noqa: BLE001 - the reason must reach the parent
+        # Keep the protocol response concise for the UI, but never discard the
+        # traceback. The parent captures stderr and logs it server-side.
+        traceback.print_exc(file=sys.stderr)
         _emit({"error": f"{type(exc).__name__}: {exc}"})
         return 1
 

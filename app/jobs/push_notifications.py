@@ -12,34 +12,47 @@ from app.db.models import DevicePushToken, Notification
 logger = logging.getLogger(__name__)
 
 
+# Every type raised by app/services/notifications.py needs an entry here, or
+# it silently degrades to "New notification" on the lock screen.
+_TITLES: dict[str, str] = {
+    "mention": "You were mentioned",
+    "comment": "New comment",
+    "client_comment": "Client feedback",
+    "approval": "Review approved",
+    "video_approved": "Approved",
+    "changes_requested": "Changes requested",
+    "review_requested": "Review requested",
+    "new_version": "New version",
+    "review_workflow": "Review workflow update",
+    "workspace_invite": "Workspace invitation",
+    "project_invite": "Project invitation",
+}
+
+_BODIES: dict[str, str] = {
+    "mention": "A teammate mentioned you in a comment.",
+    "comment": "Someone commented on your video.",
+    "client_comment": "Your client left feedback on a video.",
+    "approval": "A client approved your review link.",
+    "video_approved": "A cut you worked on has been signed off.",
+    "changes_requested": "A reviewer sent a cut back with changes.",
+    "review_requested": "Someone asked you to review a cut.",
+    "new_version": "A new version is ready to review.",
+    "review_workflow": "A review workflow stage has changed.",
+}
+
+
 def _title_for_notification(notification: Notification) -> str:
     notification_type = (notification.type or "").strip().lower()
-    if notification_type == "mention":
-        return "You were mentioned"
-    if notification_type == "approval":
-        return "Review approved"
-    if notification_type == "review_workflow":
-        return "Review workflow update"
-    if notification_type == "workspace_invite":
-        return "Workspace invitation"
-    if notification_type == "project_invite":
-        return "Project invitation"
-    return "New notification"
+    return _TITLES.get(notification_type, "New notification")
 
 
 def _body_for_notification(notification: Notification) -> str:
     notification_type = (notification.type or "").strip().lower()
-    if notification_type == "mention":
-        return "A teammate mentioned you in a comment."
-    if notification_type == "approval":
-        return "A client approved your review link."
-    if notification_type == "review_workflow":
-        return "A review workflow stage has changed."
-    if notification_type == "workspace_invite":
-        return notification.message or "You were invited to a workspace."
-    if notification_type == "project_invite":
-        return notification.message or "You were invited to a project."
-    return "Open the app to view details."
+    # The emitter writes a specific, already-humanised message ("Sarah Client
+    # requested a change on Summer Reel"); prefer it over the generic copy.
+    if notification.message:
+        return notification.message
+    return _BODIES.get(notification_type, "Open the app to view details.")
 
 
 def _send_expo_push(token: str, payload: dict) -> None:

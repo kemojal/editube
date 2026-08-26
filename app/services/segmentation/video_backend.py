@@ -107,10 +107,11 @@ def propagate_masks(
     frame_directory: Path,
     *,
     anchor_frame: int,
-    points: list[tuple[float, float]],
-    labels: list[int],
     quality: str,
     output_directory: Path,
+    points: list[tuple[float, float]] | None = None,
+    labels: list[int] | None = None,
+    anchor_mask: Any = None,
     progress: Any = None,
 ) -> PropagatedMasks:
     """Tracks one prompted subject in both directions from the anchor frame."""
@@ -144,20 +145,55 @@ def propagate_masks(
             video_path=str(frame_directory),
             offload_video_to_cpu=True,
             offload_state_to_cpu=device == "cpu",
-            async_loading_frames=True,
+            # SAM 2's asynchronous JPEG loader currently divides uint8 frames
+            # into NumPy float64 arrays. CUDA accepts the later conversion, but
+            # Apple MPS rejects float64 before inference begins. The synchronous
+            # path writes into a preallocated float32 tensor, preserving the
+            # exact same frames without the unsupported dtype promotion.
+            async_loading_frames=device != "mps",
         )
         height = int(state["video_height"])
         width = int(state["video_width"])
-        pixel_points = np.array([[x * width, y * height] for x, y in points], dtype=np.float32)
-        point_labels = np.asarray(labels, dtype=np.int32)
-        _, object_ids, anchor_logits = predictor.add_new_points_or_box(
-            inference_state=state,
-            frame_idx=anchor,
-            obj_id=1,
-            points=pixel_points,
-            labels=point_labels,
-            clear_old_points=True,
-        )
+        if anchor_mask is not None:
+            import cv2  # type: ignore
+
+            composed = np.squeeze(np.asarray(anchor_mask))
+            if composed.shape != (height, width):
+                composed = cv2.resize(
+                    composed.astype(np.uint8),
+                    (width, height),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            composed = np.ascontiguousarray(composed > 0)
+            if not np.any(composed):
+                raise SegmentationError("The selected subject produced an empty tracking mask.")
+            # SAM 2 accepts NumPy here, but allowing its internals to infer the
+            # dtype is unsafe on Apple MPS: one inference path promoted the mask
+            # to float64, which Metal does not support. Cross the library
+            # boundary explicitly as a CPU float32 tensor; SAM moves it to the
+            # predictor device itself without changing the precision.
+            tracking_mask = torch.from_numpy(composed.astype(np.float32, copy=False))
+            _, object_ids, anchor_logits = predictor.add_new_mask(
+                inference_state=state,
+                frame_idx=anchor,
+                obj_id=1,
+                mask=tracking_mask,
+            )
+        else:
+            if not points or labels is None or len(points) != len(labels):
+                raise SegmentationError("The selected subject has invalid tracking prompts.")
+            pixel_points = np.array(
+                [[x * width, y * height] for x, y in points], dtype=np.float32
+            )
+            point_labels = np.asarray(labels, dtype=np.int32)
+            _, object_ids, anchor_logits = predictor.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=anchor,
+                obj_id=1,
+                points=pixel_points,
+                labels=point_labels,
+                clear_old_points=True,
+            )
         object_index = list(object_ids).index(1)
         _write_mask(output_directory / f"{anchor:06d}.png", anchor_logits[object_index])
 

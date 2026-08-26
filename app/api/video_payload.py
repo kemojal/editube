@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import Annotation, Comment, Project, Video, VideoTranscription
 from app.services.project_access import can_moderate_video_comments
+from app.services.video_status import decision_summary, normalize_status
 
 
 def _comment_row_visible_to_viewer(
@@ -44,6 +45,7 @@ def transcription_to_dict(tr: VideoTranscription | None) -> dict[str, Any] | Non
         "segments": segments,
         "speakers": speakers,
         "speaker_count": tr.speaker_count if tr.speaker_count is not None else 0,
+        "audio_analysis": getattr(tr, "audio_analysis", None),
         "error_message": tr.error_message,
         "updated_at": tr.updated_at,
         "language": tr.language,
@@ -111,6 +113,7 @@ def video_versions_payload(db: Session, video: Video) -> list[dict[str, Any]]:
             "duration": v.duration,
             "comment_count": comment_counts.get(v.id, 0),
             "uploader_name": v.uploader.name if v.uploader else None,
+            "status": normalize_status(v.status),
         }
         for v in versions
     ]
@@ -152,7 +155,13 @@ def video_detail_dict(
         "version": video.version,
         "file_path": video.file_path,
         "thumbnail_url": video.thumbnail_url,
-        "status": video.status or "in_progress",
+        # Normalized, so the UI never offers actions the service would refuse:
+        # legacy rows still hold values like 'ready'.
+        "status": normalize_status(video.status),
+        "status_changed_at": getattr(video, "status_changed_at", None),
+        "review_due_at": getattr(video, "review_due_at", None),
+        "version_notes": getattr(video, "version_notes", None),
+        "decision": decision_summary(db, video) if db is not None else None,
         "duration": video.duration,
         "uploader": video.uploader,
         "created_at": video.created_at,

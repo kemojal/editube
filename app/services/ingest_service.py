@@ -68,6 +68,12 @@ def _probe_media(file_path: str) -> dict:
         return {}
 
 
+def probe_media_file(file_path: str) -> dict:
+    """Public entry point for `_probe_media` — the workspace library needs the
+    same duration/dimension read for the assets it stores."""
+    return _probe_media(file_path)
+
+
 def ingest_upload(
     db: Session,
     user_id: int,

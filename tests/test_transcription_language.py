@@ -23,7 +23,17 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import Comment, Annotation, Folder, Project, User, Video, VideoTranscription
+from app.db.models import (
+    ActivityFeed,
+    Comment,
+    Annotation,
+    Folder,
+    Project,
+    User,
+    Video,
+    VideoApproval,
+    VideoTranscription,
+)
 from app.utils.language import normalize_language
 
 
@@ -65,6 +75,14 @@ class _SqliteDbTestCase(unittest.TestCase):
         VideoTranscription.__table__,
         Comment.__table__,
         Annotation.__table__,
+        # video_detail_dict now reports the latest review decision, so the
+        # payload reads this table. (The shared `db_session` fixture in
+        # conftest.py builds the whole public schema and avoids this class of
+        # breakage — prefer it for new tests.)
+        VideoApproval.__table__,
+        # Uploading a new version resets the cut to in_review, and that status
+        # change is logged.
+        ActivityFeed.__table__,
     ]
 
     def setUp(self) -> None:
@@ -255,6 +273,7 @@ class UploadVideoLanguageTests(_SqliteDbTestCase):
                 description=None,
                 folder_id=None,
                 version_of=None,
+                version_notes=None,
                 language="JA",
                 db=self.db,
                 current_user=self.user,
@@ -306,6 +325,7 @@ class UploadVideoLanguageTests(_SqliteDbTestCase):
                 description=None,
                 folder_id=None,
                 version_of=None,
+                version_notes=None,
                 language=None,
                 db=self.db,
                 current_user=self.user,
@@ -370,6 +390,7 @@ class UploadVideoVersionOfTests(_SqliteDbTestCase):
                 description=None,
                 folder_id=None,
                 version_of=self.video.id,
+                version_notes=None,
                 language=None,
                 db=self.db,
                 current_user=self.user,

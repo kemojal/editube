@@ -26,6 +26,31 @@ RUNNABLE_ENGINES: set[str] = {"faster-whisper"}
 #: Model used when the user has expressed no preference.
 DEFAULT_TRANSCRIPTION_MODEL = "parakeet-v3"
 
+#: Sizes faster-whisper can actually load; guards WHISPER_FALLBACK_SIZE typos.
+_VALID_WHISPER_SIZES: set[str] = {
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+    "medium", "medium.en", "large-v1", "large-v2", "large-v3",
+    "large-v3-turbo", "turbo", "distil-large-v3",
+}
+
+
+def _fallback_size_override(model: "TranscriptionModel") -> str | None:
+    """Deployment-wide floor for stand-in runs (WHISPER_FALLBACK_SIZE).
+
+    A model's `fallback_whisper` is a per-model guess at "closest Whisper
+    build"; boxes with headroom can raise every stand-in at once (e.g.
+    `medium`, or `large-v3` on GPU) without touching the catalog or the
+    user's picker choice. Explicit faster-whisper selections are untouched —
+    the user asked for that exact build. English-only overrides (`*.en`) are
+    ignored for multilingual models so the stand-in never loses languages.
+    """
+    configured = (os.getenv("WHISPER_FALLBACK_SIZE") or "").strip()
+    if not configured or configured not in _VALID_WHISPER_SIZES:
+        return None
+    if configured.endswith(".en") and model.languages != "en":
+        return None
+    return configured
+
 
 @dataclass(frozen=True)
 class TranscriptionModel:
@@ -67,7 +92,9 @@ class TranscriptionModel:
             # stand-in, which is a detail for support, not a reason to disable.
             "available": True,
             "engine_ready": self.available,
-            "runs_on": self.engine if self.available else f"faster-whisper ({self.fallback_whisper})",
+            "runs_on": self.engine
+            if self.available
+            else f"faster-whisper ({_fallback_size_override(self) or self.fallback_whisper})",
             "badges": list(self.badges),
         }
 
@@ -354,13 +381,18 @@ def resolve_runtime(model_id: str | None) -> tuple[TranscriptionModel, str, bool
     Returns ``(model, whisper_size, is_fallback)``. ``is_fallback`` is True when
     the chosen model's engine has no adapter here and Whisper stands in for it —
     the caller logs that so a "why does Parakeet sound like Whisper" question has
-    an answer in the worker output.
+    an answer in the worker output. Stand-in runs honour WHISPER_FALLBACK_SIZE
+    (see `_fallback_size_override`); explicit Whisper picks run exactly what the
+    user chose.
     """
     model = get_transcription_model(model_id) or get_transcription_model(
         default_transcription_model_id()
     )
     assert model is not None  # the default id is always in the catalog
-    return model, model.fallback_whisper, not model.available
+    size = model.fallback_whisper
+    if not model.available:
+        size = _fallback_size_override(model) or size
+    return model, size, not model.available
 
 
 def transcription_catalog_payload() -> list[dict]:

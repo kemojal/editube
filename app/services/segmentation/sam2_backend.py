@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import threading
+from collections import OrderedDict
 from typing import Any
 
 from .base import SegmentationError, module_available
@@ -127,6 +128,58 @@ _PREDICTOR_LOCK = threading.Lock()
 #: each that is barely visible, and it is what a single GPU wants anyway.
 _INFERENCE_LOCK = threading.Lock()
 
+#: Image embeddings by (model, device, pid, frame key), newest last.
+#:
+#: `set_image` runs the image encoder, and that — not the mask decoder — is
+#: essentially the whole cost of a click: the decoder is milliseconds, the
+#: encoder hundreds of them on tiny and seconds on large. The refine loop asks
+#: about one frame repeatedly (click, alt-click, brush, click again), so
+#: re-encoding it every time meant the second click cost exactly as much as the
+#: first for no new information.
+#:
+#: What is stored is the predictor's own post-`set_image` state, restored onto
+#: it in place of the call. That is safe only because `_INFERENCE_LOCK`
+#: serialises everything that reads or writes that state — the same invariant
+#: that already made a shared stateful predictor usable at all.
+#:
+#: Two entries: a 1080p tiny embedding is ~16MB, and the working set is "the
+#: frame being refined", not a history.
+_EMBEDDINGS: "OrderedDict[tuple[str, str, int, str], dict[str, Any]]" = OrderedDict()
+_EMBEDDING_LIMIT = 2
+
+
+def _set_image_cached(predictor: Any, frame_rgb: Any, cache_key: tuple | None) -> None:
+    """`predictor.set_image(frame_rgb)`, skipped when this frame is already encoded.
+
+    Must be called with `_INFERENCE_LOCK` held.
+    """
+    if cache_key is None:
+        predictor.set_image(frame_rgb)
+        return
+
+    cached = _EMBEDDINGS.get(cache_key)
+    if cached is not None:
+        _EMBEDDINGS.move_to_end(cache_key)
+        predictor._features = cached["features"]
+        predictor._orig_hw = cached["orig_hw"]
+        predictor._is_image_set = True
+        predictor._is_batch = False
+        return
+
+    predictor.set_image(frame_rgb)
+    _EMBEDDINGS[cache_key] = {
+        "features": predictor._features,
+        "orig_hw": predictor._orig_hw,
+    }
+    while len(_EMBEDDINGS) > _EMBEDDING_LIMIT:
+        _EMBEDDINGS.popitem(last=False)
+
+
+def clear_embeddings() -> None:
+    """Drops cached image embeddings. For tests; not part of the request path."""
+    with _INFERENCE_LOCK:
+        _EMBEDDINGS.clear()
+
 
 def _load_predictor(model_id: str, device: str, owner_pid: int):
     """Returns a cached predictor, constructing at most one at a time.
@@ -167,6 +220,9 @@ def clear_predictors() -> None:
     """Drops cached predictors. For tests; not part of the request path."""
     with _PREDICTOR_LOCK:
         _PREDICTORS.clear()
+    # Embeddings are keyed by the predictor that produced them and are useless —
+    # and, restored onto a fresh predictor, wrong — once it is gone.
+    clear_embeddings()
 
 
 def warm_up(*, quality: str = "faster") -> None:
@@ -187,6 +243,7 @@ def segment_at_points(
     *,
     quality: str = "faster",
     box: tuple[float, float, float, float] | None = None,
+    frame_key: str | None = None,
 ):
     """Returns a uint8 matte (0..255) for `frame_rgb` given normalised prompts.
 
@@ -243,8 +300,12 @@ def segment_at_points(
     # set_image and predict must be one atomic unit — see _INFERENCE_LOCK. The
     # predictor carries the frame's embeddings between the two calls, so letting
     # another thread in between segments the wrong frame.
+    model_id = MODEL_IDS.get(quality, MODEL_IDS["faster"])
+    cache_key = (
+        (model_id, device, os.getpid(), frame_key) if frame_key is not None else None
+    )
     with _INFERENCE_LOCK, torch.inference_mode(), context:
-        predictor.set_image(frame_rgb)
+        _set_image_cached(predictor, frame_rgb, cache_key)
         masks, scores, _ = predictor.predict(
             point_coords=point_coords,
             point_labels=point_labels,
@@ -259,3 +320,72 @@ def segment_at_points(
     mask = masks[best]
 
     return (mask.astype(np.uint8) * 255)
+
+
+def segment_prompt_groups(
+    frame_rgb: Any,
+    positive_groups: Any,
+    negative_points: Any = (),
+    *,
+    quality: str = "faster",
+    frame_key: str | None = None,
+):
+    """Segments additive prompt groups independently and unions their mattes.
+
+    SAM interprets several positive points in one prediction as descriptions of
+    one object. That is useful for tightening one object, but wrong for the
+    editor's Add tool: a second mark is expected to preserve the first region
+    and expand the mask. One image embedding is reused for all groups, so this
+    has correct additive semantics without re-encoding the frame per mark.
+    """
+    groups = [tuple(group) for group in positive_groups if group]
+    negatives = tuple(negative_points or ())
+    if not groups:
+        raise SegmentationError("Click the subject to select it first.")
+    if not is_installed():
+        raise SegmentationError(
+            "Point-based selection needs SAM 2, which is not installed on this "
+            "server. Run `pip install torch sam2` in the API environment and "
+            "restart the worker."
+        )
+
+    _assert_fork_safe()
+
+    import numpy as np
+    import torch
+
+    height, width = frame_rgb.shape[:2]
+    device = pick_device()
+    predictor = _load_predictor(
+        MODEL_IDS.get(quality, MODEL_IDS["faster"]), device, os.getpid()
+    )
+    context = (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if device == "cuda"
+        else torch.inference_mode()
+    )
+
+    model_id = MODEL_IDS.get(quality, MODEL_IDS["faster"])
+    cache_key = (
+        (model_id, device, os.getpid(), frame_key) if frame_key is not None else None
+    )
+    union = np.zeros((height, width), dtype=bool)
+    with _INFERENCE_LOCK, torch.inference_mode(), context:
+        _set_image_cached(predictor, frame_rgb, cache_key)
+        for group in groups:
+            points = list(group) + list(negatives)
+            coords = np.asarray(
+                [[x * width, y * height] for x, y in points], dtype=np.float32
+            )
+            labels = np.asarray(
+                [1] * len(group) + [0] * len(negatives), dtype=np.int32
+            )
+            masks, scores, _ = predictor.predict(
+                point_coords=coords,
+                point_labels=labels,
+                box=None,
+                multimask_output=True,
+            )
+            union |= masks[int(np.argmax(scores))].astype(bool)
+
+    return union.astype(np.uint8) * 255

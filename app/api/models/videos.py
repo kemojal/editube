@@ -1,6 +1,6 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import Optional, List, Any
+from typing import Literal, Optional, List, Any
 
 
 class VideoBase(BaseModel):
@@ -16,6 +16,41 @@ class VideoUpdate(VideoBase):
 
 class VideoStatusUpdate(BaseModel):
     status: str  # in_progress, in_review, approved, needs_changes
+
+
+class SendForReviewRequest(BaseModel):
+    """POST /projects/{project_id}/videos/{video_id}/send-for-review."""
+
+    # Empty means "whoever owns the work" — a solo creator should not have to
+    # nominate themselves as a reviewer to send their own cut out.
+    reviewer_user_ids: Optional[List[int]] = None
+    due_at: Optional[datetime] = None
+    note: Optional[str] = None
+
+
+class ReviewDecisionRequest(BaseModel):
+    """POST /videos/{video_id}/review-decision."""
+
+    decision: Literal["approved", "changes_requested"]
+    note: Optional[str] = None
+    # "Approve with notes": sign off despite open change requests. Clients
+    # approve with two nits outstanding constantly, and forcing a fake extra
+    # round to express that is worse than recording it honestly.
+    override_blockers: bool = False
+
+
+class ApprovalBlockerResponse(BaseModel):
+    code: str
+    message: str
+    count: Optional[int] = None
+
+
+class VideoDecisionSummary(BaseModel):
+    decision: str
+    actor_name: Optional[str] = None
+    note: Optional[str] = None
+    created_at: Optional[datetime] = None
+    superseded: bool = False
 
 
 class YoutubeVideoCreate(BaseModel):
@@ -38,6 +73,12 @@ class VideoFromUploadCreate(BaseModel):
     # Spoken language for transcription, ISO 639-1 (e.g. "en"). "auto"/""/absent = auto-detect.
     language: Optional[str] = None
     size_bytes: Optional[int] = None
+    # When set, this registration becomes the next version in that video's
+    # chain — same semantics as the multipart route's `version_of` form field,
+    # so the resumable browser-to-storage path gets carry-forward, approval
+    # superseding, and new-version notifications for free.
+    version_of: Optional[int] = None
+    version_notes: Optional[str] = None
 
 
 class VideoTranscriptionNested(BaseModel):
@@ -47,6 +88,9 @@ class VideoTranscriptionNested(BaseModel):
     segments: Optional[List[Any]] = None
     speakers: Optional[List[str]] = None
     speaker_count: Optional[int] = None
+    # Silero-VAD speech/silence ranges over the source audio (see
+    # VideoTranscription.audio_analysis). None for pre-existing transcripts.
+    audio_analysis: Optional[dict] = None
     error_message: Optional[str] = None
     updated_at: Optional[datetime] = None
     # User-requested spoken language (ISO 639-1). None = auto-detect.
@@ -78,6 +122,12 @@ class VideoDetailResponse(BaseModel):
     file_path: str
     thumbnail_url: str | None = None
     status: str
+    # Null on rows that predate the status spine — we genuinely do not know
+    # when those last moved, and inventing a timestamp would be a lie.
+    status_changed_at: Optional[datetime] = None
+    review_due_at: Optional[datetime] = None
+    version_notes: Optional[str] = None
+    decision: Optional[VideoDecisionSummary] = None
     duration: int | None = None
     uploader: UploaderResponse
     created_at: datetime
@@ -116,6 +166,9 @@ class VideoVersionSummary(BaseModel):
     duration: int | None = None
     comment_count: int = 0
     uploader_name: str | None = None
+    # Lets the version switcher answer "which cut was actually approved?"
+    # without a request per version.
+    status: str = "in_progress"
 
     class Config:
         orm_mode = True

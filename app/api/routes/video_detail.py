@@ -1,14 +1,35 @@
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db.database import get_db
 from app.db.models import Project, Video, User
-from app.api.models.videos import VideoWithProjectResponse, VideoDetailResponse
+from app.api.models.videos import (
+    ReviewDecisionRequest,
+    VideoDetailResponse,
+    VideoStatusUpdate,
+    VideoWithProjectResponse,
+)
 from app.api.video_payload import video_detail_dict, video_versions_payload
 from app.utils.security import get_current_user
+from app.services.comment_workflow import video_approve_blockers
+from app.services.notifications import (
+    TYPE_CHANGES_REQUESTED,
+    TYPE_VIDEO_APPROVED,
+    NotificationSpec,
+    emit_notifications,
+)
 from app.services.transcription_enqueue import prepare_and_enqueue_transcription
+from app.services.video_status import (
+    DECISION_APPROVED,
+    IllegalStatusTransition,
+    InvalidVideoStatus,
+    apply_video_status,
+    record_decision,
+)
+from app.services.word_alignment import realign_words_to_text
 from app.services.project_access import assert_write_project_content, can_access_project
 from app.services.youtube_stream_resolve import (
     YoutubeStreamResolveError,
@@ -84,6 +105,102 @@ def start_video_transcription(
     assert_write_project_content(db, current_user, db_project)
 
     prepare_and_enqueue_transcription(db, video_id, force=force, language=language)
+
+    db_video = (
+        db.query(Video)
+        .options(
+            joinedload(Video.uploader),
+            joinedload(Video.transcription),
+            selectinload(Video.comments),
+            selectinload(Video.annotations),
+        )
+        .filter(Video.id == video_id)
+        .first()
+    )
+    return _video_with_project_payload(db, db_video, current_user.id)
+
+
+class TranscriptSegmentEdit(BaseModel):
+    """One corrected cue, addressed by its position in the segment list."""
+
+    index: int = Field(ge=0)
+    text: str = Field(max_length=5000)
+
+
+class TranscriptSegmentsUpdate(BaseModel):
+    edits: list[TranscriptSegmentEdit] = Field(min_length=1, max_length=200)
+
+
+@router.patch("/{video_id}/transcription/segments", response_model=VideoWithProjectResponse)
+def update_transcription_segments(
+    video_id: int,
+    body: TranscriptSegmentsUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Correct the text of individual transcript cues.
+
+    Only `text` is writable. Timings and speaker attribution come from the
+    model and stay put — this exists so a human can fix a misheard word, not
+    re-cut the transcript.
+
+    Edits are addressed by index rather than replacing the whole array: two
+    people correcting different lines would otherwise overwrite each other with
+    whatever their tab last loaded.
+    """
+    db_video = (
+        db.query(Video)
+        .options(joinedload(Video.transcription))
+        .filter(Video.id == video_id)
+        .first()
+    )
+    if not db_video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    db_project = db.query(Project).filter(Project.id == db_video.project_id).first()
+    if not can_access_project(db, current_user.id, db_project):
+        raise HTTPException(status_code=403, detail="Not authorized to access this video")
+    assert_write_project_content(db, current_user, db_project)
+
+    transcription = db_video.transcription
+    if not transcription or not isinstance(transcription.segments, list):
+        raise HTTPException(status_code=404, detail="This video has no transcript yet")
+
+    # Copy, mutate, reassign: SQLAlchemy does not track in-place edits to a
+    # JSONB column, so mutating the loaded list would never be written back.
+    segments = [dict(segment) for segment in transcription.segments]
+
+    for edit in body.edits:
+        if edit.index >= len(segments):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Segment {edit.index} does not exist in this transcript",
+            )
+        segment = segments[edit.index]
+        new_text = edit.text.strip()
+        # Per-word timings were produced for the original wording. Realign
+        # them to the corrected text: unchanged words keep their real ASR
+        # timings, rewritten spans inherit the replaced words' time envelope.
+        # Only when nothing usable survives is `words` dropped.
+        try:
+            seg_start = float(segment.get("start") or 0.0)
+            seg_end = float(segment.get("end") or seg_start)
+            realigned = realign_words_to_text(
+                new_text,
+                segment.get("words"),
+                seg_start=seg_start,
+                seg_end=seg_end,
+            )
+        except Exception:
+            realigned = None
+        segment["text"] = new_text
+        if realigned:
+            segment["words"] = realigned
+        else:
+            segment.pop("words", None)
+        segment["edited"] = True
+
+    transcription.segments = segments
+    db.commit()
 
     db_video = (
         db.query(Video)
@@ -175,18 +292,9 @@ def refresh_video_stream(
     return {"video_id": db_video.id, "file_path": db_video.file_path}
 
 
-@router.put("/{video_id}/status", response_model=VideoDetailResponse)
-def update_video_status(
-    video_id: int,
-    data: dict,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    valid_statuses = ("in_progress", "in_review", "approved", "needs_changes")
-    status = data.get("status")
-    if status not in valid_statuses:
-        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
-
+def _load_video_for_write(video_id: int, db: Session, current_user: User):
+    """Fetch a video with the player's eager loads, and assert the caller may
+    change it. Shared by the status and decision handlers."""
     db_video = (
         db.query(Video)
         .options(
@@ -205,21 +313,94 @@ def update_video_status(
     if not can_access_project(db, current_user.id, db_project):
         raise HTTPException(status_code=403, detail="Not authorized")
     assert_write_project_content(db, current_user, db_project)
+    return db_video, db_project
 
-    db_video.status = status
+
+@router.put("/{video_id}/status", response_model=VideoDetailResponse)
+def update_video_status(
+    video_id: int,
+    data: VideoStatusUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Project-scoped twin lives in `app/api/routes/videos.py`.
+
+    Both now delegate to the same service, so the two can no longer disagree
+    about what a valid status is — which they did, via two hand-maintained
+    copies of the same tuple. The body was also an untyped `dict` here.
+    """
+    db_video, db_project = _load_video_for_write(video_id, db, current_user)
+
+    try:
+        apply_video_status(db, db_video, data.status, actor_user_id=current_user.id)
+    except (InvalidVideoStatus, IllegalStatusTransition) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     db.commit()
     db.refresh(db_video)
-    db_video = (
-        db.query(Video)
-        .options(
-            joinedload(Video.uploader),
-            joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
-        )
-        .filter(Video.id == video_id)
-        .first()
+    return _video_detail(db_video, current_user.id, db=db, db_project=db_project)
+
+
+@router.post("/{video_id}/review-decision", response_model=VideoDetailResponse)
+async def submit_review_decision(
+    video_id: int,
+    data: ReviewDecisionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Approve a cut, or send it back with changes.
+
+    The team-side counterpart to `POST /review/{token}/approve`. Both write a
+    `VideoApproval` row and move `Video.status` through the same service, which
+    is what makes approval one mechanism rather than several.
+    """
+    db_video, db_project = _load_video_for_write(video_id, db, current_user)
+
+    if data.decision == DECISION_APPROVED and not data.override_blockers:
+        blockers = video_approve_blockers(db, db_video)
+        if blockers:
+            # 409, not 400: the request is well-formed, the world just isn't
+            # ready for it — and the client can retry with override_blockers.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": blockers[0].get("message", "Approval blocked"),
+                    "blockers": blockers,
+                },
+            )
+
+    record_decision(
+        db,
+        db_video,
+        data.decision,
+        actor_user_id=current_user.id,
+        note=data.note,
     )
-    return _video_detail(
-        db_video, current_user.id, db=db, db_project=db_project
+    db.commit()
+    db.refresh(db_video)
+
+    actor_name = current_user.name or current_user.email or "A teammate"
+    recipients = {db_project.creator_id, db_video.uploader_id}
+    recipients.discard(None)
+    recipients.discard(current_user.id)
+    approved = data.decision == DECISION_APPROVED
+    await emit_notifications(
+        db,
+        [
+            NotificationSpec(
+                user_id=uid,
+                type=TYPE_VIDEO_APPROVED if approved else TYPE_CHANGES_REQUESTED,
+                project_id=db_project.id,
+                video_id=db_video.id,
+                actor_user_id=current_user.id,
+                message=(
+                    f"{actor_name} approved {db_video.name}"
+                    if approved
+                    else f"{actor_name} requested changes on {db_video.name}"
+                ),
+            )
+            for uid in recipients
+        ],
     )
+
+    return _video_detail(db_video, current_user.id, db=db, db_project=db_project)

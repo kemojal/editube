@@ -277,22 +277,24 @@ class AnalyzeSegmentsRealWordBoundaryTests(unittest.TestCase):
         even_division_start = max(0, 0.0 + 1 * 0.4 - 0.03)
         self.assertGreater(abs(filler["start"] - even_division_start), 0.5)
 
-    def test_falls_back_to_even_division_when_words_absent(self):
+    def test_falls_back_to_char_proportional_when_words_absent(self):
         segments = [
             {"start": 0.0, "end": 2.0, "text": "hello um there we go"},
         ]
         analysis = _analyze_segments(segments, duration=2.0)
         filler = next(s for s in analysis["suggestions"] if s["kind"] == "filler")
 
-        span = 2.0 / 5
-        expected_start = max(0, 0.0 + 1 * span - 0.03)
-        expected_end = min(2.0, 0.0 + 1 * span + span + 0.03)
-        self.assertAlmostEqual(filler["start"], expected_start, places=3)
-        self.assertAlmostEqual(filler["end"], expected_end, places=3)
+        # Without word timestamps the estimate is character-proportional
+        # interpolation across the segment: "hello um there we go" has 16
+        # letters, "um" spans chars [5, 7) => [0.625, 0.875) of 2.0s.
+        self.assertAlmostEqual(filler["start"], 2.0 * (5 / 16) - 0.03, places=3)
+        self.assertAlmostEqual(filler["end"], 2.0 * (7 / 16) + 0.03, places=3)
 
-    def test_falls_back_when_word_count_mismatches_text_split(self):
-        # words[] has 3 entries but the segment text tokenizes to 5 words —
-        # trusting the mismatched list would misindex, so this must fall back.
+    def test_count_mismatch_recovers_timing_via_alignment(self):
+        # words[] has 3 entries but the segment text tokenizes to 5 words.
+        # The old guard threw all timings away; fuzzy alignment instead
+        # recognizes "hello um there" as the concatenation of three tokens
+        # and splits its real [0.0, 1.0] span among them proportionally.
         segments = [
             {
                 "start": 0.0,
@@ -308,9 +310,9 @@ class AnalyzeSegmentsRealWordBoundaryTests(unittest.TestCase):
         analysis = _analyze_segments(segments, duration=2.0)
         filler = next(s for s in analysis["suggestions"] if s["kind"] == "filler")
 
-        span = 2.0 / 5
-        expected_start = max(0, 0.0 + 1 * span - 0.03)
-        self.assertAlmostEqual(filler["start"], expected_start, places=3)
+        # "um" is chars [5, 7) of the 12-letter merged word spanning [0, 1.0]:
+        self.assertAlmostEqual(filler["start"], 1.0 * (5 / 12) - 0.03, places=3)
+        self.assertAlmostEqual(filler["end"], 1.0 * (7 / 12) + 0.03, places=3)
 
     def test_malformed_word_entries_fall_back_cleanly(self):
         segments = [
@@ -327,12 +329,12 @@ class AnalyzeSegmentsRealWordBoundaryTests(unittest.TestCase):
                 ],
             }
         ]
-        # Should not raise, and should fall back to even division.
+        # Should not raise; the poisoned words list is rejected whole and the
+        # estimate degrades to character-proportional interpolation.
         analysis = _analyze_segments(segments, duration=2.0)
         filler = next(s for s in analysis["suggestions"] if s["kind"] == "filler")
-        span = 2.0 / 5
-        expected_start = max(0, 0.0 + 1 * span - 0.03)
-        self.assertAlmostEqual(filler["start"], expected_start, places=3)
+        self.assertAlmostEqual(filler["start"], 2.0 * (5 / 16) - 0.03, places=3)
+        self.assertAlmostEqual(filler["end"], 2.0 * (7 / 16) + 0.03, places=3)
 
 
 class TranscriptionPayloadWordsPassthroughTests(unittest.TestCase):

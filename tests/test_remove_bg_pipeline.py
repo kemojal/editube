@@ -14,6 +14,7 @@ from app.jobs.rough_cut_effect import (
     build_chroma_key_command,
 )
 from app.jobs.rough_cut_export import (
+    _approved_audio_ranges,
     _approved_processed_ranges,
     _masked_filter_complex,
     _video_segment_command,
@@ -103,6 +104,27 @@ class RemoveBgExportContractTests(unittest.TestCase):
         self.assertIn("1:a?", command)
         self.assertIn("[bg][cutout]overlay=shortest=1[v]", " ".join(command))
 
+    def test_enhanced_audio_uses_original_only_for_video(self):
+        command = _video_segment_command(
+            video_source="source.mp4",
+            audio_source="enhanced.m4a",
+            source_start=4.0,
+            duration=2.0,
+            vf="format=rgba,scale=64:64",
+            scale_w=64,
+            scale_h=64,
+            crf=23,
+            output=Path("out.mp4"),
+            processed=False,
+            audio_processed=True,
+        )
+        self.assertEqual(
+            command[:8],
+            ["ffmpeg", "-y", "-ss", "4.0", "-i", "source.mp4", "-i", "enhanced.m4a"],
+        )
+        self.assertIn("1:a?", command)
+        self.assertIn("0:v", command)
+
     def test_an_additional_mask_multiplies_existing_cutout_alpha(self):
         graph = _masked_filter_complex("format=rgba,scale=64:64", 64, 64, matte_input=2)
         self.assertIn("alphaextract[source_alpha]", graph)
@@ -129,6 +151,35 @@ class RemoveBgExportContractTests(unittest.TestCase):
             ],
         )
         self.assertEqual(result, {(2.0, 5.0): "https://cdn.example/owned.webm"})
+
+    def test_enhanced_audio_is_resolved_by_owned_result_id_and_exact_timing(self):
+        rows = [
+            SimpleNamespace(
+                id=81,
+                result_data={
+                    "effectType": "audio",
+                    "clipTarget": {"start": 2.0, "end": 5.0},
+                    "outputUrl": "https://cdn.example/enhanced.m4a",
+                },
+            )
+        ]
+        db = SimpleNamespace(query=lambda _model: _Query(rows))
+        self.assertEqual(
+            _approved_audio_ranges(
+                db,
+                7,
+                [{"start": 2, "end": 5, "enhancedResultId": 81}],
+            ),
+            {(2.0, 5.0): {"source": "https://cdn.example/enhanced.m4a"}},
+        )
+        self.assertEqual(
+            _approved_audio_ranges(
+                db,
+                7,
+                [{"start": 2, "end": 6, "enhancedResultId": 81}],
+            ),
+            {},
+        )
 
     def test_completed_retouch_visual_is_accepted_only_with_matching_effect_type(self):
         rows = [

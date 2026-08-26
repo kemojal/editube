@@ -6,12 +6,14 @@ import math
 import mimetypes
 import os
 import secrets
+import shutil
+import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import List
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from sqlalchemy import exists, func, or_
 from urllib.parse import quote
 from sqlalchemy.orm import Session, joinedload
@@ -61,12 +63,32 @@ from app.db.models import (
 )
 from app.services.project_access import get_workspace_member
 from app.services.workspace_roles import normalize_invite_role
+
+
+def _seat_cap_detail(exc: SeatCapExceeded) -> str:
+    return (
+        f"Your plan includes {exc.cap} seat{'s' if exc.cap != 1 else ''} and "
+        f"{exc.used} are in use (pending invites count). Upgrade to add more people."
+    )
 from app.services.workspace_permissions import (
     can_edit_workspace_branding,
     can_manage_workspace_members,
 )
 from app.services.dns_domain_verify import verify_editube_domain_txt
 from app.services.workspace_bootstrap import ensure_personal_workspace
+from app.services.storage_policy import (
+    SeatCapExceeded,
+    assert_seat_available,
+    assert_storage_upload_allowed,
+)
+from app.services.workspace_library import (
+    ALLOWED_ASSET_CATEGORIES,
+    asset_payload,
+    category_for_mime,
+    is_remote,
+    library_feed,
+    store_asset_file,
+)
 from app.utils.email import send_workspace_invite_email, send_workspace_provisioned_account_email
 from app.utils.security import get_current_user, get_password_hash
 from app.services.oidc_sso import discover_oidc_metadata
@@ -76,10 +98,6 @@ from app.websocket_manager import notifications_ws_manager
 
 router = APIRouter(prefix="/workspaces", tags=["Workspaces"])
 
-ASSET_UPLOAD_SUBDIR = "workspace_assets"
-ALLOWED_ASSET_CATEGORIES = frozenset(
-    {"logo", "lut", "music", "sfx", "lower_third", "other"}
-)
 
 
 def _utcnow() -> datetime:
@@ -442,11 +460,20 @@ async def create_invite(
                 detail="That user is already a member of this workspace",
             )
 
+    # Superseding this address's own outstanding invite first, so re-inviting
+    # someone does not read as claiming a second seat.
     db.query(WorkspaceInvite).filter(
         WorkspaceInvite.workspace_id == workspace_id,
         WorkspaceInvite.email == email,
         WorkspaceInvite.accepted_at.is_(None),
     ).delete(synchronize_session=False)
+    db.flush()
+
+    try:
+        assert_seat_available(db, workspace_id)
+    except SeatCapExceeded as exc:
+        db.rollback()
+        raise HTTPException(status_code=402, detail=_seat_cap_detail(exc)) from exc
 
     raw = secrets.token_urlsafe(24)
     invite_role = normalize_invite_role(body.role)
@@ -620,6 +647,17 @@ def accept_invite(
         db.commit()
         return {"ok": True, "workspace_id": inv.workspace_id}
     member_role = normalize_invite_role(inv.role)
+    # Checked again at acceptance, not just at send: the owner's plan can lapse
+    # between the two, and invites outlive a downgrade by up to 14 days. The
+    # invite being accepted is already counted in `used`, so the seat it holds
+    # is the one being converted rather than an extra.
+    try:
+        assert_seat_available(db, inv.workspace_id, adding=0)
+    except SeatCapExceeded as exc:
+        raise HTTPException(
+            status_code=402,
+            detail="This workspace has no seats available. Ask the owner to upgrade.",
+        ) from exc
     db.add(
         WorkspaceMember(
             workspace_id=inv.workspace_id,
@@ -678,6 +716,13 @@ def provision_workspace_member(
     member_role = normalize_invite_role(body.role)
     inviter_name = current_user.name or current_user.email or "Workspace owner"
     login_url = f"{_public_app_base()}/login"
+
+    # Provisioning creates a member directly, bypassing the invite flow — so it
+    # needs its own seat check or it is simply a way around the cap.
+    try:
+        assert_seat_available(db, workspace_id)
+    except SeatCapExceeded as exc:
+        raise HTTPException(status_code=402, detail=_seat_cap_detail(exc)) from exc
 
     existing = db.query(User).filter(func.lower(User.email) == email).first()
     if existing:
@@ -798,24 +843,46 @@ def list_assets(
         .order_by(WorkspaceAsset.created_at.desc())
         .all()
     )
-    return [
-        {
-            "id": a.id,
-            "category": a.category,
-            "title": a.title,
-            "file_url": a.file_url,
-            "extra": a.extra,
-            "created_at": a.created_at.isoformat() if a.created_at else None,
-        }
-        for a in rows
-    ]
+    return [asset_payload(a, workspace_id=workspace_id) for a in rows]
+
+
+@router.get("/{workspace_id}/library")
+def workspace_library(
+    workspace_id: int,
+    kind: str = Query("all"),
+    source: str = Query("all"),
+    q: str = Query(""),
+    sort: str = Query("recent"),
+    limit: int = Query(48, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Every asset the workspace holds — library uploads *and* project cuts.
+
+    The two lived in different tables with no combined view, so "all my
+    uploads" was a question the product could not answer.
+    """
+    _workspace_or_404(db, workspace_id)
+    wm = _require_workspace_member(db, workspace_id, current_user)
+    return library_feed(
+        db,
+        workspace_id=workspace_id,
+        member_role=wm.role,
+        kind=kind,
+        source=source,
+        q=q,
+        sort=sort,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.post("/{workspace_id}/assets")
 async def upload_asset(
     workspace_id: int,
     title: str = Form(...),
-    category: str = Form(...),
+    category: str = Form(""),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -824,34 +891,78 @@ async def upload_asset(
     wm = _require_workspace_member(db, workspace_id, current_user)
     if wm.role not in ("owner", "producer", "editor"):
         raise HTTPException(status_code=403, detail="Not allowed to upload assets")
-    from app.utils.storage import UPLOAD_DIRECTORY
 
-    sub = os.path.join(UPLOAD_DIRECTORY, ASSET_UPLOAD_SUBDIR)
-    os.makedirs(sub, exist_ok=True)
-    ext = os.path.splitext(file.filename or "")[1] or ""
-    safe_name = f"{uuid.uuid4().hex}{ext}"
-    dest = os.path.join(sub, safe_name)
-    content = await file.read()
-    with open(dest, "wb") as fh:
-        fh.write(content)
-    rel = dest  # store path consistent with other uploads (relative to cwd)
+    requested_category = (category or "").strip().lower()
+    if requested_category and requested_category not in ALLOWED_ASSET_CATEGORIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid category; allowed: {', '.join(sorted(ALLOWED_ASSET_CATEGORIES))}",
+        )
+
+    # Spool to a temp file first: the size has to be known before the quota
+    # check, and ffprobe needs something on disk to read. Streaming in chunks
+    # keeps a 4 GB b-roll clip out of memory — `await file.read()` held the
+    # whole upload in RAM.
+    tmp_dir = tempfile.mkdtemp(prefix="ws-asset-")
+    tmp_path = os.path.join(tmp_dir, "upload")
+    size_bytes = 0
+    try:
+        with open(tmp_path, "wb") as fh:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size_bytes += len(chunk)
+                fh.write(chunk)
+
+        try:
+            assert_storage_upload_allowed(
+                db,
+                user=current_user,
+                workspace_id=workspace_id,
+                incoming_bytes=size_bytes,
+            )
+        except ValueError:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "Storage cap reached and grace period ended. "
+                    "Upgrade plan or add storage to continue uploads."
+                ),
+            )
+
+        stored = store_asset_file(
+            tmp_path,
+            filename=file.filename,
+            content_type=file.content_type,
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
     a = WorkspaceAsset(
         workspace_id=workspace_id,
-        category=category.strip() or "other",
-        title=title.strip() or "Untitled",
-        file_url=rel,
+        category=requested_category or category_for_mime(stored.mime_type),
+        title=title.strip() or (file.filename or "Untitled"),
+        file_url=stored.file_url,
+        storage_key=stored.storage_key,
+        mime_type=stored.mime_type,
+        size_bytes=stored.size_bytes,
+        duration_ms=stored.duration_ms,
+        width=stored.width,
+        height=stored.height,
         created_by_user_id=current_user.id,
     )
     db.add(a)
     db.commit()
     db.refresh(a)
-    return {"id": a.id, "file_url": a.file_url, "title": a.title, "category": a.category}
+    return asset_payload(a, workspace_id=workspace_id)
 
 
 @router.get("/{workspace_id}/assets/{asset_id}/media")
 def get_workspace_asset_media(
     workspace_id: int,
     asset_id: int,
+    proxy: bool = Query(False),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -866,10 +977,35 @@ def get_workspace_asset_media(
     if not a:
         raise HTTPException(status_code=404, detail="Asset not found")
     path = a.file_url
+    # Assets uploaded since the storage migration live in R2/Cloudinary, so
+    # there is no local file to stream — hand back the object URL instead of
+    # the 404 a path-only check used to produce.
+    if is_remote(path):
+        if proxy:
+            # Small text assets (LUT cubes) are read by the editor itself, and
+            # a redirect to the bucket dies on its CORS policy. Stream them
+            # through this origin instead — bounded, so the proxy cannot be
+            # pointed at multi-gigabyte b-roll.
+            from app.services.lut import MAX_CUBE_BYTES
+
+            if int(a.size_bytes or 0) > MAX_CUBE_BYTES:
+                raise HTTPException(status_code=413, detail="Asset too large to proxy")
+            import urllib.request as _urllib_request
+
+            request = _urllib_request.Request(path, headers={"User-Agent": "editube-server/1.0"})
+            with _urllib_request.urlopen(request, timeout=20) as response:  # noqa: S310 - URL comes from our own asset row
+                blob = response.read(MAX_CUBE_BYTES + 1)
+            if len(blob) > MAX_CUBE_BYTES:
+                raise HTTPException(status_code=413, detail="Asset too large to proxy")
+            return Response(content=blob, media_type=a.mime_type or "application/octet-stream")
+        return RedirectResponse(url=path, status_code=307)
     if not path or not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="File not found")
     media_type, _ = mimetypes.guess_type(path)
-    return FileResponse(path, media_type=media_type or "application/octet-stream")
+    return FileResponse(
+        path,
+        media_type=a.mime_type or media_type or "application/octet-stream",
+    )
 
 
 @router.patch("/{workspace_id}/assets/{asset_id}")
@@ -906,14 +1042,7 @@ def patch_workspace_asset(
         a.category = c
     db.commit()
     db.refresh(a)
-    return {
-        "id": a.id,
-        "category": a.category,
-        "title": a.title,
-        "file_url": a.file_url,
-        "extra": a.extra,
-        "created_at": a.created_at.isoformat() if a.created_at else None,
-    }
+    return asset_payload(a, workspace_id=workspace_id)
 
 
 @router.delete("/{workspace_id}/assets/{asset_id}")

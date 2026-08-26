@@ -11,11 +11,12 @@ import os
 from pathlib import Path
 from typing import BinaryIO
 
-from .base import UploadResult
+from .base import PresignedUpload, UploadResult
 
 # Multipart threshold/chunk — mirror the 6 MB the Cloudinary path used so large
 # videos stream up in parts instead of one giant request.
 _MULTIPART_CHUNK = 6 * 1024 * 1024
+_PRESIGN_TTL_SECONDS = 15 * 60
 
 
 class R2Backend:
@@ -106,6 +107,96 @@ class R2Backend:
 
     def upload_bytes(self, data: bytes, *, key: str, content_type: str) -> UploadResult:
         return self.upload_stream(io.BytesIO(data), key=key, content_type=content_type)
+
+    def create_presigned_upload(
+        self,
+        *,
+        key: str,
+        content_type: str,
+        expires_in: int = _PRESIGN_TTL_SECONDS,
+    ) -> PresignedUpload:
+        """Create a single-use-style PUT target so large browser uploads bypass API disk."""
+        upload_url = self._s3().generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": self._bucket,
+                "Key": key,
+                "ContentType": content_type,
+            },
+            ExpiresIn=expires_in,
+        )
+        return PresignedUpload(
+            upload_url=str(upload_url),
+            public_url=self.public_url(key),
+            key=key,
+            headers={"Content-Type": content_type},
+        )
+
+    # -- multipart (resumable) --------------------------------------------
+    # S3 multipart is what makes browser uploads survivable: each part is its
+    # own request with its own retry, a failure at 90% re-sends one part
+    # instead of starting over, and the single-PUT 5 GB ceiling disappears.
+
+    def create_multipart_upload(self, *, key: str, content_type: str) -> str:
+        response = self._s3().create_multipart_upload(
+            Bucket=self._bucket, Key=key, ContentType=content_type
+        )
+        return str(response["UploadId"])
+
+    def presign_part_urls(
+        self,
+        *,
+        key: str,
+        upload_id: str,
+        part_count: int,
+        expires_in: int = 6 * 60 * 60,
+    ) -> list[str]:
+        """One presigned `upload_part` URL per part, 1-indexed.
+
+        Presigning is local HMAC work — no network round trip per URL — so
+        batching the whole set into the create response costs one request
+        total. Six-hour expiry: a 50 GB upload on a slow hotel line is exactly
+        the case this flow exists for.
+        """
+        s3 = self._s3()
+        return [
+            str(
+                s3.generate_presigned_url(
+                    "upload_part",
+                    Params={
+                        "Bucket": self._bucket,
+                        "Key": key,
+                        "UploadId": upload_id,
+                        "PartNumber": part_number,
+                    },
+                    ExpiresIn=expires_in,
+                )
+            )
+            for part_number in range(1, part_count + 1)
+        ]
+
+    def complete_multipart_upload(
+        self, *, key: str, upload_id: str, parts: list[dict]
+    ) -> str:
+        """`parts` = [{"part_number": n, "etag": "..."}, ...]. Returns the public URL."""
+        self._s3().complete_multipart_upload(
+            Bucket=self._bucket,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={
+                "Parts": [
+                    {"PartNumber": int(p["part_number"]), "ETag": str(p["etag"])}
+                    for p in sorted(parts, key=lambda p: int(p["part_number"]))
+                ]
+            },
+        )
+        return self.public_url(key)
+
+    def abort_multipart_upload(self, *, key: str, upload_id: str) -> None:
+        """Frees the already-uploaded parts, which otherwise bill forever."""
+        self._s3().abort_multipart_upload(
+            Bucket=self._bucket, Key=key, UploadId=upload_id
+        )
 
     # -- reads ------------------------------------------------------------
     def public_url(self, key: str) -> str:

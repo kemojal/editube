@@ -13,6 +13,7 @@ from ..models.users import User as UserSchema, UserCreate, UserUpdate, UserRegis
 from ...db.database import get_db
 from app.db.models import (
     ApiToken,
+    Subscription,
     User,
     UserCaptionFavorite,
     UserSettings,
@@ -61,7 +62,8 @@ from app.services.oidc_sso import (
     fetch_oidc_userinfo,
     validate_oidc_claims,
 )
-from app.services.pricing import normalize_plan_key
+from app.services.entitlements import ENTITLED_STATUSES
+from app.services.pricing import PAID_PLANS, normalize_plan_key, resolve_plan_key
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +341,20 @@ def delete_my_account(
     user.google_sub = None
     user.mfa_required = False
     user.subscription_status = "canceled"
+    # The Stripe cancellation above is best-effort and its webhook may never
+    # arrive for a row we have just anonymized, so drop the entitlement here
+    # too. Content owned by the tombstone otherwise keeps counting against a
+    # paid storage cap nobody is paying for.
+    user.plan = "free"
+    user.stripe_subscription_id = None
+    user.storage_grace_until = None
+    db.query(Subscription).filter(
+        Subscription.user_id == user.id,
+        Subscription.ended_at.is_(None),
+    ).update(
+        {"status": "canceled", "ended_at": now, "cancel_at_period_end": True},
+        synchronize_session=False,
+    )
 
     db.commit()
 
@@ -1176,10 +1192,41 @@ def onboarding_update_plan(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Persist selected plan before Checkout. Onboarding completes after Stripe webhook."""
-    normalized = normalize_plan_key(data.plan)
-    if normalized not in ("free", "pro", "scale", "enterprise"):
+    """Record the plan the user picked in onboarding, before Checkout.
+
+    This wrote `current_user.plan` directly, which is the field every quota in
+    the app reads — `storage_policy`, `ugc_credits`, seat caps. So any
+    authenticated user could `PUT {"plan": "scale"}` and hand themselves a 5 TB
+    storage cap and 200 monthly UGC credits without ever reaching Stripe.
+
+    A paid tier is now only writable when the account already has a
+    subscription entitling it to that tier; otherwise the choice is remembered
+    as *intent* and the tier itself stays where it was until Stripe says
+    otherwise.
+    """
+    normalized = resolve_plan_key(data.plan)
+    if normalized is None:
         raise HTTPException(status_code=400, detail="Invalid plan")
+
+    if normalized in PAID_PLANS:
+        entitled = (
+            db.query(Subscription)
+            .filter(
+                Subscription.user_id == current_user.id,
+                Subscription.status.in_(sorted(ENTITLED_STATUSES)),
+                Subscription.plan == normalized,
+            )
+            .first()
+        )
+        if not entitled:
+            # Not an error: picking Pro in onboarding and then going to
+            # Checkout is the normal path. It just does not grant anything.
+            current_user.selected_plan = normalized
+            db.commit()
+            db.refresh(current_user)
+            return current_user
+
+    current_user.selected_plan = normalized
     current_user.plan = normalized
     db.commit()
     db.refresh(current_user)
@@ -1191,10 +1238,28 @@ def onboarding_complete_free(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Only ever downgrades, so no entitlement check is needed — but it must not
+    # strand someone who is genuinely paying. `has_used_trial` reads
+    # `trial_start_date`, so this stamp is also what stops a free-plan signup
+    # from later claiming a paid trial it never had; that is deliberate only
+    # for accounts that never subscribe, hence the guard.
+    live = (
+        db.query(Subscription)
+        .filter(
+            Subscription.user_id == current_user.id,
+            Subscription.status.in_(sorted(ENTITLED_STATUSES)),
+        )
+        .first()
+    )
+    if live:
+        raise HTTPException(
+            status_code=409,
+            detail="You have an active subscription. Cancel it in billing before switching to Free.",
+        )
+
+    current_user.selected_plan = "free"
     current_user.plan = "free"
     current_user.onboarding_completed = True
-    if current_user.trial_start_date is None:
-        current_user.trial_start_date = datetime.utcnow()
     db.commit()
     db.refresh(current_user)
     return current_user

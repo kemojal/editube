@@ -4,7 +4,7 @@ from typing import List, Optional
 import logging
 
 from app.db.database import get_db
-from app.db.models import Project, Video, VideoTranscription, User, Folder
+from app.db.models import Comment, Project, Video, VideoTranscription, User, Folder
 from app.services.project_access import assert_write_project_content, can_access_project
 from app.services.storage_policy import assert_storage_upload_allowed
 from app.api.video_payload import video_detail_dict, video_versions_payload
@@ -13,6 +13,7 @@ from app.api.models.videos import (
     VideoCreate,
     VideoUpdate,
     VideoStatusUpdate,
+    SendForReviewRequest,
     VideoDetailResponse,
     VideoWithProjectResponse,
     VideoVersionSummary,
@@ -20,6 +21,24 @@ from app.api.models.videos import (
     ProjectSummary,
     YoutubeVideoCreate,
     VideoFromUploadCreate,
+)
+from app.services.notifications import (
+    TYPE_NEW_VERSION,
+    TYPE_REVIEW_REQUESTED,
+    NotificationSpec,
+    emit_notifications,
+    emit_notifications_sync,
+)
+from app.services.video_status import (
+    STATUS_IN_REVIEW,
+    IllegalStatusTransition,
+    InvalidVideoStatus,
+    apply_video_status,
+    supersede_open_decisions,
+)
+from app.services.comment_carry_forward import (
+    carry_forward_open_change_requests,
+    count_open_change_requests,
 )
 from app.utils.security import get_current_user
 from app.utils.storage import upload_file, delete_file
@@ -75,6 +94,8 @@ def _finalize_project_video(
     version_group_id: str,
     language: Optional[str],
     activity_action: str,
+    version_notes: Optional[str] = None,
+    base_video: Optional[Video] = None,
 ) -> Video:
     """
     Shared tail of "a file is now stored, register it as a project Video":
@@ -96,9 +117,78 @@ def _finalize_project_video(
         file_path=file_path,
         size_bytes=size_bytes,
         uploader_id=current_user.id,
+        version_notes=(version_notes or None),
     )
     db.add(db_video)
     db.flush()
+
+    if base_video is not None:
+        # A new cut resets the review state of the deliverable. Without this,
+        # "the client approved v2" silently reads as "the current cut is
+        # approved" once v3 lands.
+        chain_ids = [
+            row[0]
+            for row in db.query(Video.id)
+            .filter(
+                Video.project_id == project_id,
+                Video.version_group_id == version_group_id,
+                Video.id != db_video.id,
+            )
+            .all()
+        ]
+        supersede_open_decisions(db, chain_ids, superseded_by_video_id=db_video.id)
+        apply_video_status(
+            db,
+            db_video,
+            STATUS_IN_REVIEW,
+            actor_user_id=current_user.id,
+            skip_transition_check=True,
+        )
+        # The editor's punch list follows the work rather than dying with the
+        # version it was raised against.
+        carry_forward_open_change_requests(db, base_video, db_video)
+
+        # Tell the people invested in the previous cut that a new one exists —
+        # everyone who commented on it or holds open work on it, plus the
+        # project owner. Without this, reviewers found out by accident.
+        recipients: set[int] = set()
+        for (uid,) in (
+            db.query(Comment.user_id)
+            .filter(Comment.video_id == base_video.id, Comment.user_id.isnot(None))
+            .distinct()
+            .all()
+        ):
+            recipients.add(uid)
+        for (uid,) in (
+            db.query(Comment.assignee_user_id)
+            .filter(
+                Comment.video_id == base_video.id,
+                Comment.assignee_user_id.isnot(None),
+            )
+            .distinct()
+            .all()
+        ):
+            recipients.add(uid)
+        project_row = db.query(Project).filter(Project.id == project_id).first()
+        if project_row and project_row.creator_id:
+            recipients.add(project_row.creator_id)
+        recipients.discard(current_user.id)
+
+        actor_name = current_user.name or current_user.email or "A teammate"
+        emit_notifications_sync(
+            db,
+            [
+                NotificationSpec(
+                    user_id=uid,
+                    type=TYPE_NEW_VERSION,
+                    project_id=project_id,
+                    video_id=db_video.id,
+                    actor_user_id=current_user.id,
+                    message=f"{actor_name} uploaded v{version} of {name}",
+                )
+                for uid in recipients
+            ],
+        )
 
     normalized_language = normalize_language(language)
     db_tr = VideoTranscription(video_id=db_video.id, status="pending", language=normalized_language)
@@ -155,6 +245,9 @@ def upload_video(
     folder_id: Optional[int] = Form(None),
     # When set, this upload becomes the next version in that video's chain.
     version_of: Optional[int] = Form(None),
+    # "What changed in this version" — shown to reviewers above the comment
+    # feed so they can decide what to re-watch instead of starting over.
+    version_notes: Optional[str] = Form(None),
     # Spoken language for transcription, ISO 639-1 (e.g. "en"). "auto"/""/absent = auto-detect.
     language: Optional[str] = Form(None),
     db: Session = Depends(get_db),
@@ -229,6 +322,8 @@ def upload_video(
         version_group_id=version_group_id,
         language=language,
         activity_action="video_uploaded",
+        version_notes=version_notes,
+        base_video=base_video,
     )
 
     db_video = (
@@ -352,6 +447,29 @@ def register_uploaded_video(
 
     import uuid as _uuid
 
+    # Same chain semantics as the multipart route's `version_of`: inherit the
+    # group and folder, and let _finalize_project_video run carry-forward,
+    # approval superseding, and new-version notifications.
+    base_video: Optional[Video] = None
+    folder_id = body.folder_id
+    if body.version_of is not None:
+        base_video = (
+            db.query(Video)
+            .filter(Video.id == body.version_of, Video.project_id == project_id)
+            .first()
+        )
+        if not base_video:
+            raise HTTPException(
+                status_code=404, detail="Version target video not found in this project"
+            )
+        folder_id = base_video.folder_id
+
+    if base_video is not None:
+        version_group_id, version = resolve_version_chain(db, base_video)
+    else:
+        version_group_id = _uuid.uuid4().hex
+        version = 1
+
     db_video = _finalize_project_video(
         db,
         project_id=project_id,
@@ -360,11 +478,13 @@ def register_uploaded_video(
         size_bytes=incoming_size,
         name=body.name,
         description=body.description,
-        folder_id=body.folder_id,
-        version=1,
-        version_group_id=_uuid.uuid4().hex,
+        folder_id=folder_id,
+        version=version,
+        version_group_id=version_group_id,
         language=body.language,
         activity_action="video_uploaded",
+        version_notes=body.version_notes,
+        base_video=base_video,
     )
 
     db_video = (
@@ -472,6 +592,38 @@ def start_project_video_transcription(
     return detail
 
 
+@router.get("/{video_id}/next-version-preview")
+def next_version_preview(
+    project_id: int,
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """What uploading a new version of this cut will do.
+
+    The upload dialog states the consequence before the editor commits to it
+    ("4 open change requests will move to v3") rather than surprising them
+    afterwards.
+    """
+    db_video = (
+        db.query(Video)
+        .filter(Video.id == video_id, Video.project_id == project_id)
+        .first()
+    )
+    if not db_video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    db_project = db.query(Project).filter(Project.id == project_id).first()
+    if not can_access_project(db, current_user.id, db_project):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    return {
+        "current_version": db_video.version or 1,
+        "next_version": (db_video.version or 1) + 1,
+        "carry_forward_count": count_open_change_requests(db, db_video.id),
+        "suggested_name": db_video.name,
+    }
+
+
 @router.put("/{video_id}/status", response_model=VideoDetailResponse)
 def update_video_status(
     project_id: int,
@@ -480,10 +632,6 @@ def update_video_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    valid_statuses = ("in_progress", "in_review", "approved", "needs_changes")
-    if data.status not in valid_statuses:
-        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
-
     db_video = (
         db.query(Video)
         .options(
@@ -502,7 +650,14 @@ def update_video_status(
         raise HTTPException(status_code=403, detail="Not authorized")
     assert_write_project_content(db, current_user, db_project)
 
-    db_video.status = data.status
+    # The vocabulary, the legal moves, and the provenance all live in the
+    # service — this handler and its twin in video_detail.py used to carry
+    # their own copies of the status tuple and silently allowed any move.
+    try:
+        apply_video_status(db, db_video, data.status, actor_user_id=current_user.id)
+    except (InvalidVideoStatus, IllegalStatusTransition) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     db.commit()
     db.refresh(db_video)
     db_video = (
@@ -519,3 +674,76 @@ def update_video_status(
     return _video_detail(
         db_video, current_user.id, db=db, db_project=db_project
     )
+
+
+@router.post("/{video_id}/send-for-review", response_model=VideoDetailResponse)
+async def send_video_for_review(
+    project_id: int,
+    video_id: int,
+    data: SendForReviewRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Put a cut in front of reviewers.
+
+    Deliberately separate from the generic status endpoint: sending has
+    consequences — a deadline is recorded and people are notified — that a raw
+    status write must never trigger silently.
+    """
+    db_video = (
+        db.query(Video)
+        .options(
+            joinedload(Video.uploader),
+            joinedload(Video.transcription),
+            selectinload(Video.comments),
+            selectinload(Video.annotations),
+        )
+        .filter(Video.id == video_id, Video.project_id == project_id)
+        .first()
+    )
+    if not db_video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    db_project = db.query(Project).filter(Project.id == project_id).first()
+    if not can_access_project(db, current_user.id, db_project):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    assert_write_project_content(db, current_user, db_project)
+
+    try:
+        apply_video_status(
+            db,
+            db_video,
+            STATUS_IN_REVIEW,
+            actor_user_id=current_user.id,
+            note=data.note,
+        )
+    except (InvalidVideoStatus, IllegalStatusTransition) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    db_video.review_due_at = data.due_at
+    db.commit()
+    db.refresh(db_video)
+
+    # Reviewers named explicitly, else whoever owns the work.
+    recipients = set(data.reviewer_user_ids or [])
+    if not recipients:
+        recipients = {db_project.creator_id, db_video.uploader_id}
+    recipients.discard(None)
+    recipients.discard(current_user.id)
+
+    actor_name = current_user.name or current_user.email or "A teammate"
+    await emit_notifications(
+        db,
+        [
+            NotificationSpec(
+                user_id=uid,
+                type=TYPE_REVIEW_REQUESTED,
+                project_id=project_id,
+                video_id=video_id,
+                actor_user_id=current_user.id,
+                message=f"{actor_name} asked you to review {db_video.name}",
+            )
+            for uid in recipients
+        ],
+    )
+
+    return _video_detail(db_video, current_user.id, db=db, db_project=db_project)

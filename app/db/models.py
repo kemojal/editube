@@ -23,7 +23,15 @@ class User(Base):
     # them: any of "auto_edit", "repurpose", "review". A list because these are
     # not exclusive — most people arrive wanting more than one.
     workflow_types = Column(JSONB, nullable=True)
+    # The tier the account is *entitled* to. Every quota in the app reads this
+    # — storage caps, UGC credits, seat caps — so it is only ever written from
+    # a Stripe subscription state, never from user input.
     plan = Column(String, nullable=True)  # "free", "pro", "scale", "enterprise"
+    # The tier the user picked in onboarding, before paying for it. Kept apart
+    # from `plan` because `PUT /users/onboarding/plan` used to write `plan`
+    # directly, which let any authenticated account award itself Scale quotas
+    # without touching Stripe.
+    selected_plan = Column(String, nullable=True)
     onboarding_completed = Column(Boolean, server_default="false", nullable=False)
     trial_start_date = Column(TIMESTAMP, nullable=True)
     storage_grace_until = Column(TIMESTAMP, nullable=True)
@@ -245,6 +253,26 @@ class StripePrice(Base):
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class StripeWebhookEvent(Base):
+    """One row per Stripe event id that has been fully processed.
+
+    Stripe guarantees at-least-once delivery and retries any webhook that does
+    not return 2xx, so every handler must be idempotent. Most of them were —
+    upserts keyed on the subscription id — but the side effects were not: a
+    single retried ``checkout.session.completed`` sent the welcome email again,
+    and a retried ``customer.subscription.updated`` re-sent the
+    "will not renew" notice. The insert of this row is what makes a replay a
+    no-op, so it is committed only after the handler has succeeded.
+    """
+
+    __tablename__ = "stripe_webhook_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    stripe_event_id = Column(String, unique=True, index=True, nullable=False)
+    event_type = Column(String, nullable=True)
+    processed_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
 class Workspace(Base):
     __tablename__ = "workspaces"
 
@@ -365,11 +393,23 @@ class WorkspaceAsset(Base):
     category = Column(String, nullable=False, index=True)
     title = Column(String, nullable=False)
     file_url = Column(String, nullable=False)
+    #: Object key when the file lives in R2/Cloudinary; NULL for local disk.
+    storage_key = Column(String, nullable=True)
+    # Media metadata, so the asset browser can render a grid (and the storage
+    # meter can count these bytes) without opening every file.
+    mime_type = Column(String, nullable=True)
+    # BigInteger: Integer overflows at ~2.1 GB and b-roll routinely exceeds it.
+    size_bytes = Column(BigInteger, server_default="0", nullable=False)
+    duration_ms = Column(Integer, nullable=True)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    thumbnail_url = Column(String, nullable=True)
     extra = Column(JSONB, nullable=True)
     created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
     workspace = relationship("Workspace", back_populates="assets")
+    created_by = relationship("User", foreign_keys=[created_by_user_id])
     project_links = relationship(
         "ProjectWorkspaceAssetLink",
         back_populates="workspace_asset",
@@ -499,10 +539,20 @@ class Video(Base):
     ingest_page_url = Column(Text, nullable=True)
     thumbnail_url = Column(String, nullable=True)
     status = Column(String, server_default="in_progress", nullable=False)  # in_progress, in_review, approved, needs_changes
+    # Written only by app.services.video_status.apply_video_status.
+    status_changed_at = Column(TIMESTAMP, nullable=True)
+    status_changed_by = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # When reviewers are expected to have responded by. Set by "send for review".
+    review_due_at = Column(TIMESTAMP, nullable=True)
+    # "What changed in this version" — shown to reviewers above the comment feed.
+    version_notes = Column(Text, nullable=True)
     duration = Column(Integer, nullable=True)  # duration in seconds
     size_bytes = Column(Integer, server_default="0", nullable=False)
     uploader_id = Column(Integer, ForeignKey("users.id"))
-    uploader = relationship("User")
+    uploader = relationship("User", foreign_keys=[uploader_id])
+    status_actor = relationship("User", foreign_keys=[status_changed_by])
     project = relationship("Project", back_populates="videos")
     folder = relationship("Folder", back_populates="videos")
     created_at = Column(TIMESTAMP, server_default=func.now())
@@ -526,6 +576,54 @@ class Video(Base):
         back_populates="video",
         cascade="all, delete-orphan",
     )
+    approvals = relationship(
+        "VideoApproval",
+        back_populates="video",
+        foreign_keys="VideoApproval.video_id",
+        cascade="all, delete-orphan",
+        order_by="VideoApproval.created_at.desc()",
+    )
+
+
+class VideoApproval(Base):
+    """One review decision on one version.
+
+    `Video.status` answers "where is this cut now"; these rows answer "who
+    decided what, on which version, and was that decision later superseded".
+    Team decisions (actor_user_id) and guest decisions (review_session_id) land
+    in the same table on purpose — that convergence is what makes approval a
+    single mechanism rather than four disconnected ones.
+    """
+
+    __tablename__ = "video_approvals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(
+        Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # approved | changes_requested
+    decision = Column(String, nullable=False, index=True)
+    actor_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    review_session_id = Column(
+        Integer, ForeignKey("review_sessions.id", ondelete="SET NULL"), nullable=True
+    )
+    review_link_id = Column(
+        Integer, ForeignKey("review_links.id", ondelete="SET NULL"), nullable=True
+    )
+    note = Column(Text, nullable=True)
+    # Stamped when a newer version lands, so history reads correctly six months
+    # later ("v2 was approved, then superseded by v3").
+    superseded_at = Column(TIMESTAMP, nullable=True)
+    superseded_by_video_id = Column(
+        Integer, ForeignKey("videos.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    video = relationship("Video", back_populates="approvals", foreign_keys=[video_id])
+    actor = relationship("User", foreign_keys=[actor_user_id])
+    review_session = relationship("ReviewSession", foreign_keys=[review_session_id])
 
 
 class VideoTranscription(Base):
@@ -547,6 +645,11 @@ class VideoTranscription(Base):
     segments = Column(JSONB, nullable=True)
     speakers = Column(JSONB, nullable=True)
     speaker_count = Column(Integer, nullable=True)
+    # Silero-VAD speech/silence ranges over the extracted audio, in source
+    # seconds: {version, engine, sample_rate, duration, speech_ranges,
+    # silences, params}. Written by app.jobs.transcription; consumed by
+    # auto-edit silence suggestions and the editor's pause UI.
+    audio_analysis = Column(JSONB, nullable=True)
     error_message = Column(Text, nullable=True)
     model_name = Column(String, nullable=True)
     # User-requested spoken language (ISO 639-1, e.g. "en"). NULL = auto-detect.
@@ -617,14 +720,32 @@ class Comment(Base):
     )
     client_mutation_id = Column(String, nullable=True, index=True)
     revision = Column(Integer, server_default="1", nullable=False)
+    # Set when this comment was copied onto a new version because it was still
+    # open. Points at the original on the previous version, which stays put as
+    # history — carry-forward copies, it never moves.
+    carried_from_comment_id = Column(
+        Integer, ForeignKey("comments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
     video = relationship("Video", back_populates="comments")
     user = relationship("User", foreign_keys=[user_id])
     assignee = relationship("User", foreign_keys=[assignee_user_id])
-    parent = relationship("Comment", remote_side=[id], back_populates="replies")
-    replies = relationship("Comment", back_populates="parent", cascade="all, delete-orphan")
+    # Two self-referential foreign keys now exist (parent_id and
+    # carried_from_comment_id), so every self-relationship must name its own.
+    parent = relationship(
+        "Comment", remote_side=[id], back_populates="replies", foreign_keys=[parent_id]
+    )
+    carried_from = relationship(
+        "Comment", remote_side=[id], foreign_keys=[carried_from_comment_id]
+    )
+    replies = relationship(
+        "Comment",
+        back_populates="parent",
+        foreign_keys=[parent_id],
+        cascade="all, delete-orphan",
+    )
     likes = relationship("CommentLike", back_populates="comment", cascade="all, delete-orphan")
     review_link = relationship("ReviewLink")
     attachments = relationship(
@@ -1072,9 +1193,19 @@ class Notification(Base):
     invite_token = Column(String, nullable=True)
     message = Column(Text, nullable=True)
     read = Column(Boolean, default=False)
+    read_at = Column(TIMESTAMP, nullable=True)
+    # Who caused this, so the UI can name them without re-fetching the comment.
+    actor_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Siblings sharing a key inside the coalescing window fold into one row
+    # rather than inserting twenty. See app/services/notifications.py.
+    group_key = Column(String, nullable=True, index=True)
+    group_count = Column(Integer, server_default="1", nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now())
 
-    user = relationship("User")
+    user = relationship("User", foreign_keys=[user_id])
+    actor = relationship("User", foreign_keys=[actor_user_id])
     project = relationship("Project")
     video = relationship("Video")
     comment = relationship("Comment")
@@ -1120,8 +1251,8 @@ class CommentAttachment(Base):
 class ActivityFeed(Base):
     __tablename__ = "activity_feed"
     id = Column(Integer, primary_key=True, index=True)
-    project_id = Column(Integer, ForeignKey("projects.id"))
-    user_id = Column(Integer, ForeignKey("users.id"))
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
     action = Column(String)
     meta_info = Column(Text)
     created_at = Column(TIMESTAMP, server_default=func.now())
@@ -2088,6 +2219,42 @@ class RepurposeUserDefaults(Base):
     user = relationship("User")
 
 
+class CaptionTemplateDef(Base):
+    """A caption template for the rough-cut editor's template gallery.
+
+    The catalogue started life as ``CAPTION_TEMPLATES`` in the frontend; this
+    table is the editable source of truth so internal users can refine, add and
+    archive templates without a deploy. ``patch`` holds the ``Partial<CaptionStyle>``
+    the frontend applies over its caption defaults — the backend treats it as
+    opaque JSON, exactly like the rough-cut draft's ``captionStyle``.
+    """
+
+    __tablename__ = "caption_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # The stable identifier the editor persists in drafts and favorites
+    # (`CaptionStyle.templateId`, `user_caption_favorites.template_id`).
+    slug = Column(String(80), nullable=False, unique=True, index=True)
+    category = Column(String(24), nullable=False, server_default="new")
+    label = Column(String(120), nullable=False)
+    # Words drawn on the gallery preview card.
+    sample = Column(String(200), nullable=False, server_default="")
+    # Optional badge: "New" | "Pro" | "Hot" | "Premium".
+    tag = Column(String(40), nullable=True)
+    blurb = Column(Text, nullable=False, server_default="")
+    patch = Column(JSONB, nullable=False, server_default="{}")
+    sort_order = Column(Integer, nullable=False, server_default="0")
+    # Archived templates disappear from the user-facing gallery but stay
+    # resolvable, so drafts that reference them keep rendering.
+    archived = Column(Boolean, nullable=False, server_default="false")
+    # True for rows seeded from the frontend's built-in catalogue.
+    builtin = Column(Boolean, nullable=False, server_default="false")
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class UserCaptionFavorite(Base):
     """User-scoped favorites for caption template ids exposed by the rough-cut editor.
 
@@ -2171,6 +2338,67 @@ class GeneratedMedia(Base):
     # is previewed, then saved or discarded. Only saved rows are project media.
     saved = Column(Boolean, nullable=False, server_default="false", index=True)
 
+    # Provenance, when this was generated by the AI creative director rather
+    # than by hand. The compiler joins assets back to the directive that asked
+    # for them through `directive_id`, and reverting a director run is a filter
+    # over `plan_id` — which is why the link lives here rather than as a tag on
+    # the timeline item, where the editor's allow-list loaders would strip it.
+    director_plan_id = Column(
+        Integer, ForeignKey("director_plans.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    director_directive_id = Column(String, nullable=True)
+
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class DirectorPlan(Base):
+    """One run of the AI creative director.
+
+    The row is the run's state machine. Planning, generating the assets it asked
+    for, and compiling them onto the timeline are separate stages that can each
+    fail or be cancelled independently, and a run that dies mid-way has to be
+    resumable rather than restarted — regenerating a dozen images because the
+    compile step crashed would be both slow and expensive.
+
+    `plan` holds the validated EditPlan; `applied_manifest` records every id the
+    compiler created, which is what makes a revert a precise filter rather than
+    a guess (docs/ai_creative_director.md §9.2).
+    """
+
+    __tablename__ = "director_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(
+        Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id = Column(
+        Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    # queued | planning | generating | compiling | ready | applied | failed | cancelled
+    status = Column(String, nullable=False, server_default="queued", index=True)
+    #: Human-readable stage, surfaced verbatim in the UI. Progress is reported as
+    #: a sentence rather than a percentage because the stages are not comparable
+    #: in duration — planning is seconds, a Veo shot is minutes.
+    stage = Column(String, nullable=True)
+    progress = Column(Integer, nullable=False, server_default="0")
+
+    tier = Column(String, nullable=False, server_default="standard")
+    brief = Column(Text, nullable=True)
+    allow_video = Column(Boolean, nullable=False, server_default="true")
+
+    plan = Column(JSONB, nullable=True)
+    usage = Column(JSONB, nullable=True)
+    model = Column(String, nullable=True)
+    warnings = Column(JSONB, nullable=True)
+    applied_manifest = Column(JSONB, nullable=True)
+
+    error_message = Column(Text, nullable=True)
+    cancel_requested = Column(Boolean, nullable=False, server_default="false")
+
+    applied_at = Column(TIMESTAMP, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 

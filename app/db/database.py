@@ -27,10 +27,32 @@ def _database_url() -> str:
 
 SQLALCHEMY_DATABASE_URL = _database_url()
 
+
+def connect_args_for(url: str) -> dict:
+    """psycopg2 connect args that keep a flaky network from hanging us.
+
+    Without connect_timeout a dropped link (laptop asleep, VPN flapping, DNS
+    not answering) leaves psycopg2 blocking on the socket until someone hits
+    Ctrl-C. The keepalives matter for Neon specifically: its pooler drops idle
+    connections, and without them the first query after an idle spell dies on a
+    half-open socket instead of being recycled.
+    """
+    if not url.startswith(("postgresql", "postgres:")):
+        return {}
+    return {
+        "connect_timeout": 10,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+    }
+
+
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     pool_pre_ping=True,
     pool_recycle=300,
+    connect_args=connect_args_for(SQLALCHEMY_DATABASE_URL),
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

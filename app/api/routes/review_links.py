@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.api.models.review_links import (
     PublicReviewApproveRequest,
+    PublicReviewRequestChangesRequest,
     PublicReviewAuthRequest,
     PublicReviewAuthResponse,
     PublicReviewCommentCreate,
@@ -65,7 +66,6 @@ from app.db.database import get_db
 from app.db.models import (
     Comment,
     Invoice,
-    Notification,
     Project,
     ProjectRevision,
     ReviewEvent,
@@ -102,13 +102,30 @@ from app.services.comment_workflow import (
     sync_is_resolved_from_status,
 )
 from app.jobs.queue import (
+    enqueue_comment_notification_email_job,
     enqueue_mention_email_job,
-    enqueue_push_notification_job,
     enqueue_review_forensic_package_job,
 )
 from app.services.mentions import extract_mention_handles, resolve_mentioned_users
+from app.services.notification_prefs import wants_comment_emails
+from app.services.video_status import (
+    DECISION_APPROVED,
+    DECISION_CHANGES_REQUESTED,
+    STATUS_IN_REVIEW,
+    apply_video_status,
+    is_approved,
+    record_decision,
+)
+from app.services.notifications import (
+    TYPE_APPROVAL,
+    TYPE_CHANGES_REQUESTED,
+    TYPE_CLIENT_COMMENT,
+    TYPE_MENTION,
+    TYPE_REVIEW_WORKFLOW,
+    NotificationSpec,
+    emit_notifications,
+)
 from app.utils.email import send_review_magic_link_email
-from app.websocket_manager import notifications_ws_manager
 from app.utils.security import (
     get_current_user,
     get_password_hash,
@@ -673,36 +690,19 @@ async def _notify_review_workflow_users(
     project_id: int,
     video_id: int,
 ) -> None:
-    if not user_ids:
-        return
-    created: list[Notification] = []
-    for uid in set(user_ids):
-        n = Notification(
-            user_id=uid,
-            type="review_workflow",
-            project_id=project_id,
-            video_id=video_id,
-            read=False,
-        )
-        db.add(n)
-        created.append(n)
-    db.commit()
-    for n in created:
-        enqueue_push_notification_job(n.user_id, n.id)
-        await notifications_ws_manager.send_to_user(
-            n.user_id,
-            {
-                "event": "notification.new",
-                "payload": {
-                    "id": n.id,
-                    "type": n.type,
-                    "read": n.read,
-                    "project_id": n.project_id,
-                    "video_id": n.video_id,
-                    "created_at": n.created_at.isoformat() if n.created_at else None,
-                },
-            },
-        )
+    await emit_notifications(
+        db,
+        [
+            NotificationSpec(
+                user_id=uid,
+                type=TYPE_REVIEW_WORKFLOW,
+                project_id=project_id,
+                video_id=video_id,
+                message="A review stage needs your attention",
+            )
+            for uid in set(user_ids)
+        ],
+    )
 
 
 def _workflow_run_api_response(db: Session, run: ReviewWorkflowRun) -> dict:
@@ -1618,38 +1618,55 @@ async def create_public_comment(
     db.commit()
     db.refresh(comment)
 
-    handles = extract_mention_handles(body.text or "")
-    if handles:
-        video = db.query(Video).filter(Video.id == link.video_id).first()
-        project = db.query(Project).filter(Project.id == video.project_id).first() if video else None
-        if project:
-            project_users = list_users_for_mentions(db, project)
+    # Tell the team a client said something.
+    #
+    # This block used to sit inside `if handles:`, so a client could leave
+    # twenty comments and — unless they happened to type an @mention — nobody
+    # was ever told. Client feedback rotting unseen is the exact failure this
+    # product exists to remove, so the owner and uploader are now notified for
+    # every guest comment. Volume is handled by coalescing on `group_key`
+    # rather than by staying silent.
+    video = db.query(Video).filter(Video.id == link.video_id).first()
+    project = (
+        db.query(Project).filter(Project.id == video.project_id).first() if video else None
+    )
+    if project:
+        actor_name = session.guest_name or session.guest_email or "Guest reviewer"
+        frontend_base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+        # Recipients are project team — deep-link to the authenticated player.
+        comment_url = (
+            f"{frontend_base}/player/{link.video_id}?"
+            + urlencode({"tab": "comments", "commentId": str(comment.id)})
+        )
+        is_change_request = comment.kind == COMMENT_KIND_CHANGE_REQUEST
+
+        specs: list[NotificationSpec] = []
+        notified_ids: set[int] = set()
+
+        handles = extract_mention_handles(body.text or "")
+        if handles:
             recipients = resolve_mentioned_users(
                 mention_handles=handles,
-                candidate_users=project_users,
+                candidate_users=list_users_for_mentions(db, project),
                 actor_user_id=None,
             )
-            frontend_base = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
-            # Mention recipients are project team — deep-link to authenticated player.
-            comment_url = (
-                f"{frontend_base}/player/{link.video_id}?"
-                + urlencode({"tab": "comments", "commentId": str(comment.id)})
-            )
-            actor_name = session.guest_name or session.guest_email or "Guest reviewer"
-
-            created_notifications: list[Notification] = []
             for recipient in recipients:
-                notification = Notification(
-                    user_id=recipient.id,
-                    type="mention",
-                    project_id=project.id,
-                    video_id=link.video_id,
-                    comment_id=comment.id,
-                    read=False,
+                specs.append(
+                    NotificationSpec(
+                        user_id=recipient.id,
+                        type=TYPE_MENTION,
+                        project_id=project.id,
+                        video_id=link.video_id,
+                        comment_id=comment.id,
+                        message=f"{actor_name} mentioned you in a comment",
+                    )
                 )
-                db.add(notification)
-                created_notifications.append(notification)
-                settings = db.query(UserSettings).filter(UserSettings.user_id == recipient.id).first()
+                notified_ids.add(recipient.id)
+                settings = (
+                    db.query(UserSettings)
+                    .filter(UserSettings.user_id == recipient.id)
+                    .first()
+                )
                 if settings is not None and not settings.email_mentions:
                     continue
                 queued = enqueue_mention_email_job(
@@ -1661,26 +1678,43 @@ async def create_public_comment(
                     comment_url=comment_url,
                 )
                 if not queued:
-                    logger.warning("Mention email enqueue skipped/failed for user %s", recipient.id)
+                    logger.warning(
+                        "Mention email enqueue skipped/failed for user %s", recipient.id
+                    )
 
-            db.commit()
-            for notification in created_notifications:
-                enqueue_push_notification_job(notification.user_id, notification.id)
-                await notifications_ws_manager.send_to_user(
-                    notification.user_id,
-                    {
-                        "event": "notification.new",
-                        "payload": {
-                            "id": notification.id,
-                            "type": notification.type,
-                            "read": notification.read,
-                            "project_id": notification.project_id,
-                            "video_id": notification.video_id,
-                            "comment_id": notification.comment_id,
-                            "created_at": notification.created_at.isoformat() if notification.created_at else None,
-                        },
-                    },
+        owner_ids = {project.creator_id, video.uploader_id if video else None}
+        owner_ids.discard(None)
+        owner_ids -= notified_ids
+        video_label = video.name if video else "your video"
+        for owner_id in owner_ids:
+            specs.append(
+                NotificationSpec(
+                    user_id=owner_id,
+                    type=TYPE_CLIENT_COMMENT,
+                    project_id=project.id,
+                    video_id=link.video_id,
+                    comment_id=comment.id,
+                    message=(
+                        f"{actor_name} requested a change on {video_label}"
+                        if is_change_request
+                        else f"{actor_name} commented on {video_label}"
+                    ),
+                    # One alert per reviewer per video per window, however many
+                    # comments they leave in a sitting.
+                    group_key=f"client_comment:{link.video_id}:{session.id}",
                 )
+            )
+            if wants_comment_emails(db, owner_id):
+                enqueue_comment_notification_email_job(
+                    recipient_user_id=owner_id,
+                    actor_name=actor_name,
+                    project_name=project.name,
+                    video_name=video.name if video else None,
+                    comment_text=comment.text or "",
+                    comment_url=comment_url,
+                )
+
+        await emit_notifications(db, specs)
 
     reply_rows = (
         db.query(Comment)
@@ -1872,42 +1906,166 @@ def get_draft(token: str, session_id: int, db: Session = Depends(get_db)):
 
 
 @public_router.post("/{token}/approve")
-def approve(
+async def approve(
     token: str,
     body: PublicReviewApproveRequest,
     db: Session = Depends(get_db),
 ):
+    """A guest signs off on the cut they are watching.
+
+    This used to write `ReviewSession.approved_at` and stop there, so a client
+    could approve a video whose status stayed "in progress" forever and whose
+    editor saw no change anywhere in the app. The decision now lands in
+    `video_approvals` and moves `Video.status`, which is what makes team
+    approval and guest approval one mechanism instead of two.
+
+    The handler is `async` so it can reach the notification WebSocket; as a
+    sync handler it could only ever enqueue a push.
+    """
     link = _get_link_or_404(token, db)
     _assert_link_usable(link)
     session = _get_session_or_404(link, body.session_id, db)
-    if body.approved:
-        blockers = client_approve_blockers(db, link)
-        if blockers:
-            raise HTTPException(
-                status_code=400,
-                detail=blockers[0].get("message", "Approval blocked"),
-            )
-    session.approved_at = (
-        datetime.now(timezone.utc) if body.approved else None
+
+    video = db.query(Video).filter(Video.id == link.video_id).first()
+    project = (
+        db.query(Project).filter(Project.id == video.project_id).first() if video else None
     )
-    if body.approved:
-        video = db.query(Video).filter(Video.id == link.video_id).first()
-        project = db.query(Project).filter(Project.id == video.project_id).first() if video else None
-        owner_id = project.creator_id if project else None
-        if owner_id:
-            approval_notification = Notification(
-                user_id=owner_id,
-                type="approval",
-                project_id=project.id if project else None,
-                video_id=link.video_id,
-                comment_id=None,
-                read=False,
+
+    if not body.approved:
+        # Withdrawing an approval puts the cut back in front of reviewers.
+        session.approved_at = None
+        if video is not None and is_approved(video):
+            apply_video_status(
+                db, video, STATUS_IN_REVIEW, skip_transition_check=True
             )
-            db.add(approval_notification)
-            db.flush()
-            enqueue_push_notification_job(owner_id, approval_notification.id)
+        db.commit()
+        return {"ok": True, "approved_at": None}
+
+    blockers = client_approve_blockers(db, link)
+    if blockers:
+        raise HTTPException(
+            status_code=400,
+            detail=blockers[0].get("message", "Approval blocked"),
+        )
+
+    session.approved_at = datetime.now(timezone.utc)
+    if video is not None:
+        record_decision(
+            db,
+            video,
+            DECISION_APPROVED,
+            review_session_id=session.id,
+            review_link_id=link.id,
+            note=getattr(body, "note", None),
+        )
     db.commit()
+
+    if project is not None:
+        approver = session.guest_name or session.guest_email or "Your client"
+        video_label = video.name if video else "the video"
+        recipients = {project.creator_id, video.uploader_id if video else None}
+        recipients.discard(None)
+        await emit_notifications(
+            db,
+            [
+                NotificationSpec(
+                    user_id=uid,
+                    type=TYPE_APPROVAL,
+                    project_id=project.id,
+                    video_id=link.video_id,
+                    message=f"{approver} approved {video_label}",
+                )
+                for uid in recipients
+            ],
+        )
+
     return {"ok": True, "approved_at": session.approved_at}
+
+
+@public_router.post("/{token}/request-changes")
+async def request_changes(
+    token: str,
+    body: PublicReviewRequestChangesRequest,
+    db: Session = Depends(get_db),
+):
+    """A guest sends the cut back.
+
+    Until now there was no reject action anywhere in the product — the only
+    way a reviewer could express "not yet" was to write a change-request
+    comment and hope somebody noticed. Approving was a button; declining was
+    an inference.
+
+    The note optionally becomes a change request at t=0 so it lands in the
+    editor's revision checklist instead of living only in a status field.
+    """
+    link = _get_link_or_404(token, db)
+    _assert_link_usable(link)
+    session = _get_session_or_404(link, body.session_id, db)
+
+    video = db.query(Video).filter(Video.id == link.video_id).first()
+    if video is None:
+        raise HTTPException(status_code=404, detail="Video not found")
+    project = db.query(Project).filter(Project.id == video.project_id).first()
+
+    note = (body.note or "").strip() or None
+
+    # Requesting changes withdraws any prior sign-off from this guest.
+    session.approved_at = None
+
+    record_decision(
+        db,
+        video,
+        DECISION_CHANGES_REQUESTED,
+        review_session_id=session.id,
+        review_link_id=link.id,
+        note=note,
+    )
+
+    created_comment: Comment | None = None
+    if note and body.create_comment and link.allow_comments:
+        created_comment = Comment(
+            video_id=video.id,
+            user_id=None,
+            text=note,
+            timecode=0,
+            guest_name=session.guest_name or "Guest",
+            guest_email=session.guest_email,
+            guest_avatar_url=session.guest_avatar_url,
+            review_link_id=link.id,
+            kind=COMMENT_KIND_CHANGE_REQUEST,
+            status="open",
+            visibility=COMMENT_VISIBILITY_PUBLIC,
+            is_private=False,
+        )
+        sync_is_resolved_from_status(created_comment)
+        db.add(created_comment)
+
+    db.commit()
+
+    if project is not None:
+        reviewer = session.guest_name or session.guest_email or "Your client"
+        recipients = {project.creator_id, video.uploader_id}
+        recipients.discard(None)
+        await emit_notifications(
+            db,
+            [
+                NotificationSpec(
+                    user_id=uid,
+                    type=TYPE_CHANGES_REQUESTED,
+                    project_id=project.id,
+                    video_id=video.id,
+                    comment_id=created_comment.id if created_comment else None,
+                    message=f"{reviewer} requested changes on {video.name}",
+                )
+                for uid in recipients
+            ],
+        )
+
+    return {
+        "ok": True,
+        "status": video.status,
+        "comment_id": created_comment.id if created_comment else None,
+    }
 
 
 @public_router.post("/{token}/signoff", response_model=PublicReviewSignoffResponse)
@@ -2215,21 +2373,33 @@ def public_download_allowed(
 
 @public_router.get("/{token}/versions")
 def list_review_versions(token: str, db: Session = Depends(get_db)):
+    """Sibling review links, so a guest can tell there is a newer cut.
+
+    This used to raise `AttributeError` on every single call — it reached for
+    `link.project` and `link.project_id`, and `ReviewLink` has neither a
+    `project` relationship nor a `project_id` column. A link's route to its
+    project is through its video, which is how `app/api/video_payload.py`
+    already does it.
+    """
     link = _get_link_or_404(token, db)
     _assert_link_usable(link)
-    is_review = False
-    if getattr(link, "project", None) is not None and link.project.project_type == "review":
-        is_review = True
-    elif link.project_id:
-        proj = db.query(Project.project_type).filter(Project.id == link.project_id).first()
-        if proj and proj[0] == "review":
-            is_review = True
 
-    if is_review:
+    video = db.query(Video).filter(Video.id == link.video_id).first()
+    project_id = video.project_id if video else None
+    project_type = None
+    if project_id:
+        project_type = (
+            db.query(Project.project_type).filter(Project.id == project_id).scalar()
+        )
+
+    if project_type == "review":
+        # Review projects treat every video in the project as a version of the
+        # same deliverable, so peers are found through the project.
         peers = (
             db.query(ReviewLink)
+            .join(Video, Video.id == ReviewLink.video_id)
             .filter(
-                ReviewLink.project_id == link.project_id,
+                Video.project_id == project_id,
                 ReviewLink.revoked_at.is_(None),
             )
             .order_by(ReviewLink.created_at.asc())
@@ -2245,16 +2415,56 @@ def list_review_versions(token: str, db: Session = Depends(get_db)):
             .order_by(ReviewLink.created_at.asc())
             .all()
         )
+    elif video is not None and video.version_group_id:
+        # Links created before version_group_id was stamped on them still have
+        # a chain — it just lives on the video.
+        peers = (
+            db.query(ReviewLink)
+            .join(Video, Video.id == ReviewLink.video_id)
+            .filter(
+                Video.project_id == project_id,
+                Video.version_group_id == video.version_group_id,
+                ReviewLink.revoked_at.is_(None),
+            )
+            .order_by(ReviewLink.created_at.asc())
+            .all()
+        )
     else:
-        peers = []
-    items = [
-        {
-            "id": row.id,
-            "token": row.token,
-            "label": row.label,
-            "version_label": row.version_label,
-            "created_at": row.created_at,
-        }
-        for row in peers
-    ]
-    return {"ok": True, "items": items}
+        peers = [link]
+
+    version_by_video = {
+        v.id: v
+        for v in db.query(Video)
+        .filter(Video.id.in_([row.video_id for row in peers] or [0]))
+        .all()
+    }
+
+    items = []
+    for row in peers:
+        peer_video = version_by_video.get(row.video_id)
+        items.append(
+            {
+                "id": row.id,
+                "token": row.token,
+                "label": row.label,
+                "version_label": row.version_label,
+                "created_at": row.created_at,
+                "video_id": row.video_id,
+                "version": peer_video.version if peer_video else None,
+                "status": (peer_video.status or "in_progress") if peer_video else None,
+                "is_current": row.id == link.id,
+            }
+        )
+    items.sort(key=lambda item: (item["version"] or 0))
+
+    latest = items[-1] if items else None
+    return {
+        "ok": True,
+        "items": items,
+        # Lets the guest page say "v4 is available — you're viewing v2".
+        "current_version": next(
+            (item["version"] for item in items if item["is_current"]), None
+        ),
+        "latest_version": latest["version"] if latest else None,
+        "latest_token": latest["token"] if latest else None,
+    }

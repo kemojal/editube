@@ -32,6 +32,16 @@ class UploadResult:
     content_type: str
 
 
+@dataclass(frozen=True)
+class PresignedUpload:
+    """A short-lived browser-to-storage upload destination."""
+
+    upload_url: str
+    public_url: str
+    key: str
+    headers: dict[str, str]
+
+
 @runtime_checkable
 class StorageBackend(Protocol):
     """Write-only object store (we never delete today — see migration plan §2)."""

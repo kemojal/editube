@@ -1,0 +1,305 @@
+{
+  "_comment": "Contract between the backend compiler (director_compile.py) and the editor's on-screen replay. The backend writes the draft; the editor rewinds and replays the same plan for the user to watch, and the two must land on byte-identical state -- otherwise the user watches one edit happen and the autosave writes a different one. Both sides assert against this file. Regenerate only when the compiler's output changes on purpose.",
+  "input": {
+    "segments": [
+      {
+        "start": 0.0,
+        "end": 6.0,
+        "text": "Most teams lose two days a week to meetings"
+      },
+      {
+        "start": 6.0,
+        "end": 12.0,
+        "text": "and nobody can say where the time actually went"
+      },
+      {
+        "start": 12.0,
+        "end": 20.0,
+        "text": "so we built something to find out where it goes"
+      }
+    ],
+    "keepRanges": [
+      {
+        "start": 0,
+        "end": 6
+      },
+      {
+        "start": 12,
+        "end": 20
+      }
+    ],
+    "sourceDuration": 20.0,
+    "aspect": "16:9",
+    "planId": 7,
+    "appliedAt": "2026-08-11T00:00:00Z",
+    "plan": {
+      "version": 1,
+      "brief": {
+        "houseStylePrefix": "35mm, shallow depth of field, warm practical light."
+      },
+      "beats": [],
+      "directives": [
+        {
+          "id": "d1",
+          "type": "broll",
+          "start": 1.5,
+          "end": 5.0,
+          "anchor": {
+            "quote": "two days a week",
+            "segmentId": "s0"
+          },
+          "track": "V2",
+          "asset": {
+            "source": "generate-image",
+            "prompt": "an overhead shot of a cluttered desk at dusk",
+            "aspectRatio": "16:9"
+          },
+          "animationIn": {
+            "preset": "fade",
+            "durationSeconds": 0.35
+          },
+          "animationOut": {
+            "preset": "fade",
+            "durationSeconds": 0.35
+          },
+          "framing": {
+            "kenBurns": {
+              "from": 1.0,
+              "to": 1.08,
+              "easing": "glide"
+            }
+          },
+          "confidence": 0.82,
+          "why": "The speaker quantifies the cost; show it."
+        },
+        {
+          "id": "d2",
+          "type": "broll",
+          "start": 4.0,
+          "end": 8.0,
+          "anchor": {
+            "quote": "to meetings",
+            "segmentId": "s0"
+          },
+          "track": "V2",
+          "asset": {
+            "source": "generate-image",
+            "prompt": "a wide empty meeting room",
+            "aspectRatio": "16:9"
+          },
+          "animationIn": {
+            "preset": "slide-up",
+            "durationSeconds": 0.4
+          },
+          "animationOut": {
+            "preset": "fade",
+            "durationSeconds": 0.3
+          },
+          "framing": {
+            "kenBurns": {
+              "from": 1.06,
+              "to": 1.0,
+              "easing": "settle"
+            }
+          },
+          "confidence": 0.7,
+          "why": "Names the venue; show it empty."
+        }
+      ]
+    },
+    "assets": {
+      "d1": {
+        "id": 101,
+        "kind": "image",
+        "status": "ready",
+        "url": "https://cdn.test/desk.png"
+      },
+      "d2": {
+        "id": 102,
+        "kind": "image",
+        "status": "ready",
+        "url": "https://cdn.test/room.png"
+      }
+    },
+    "draft": {
+      "sourceDuration": 20.0,
+      "keepRanges": [
+        {
+          "start": 0,
+          "end": 6
+        },
+        {
+          "start": 12,
+          "end": 20
+        }
+      ],
+      "timelineTracks": [
+        {
+          "id": "track-text-1",
+          "kind": "text",
+          "label": "TX1",
+          "enabled": true,
+          "locked": false,
+          "height": 22,
+          "order": 0
+        },
+        {
+          "id": "track-video-1",
+          "kind": "video",
+          "label": "V1",
+          "enabled": true,
+          "locked": false,
+          "height": 44,
+          "order": 1
+        },
+        {
+          "id": "track-audio-1",
+          "kind": "audio",
+          "label": "A1",
+          "enabled": true,
+          "muted": false,
+          "locked": false,
+          "height": 34,
+          "order": 2
+        }
+      ],
+      "timelineMediaItems": [],
+      "clipAttributes": {}
+    }
+  },
+  "expected": {
+    "timelineTracks": [
+      {
+        "id": "track-text-1",
+        "kind": "text",
+        "label": "TX1",
+        "enabled": true,
+        "locked": false,
+        "height": 22,
+        "order": 0
+      },
+      {
+        "id": "track-video-2",
+        "kind": "video",
+        "label": "V2",
+        "enabled": true,
+        "locked": false,
+        "height": 44,
+        "order": 1
+      },
+      {
+        "id": "track-video-1",
+        "kind": "video",
+        "label": "V1",
+        "enabled": true,
+        "locked": false,
+        "height": 44,
+        "order": 2
+      },
+      {
+        "id": "track-audio-1",
+        "kind": "audio",
+        "label": "A1",
+        "enabled": true,
+        "muted": false,
+        "locked": false,
+        "height": 34,
+        "order": 3
+      }
+    ],
+    "timelineMediaItems": [
+      {
+        "id": "dir7-d1",
+        "trackId": "track-video-2",
+        "track": "video",
+        "mediaKey": "generated-101",
+        "sourceKind": "generated",
+        "sourceId": 101,
+        "name": "an overhead shot of a cluttered desk at dusk",
+        "kind": "image",
+        "sourceUrl": "https://cdn.test/desk.png",
+        "duration": 3.5,
+        "start": 2.229,
+        "end": 5.729,
+        "sourceStart": 0.0,
+        "playDuration": 3.5,
+        "audioEnabled": false
+      },
+      {
+        "id": "dir7-d2",
+        "trackId": "track-video-2",
+        "track": "video",
+        "mediaKey": "generated-102",
+        "sourceKind": "generated",
+        "sourceId": 102,
+        "name": "a wide empty meeting room",
+        "kind": "image",
+        "sourceUrl": "https://cdn.test/room.png",
+        "duration": 4.0,
+        "start": 4.286,
+        "end": 14.286,
+        "sourceStart": 0.0,
+        "playDuration": 4.0,
+        "audioEnabled": false
+      }
+    ],
+    "clipAttributes": {
+      "media:dir7-d1": {
+        "animation": {
+          "inPreset": "fade",
+          "outPreset": "fade",
+          "duration": 0.35,
+          "intensity": 100
+        },
+        "keyframes": {
+          "video.scale": [
+            {
+              "t": 0.0,
+              "v": 100.0,
+              "easing": "glide"
+            },
+            {
+              "t": 3.5,
+              "v": 108.0
+            }
+          ]
+        }
+      },
+      "media:dir7-d2": {
+        "animation": {
+          "inPreset": "slide-up",
+          "outPreset": "fade",
+          "duration": 0.4,
+          "intensity": 100
+        },
+        "keyframes": {
+          "video.scale": [
+            {
+              "t": 0.0,
+              "v": 106.0,
+              "easing": "settle"
+            },
+            {
+              "t": 4.0,
+              "v": 100.0
+            }
+          ]
+        }
+      }
+    },
+    "manifest": {
+      "timelineMediaItemIds": [
+        "dir7-d1",
+        "dir7-d2"
+      ],
+      "clipAttributeKeys": [
+        "media:dir7-d1",
+        "media:dir7-d2"
+      ],
+      "trackIds": [
+        "track-video-2"
+      ]
+    },
+    "placed": 2
+  }
+}

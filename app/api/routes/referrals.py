@@ -18,16 +18,21 @@ from sqlalchemy.orm import Session
 from app.db.database import get_db
 from app.db.models import AccountCreditLedger, Referral, User
 from app.services.referrals import (
+    MAX_INVITE_SENDS,
     REFERRAL_TERMS,
+    ReferralInviteError,
     ReferralRedemptionError,
     build_referral_link,
     credit_balance,
     credits_earned_from_referrals,
     describe_code_for_signup,
+    expire_stale_invites,
     get_or_create_referral_code,
-    passes_left,
     passes_used,
     redeem_referral_code,
+    resend_email_invite,
+    revoke_email_invite,
+    send_email_invite,
 )
 from app.utils.security import get_current_user
 
@@ -39,6 +44,10 @@ class ClaimBody(BaseModel):
     code: str
 
 
+class InviteBody(BaseModel):
+    email: str
+
+
 def _display_name(user: User | None) -> str | None:
     if not user:
         return None
@@ -47,7 +56,11 @@ def _display_name(user: User | None) -> str | None:
 
 
 def _referral_payload(db: Session, referral: Referral) -> dict:
-    invitee = db.query(User).filter(User.id == referral.invitee_user_id).first()
+    invitee = (
+        db.query(User).filter(User.id == referral.invitee_user_id).first()
+        if referral.invitee_user_id
+        else None
+    )
     return {
         "id": referral.id,
         "name": _display_name(invitee),
@@ -59,6 +72,12 @@ def _referral_payload(db: Session, referral: Referral) -> dict:
         "converted_at": referral.converted_at,
         "rewarded_at": referral.rewarded_at,
         "reward_credits": referral.reward_credits,
+        "invited_at": referral.invited_at,
+        "invite_expires_at": referral.invite_expires_at,
+        "invite_sends": referral.invite_sends,
+        # Computed here so the button's enabled state and the endpoint's rule
+        # can't disagree — the panel doesn't get to guess at the send cap.
+        "can_resend": referral.status == "invited" and referral.invite_sends < MAX_INVITE_SENDS,
     }
 
 
@@ -68,11 +87,13 @@ def get_my_referrals(
     current_user: User = Depends(get_current_user),
 ):
     code = get_or_create_referral_code(db, current_user)
+    # Invites are retired lazily, on the read of the only page that shows them.
+    expire_stale_invites(db, current_user.id)
 
     referrals = (
         db.query(Referral)
         .filter(Referral.referrer_user_id == current_user.id)
-        .order_by(Referral.signed_up_at.desc())
+        .order_by(Referral.created_at.desc(), Referral.id.desc())
         .all()
     )
 
@@ -92,6 +113,73 @@ def get_my_referrals(
         },
         "referrals": [_referral_payload(db, r) for r in referrals],
     }
+
+
+@router.post("/invites", status_code=201)
+def create_email_invite(
+    body: InviteBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Email a guest pass to an address.
+
+    Sending reserves one of the referrer's passes, which is what bounds this to
+    three addresses rather than three thousand — see
+    ``services.referrals.send_email_invite``.
+    """
+    try:
+        referral = send_email_invite(db, current_user, body.email)
+    except ReferralInviteError as exc:
+        status = 429 if exc.reason == "rate_limited" else 409 if exc.reason in (
+            "duplicate",
+            "exhausted",
+        ) else 400
+        raise HTTPException(status_code=status, detail=exc.message) from exc
+
+    return {"invite": _referral_payload(db, referral)}
+
+
+@router.post("/invites/{referral_id}/resend")
+def resend_invite(
+    referral_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        referral = resend_email_invite(db, current_user, referral_id)
+    except ReferralInviteError as exc:
+        status = (
+            404
+            if exc.reason == "not_found"
+            else 429
+            if exc.reason == "rate_limited"
+            else 409
+        )
+        raise HTTPException(status_code=status, detail=exc.message) from exc
+
+    return {"invite": _referral_payload(db, referral)}
+
+
+@router.delete("/invites/{referral_id}", status_code=204)
+def revoke_invite(
+    referral_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Withdraw an outstanding invite and get the pass back.
+
+    Cannot un-send the mail — the link in it is the shared referral code. What
+    it stops is holding a pass for someone who isn't coming.
+    """
+    try:
+        revoke_email_invite(db, current_user, referral_id)
+    except ReferralInviteError as exc:
+        raise HTTPException(
+            status_code=404 if exc.reason == "not_found" else 409, detail=exc.message
+        ) from exc
+    return None
 
 
 @router.get("/me/credits")

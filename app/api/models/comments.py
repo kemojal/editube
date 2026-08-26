@@ -74,6 +74,9 @@ class CommentResponse(BaseModel):
     review_link_id: Optional[int] = None
     client_mutation_id: Optional[str] = None
     revision: int = 1
+    # Points at the original on the previous version when this change request
+    # was carried forward.
+    carried_from_comment_id: Optional[int] = None
     attachments: List[dict] = Field(default_factory=list)
     likes_count: int = 0
     liked_by_me: bool = False

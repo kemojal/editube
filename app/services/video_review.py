@@ -246,6 +246,7 @@ def build_review(
         remove_fillers=opts.remove_fillers,
         remove_silences=opts.remove_silences,
         remove_bad_takes=opts.remove_bad_takes,
+        remove_repeats=opts.remove_repeats,
         aggressiveness=opts.aggressiveness,
     )
     counts, removable = _summarize_analysis(analysis)

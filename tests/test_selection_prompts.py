@@ -21,7 +21,7 @@ class SelectionPromptTests(unittest.TestCase):
         self.assertIsNone(extract({"selection": {"points": [], "strokes": []}}))
 
     def test_include_and_exclude_become_labels_one_and_zero(self):
-        points, labels = extract(
+        prompts = extract(
             {
                 "selection": {
                     "points": [
@@ -31,12 +31,30 @@ class SelectionPromptTests(unittest.TestCase):
                 }
             }
         )
+        self.assertIsNotNone(prompts)
+        points, labels = prompts.flattened()
         self.assertEqual(points, [(0.5, 0.5), (0.1, 0.2)])
         self.assertEqual(labels, [1, 0])
 
     def test_missing_include_defaults_to_positive(self):
-        _, labels = extract({"selection": {"points": [{"x": 0.5, "y": 0.5}]}})
+        prompts = extract({"selection": {"points": [{"x": 0.5, "y": 0.5}]}})
+        self.assertIsNotNone(prompts)
+        _, labels = prompts.flattened()
         self.assertEqual(labels, [1])
+
+    def test_each_include_click_is_an_independent_additive_group(self):
+        prompts = extract(
+            {
+                "selection": {
+                    "points": [
+                        {"x": 0.2, "y": 0.5, "include": True},
+                        {"x": 0.8, "y": 0.5, "include": True},
+                    ]
+                }
+            }
+        )
+        self.assertIsNotNone(prompts)
+        self.assertEqual(prompts.positive_groups, (((0.2, 0.5),), ((0.8, 0.5),)))
 
     def test_malformed_points_are_skipped_not_crashed_on(self):
         result = extract(
@@ -52,13 +70,15 @@ class SelectionPromptTests(unittest.TestCase):
             }
         )
         self.assertIsNotNone(result)
-        points, labels = result
+        points, labels = result.flattened()
         self.assertEqual(len(points), 1)
         self.assertEqual(len(labels), 1)
 
     def test_strokes_become_sampled_point_runs(self):
         stroke = {"points": [{"x": i / 100, "y": 0.5} for i in range(100)], "include": True}
-        points, labels = extract({"selection": {"points": [], "strokes": [stroke]}})
+        prompts = extract({"selection": {"points": [], "strokes": [stroke]}})
+        self.assertIsNotNone(prompts)
+        points, labels = prompts.flattened()
 
         # Sampled, not sent wholesale: SAM degrades with a very large prompt set,
         # and 100 near-identical points add nothing over a dozen.
@@ -68,11 +88,38 @@ class SelectionPromptTests(unittest.TestCase):
 
     def test_eraser_strokes_carry_the_negative_label(self):
         stroke = {"points": [{"x": 0.1, "y": 0.1}, {"x": 0.2, "y": 0.2}], "include": False}
-        _, labels = extract({"selection": {"strokes": [stroke]}})
-        self.assertTrue(all(label == 0 for label in labels))
+        prompts = extract(
+            {
+                "selection": {
+                    "points": [{"x": 0.5, "y": 0.5, "include": True}],
+                    "strokes": [stroke],
+                }
+            }
+        )
+        self.assertIsNotNone(prompts)
+        _, labels = prompts.flattened()
+        self.assertEqual(labels[0], 1)
+        self.assertTrue(all(label == 0 for label in labels[1:]))
+
+    def test_negative_marks_without_a_subject_return_none(self):
+        self.assertIsNone(
+            extract(
+                {
+                    "selection": {
+                        "points": [{"x": 0.5, "y": 0.5, "include": False}],
+                        "strokes": [
+                            {
+                                "points": [{"x": 0.1, "y": 0.1}],
+                                "include": False,
+                            }
+                        ],
+                    }
+                }
+            )
+        )
 
     def test_points_and_strokes_combine(self):
-        points, labels = extract(
+        prompts = extract(
             {
                 "selection": {
                     "points": [{"x": 0.5, "y": 0.5, "include": True}],
@@ -82,6 +129,8 @@ class SelectionPromptTests(unittest.TestCase):
                 }
             }
         )
+        self.assertIsNotNone(prompts)
+        points, labels = prompts.flattened()
         self.assertGreater(len(points), 1)
         self.assertIn(0, labels)
         self.assertIn(1, labels)
@@ -99,13 +148,31 @@ class SelectionPromptTests(unittest.TestCase):
                 }
             }
         )
-        points, labels = result
+        self.assertIsNotNone(result)
+        points, labels = result.flattened()
         self.assertEqual(len(points), len(labels))
 
     def test_short_stroke_is_not_dropped_by_sampling(self):
         stroke = {"points": [{"x": 0.1, "y": 0.1}, {"x": 0.2, "y": 0.2}], "include": True}
-        points, _ = extract({"selection": {"strokes": [stroke]}})
+        prompts = extract({"selection": {"strokes": [stroke]}})
+        self.assertIsNotNone(prompts)
+        points, _ = prompts.flattened()
         self.assertGreaterEqual(len(points), 1)
+
+    def test_coordinates_are_clamped_to_the_source_frame(self):
+        prompts = extract(
+            {
+                "selection": {
+                    "points": [
+                        {"x": -2, "y": 3, "include": True},
+                        {"x": 4, "y": -1, "include": False},
+                    ]
+                }
+            }
+        )
+        self.assertIsNotNone(prompts)
+        self.assertEqual(prompts.positive_groups, (((0.0, 1.0),),))
+        self.assertEqual(prompts.negative_points, ((1.0, 0.0),))
 
 
 if __name__ == "__main__":

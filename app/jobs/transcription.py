@@ -396,6 +396,30 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
                         db.rollback()
                         logger.exception("Transcription progress touch failed for video %s", video_id)
 
+            # Audio-level speech/silence analysis (Silero VAD over the same
+            # WAV Whisper just consumed). Segment gaps cannot see pauses that
+            # Whisper merged into one segment; this can. Enhancement only —
+            # never fails the job.
+            audio_analysis = None
+            try:
+                from app.services.audio_analysis import analyze_wav_speech
+
+                _touch_transcription_timestamp(db, video_id)
+                audio_analysis = analyze_wav_speech(wav_path, offset_seconds=range_start)
+            except Exception:
+                logger.exception("Audio analysis failed for video %s", video_id)
+
+            if audio_analysis:
+                # The WAV knows the real duration; the videos row often doesn't
+                # (NULL for direct uploads). Only trust it when the WAV covers
+                # the whole source, i.e. no source-range trim was applied.
+                analysis_duration = float(audio_analysis.get("duration") or 0)
+                if video_duration is None and range_start == 0 and range_end is None and analysis_duration > 0:
+                    video_duration = analysis_duration
+                    if not video.duration:
+                        video.duration = int(round(analysis_duration))
+                        db.add(video)
+
             nonempty = [s for s in segments if (s.get("text") or "").strip()]
             if not nonempty:
                 vt.segments = []
@@ -417,6 +441,7 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
             vt.segments = nonempty
             vt.speakers = sorted(speaker_labels)
             vt.speaker_count = len(speaker_labels)
+            vt.audio_analysis = audio_analysis
             vt.status = "completed"
             vt.model_name = selected_model.id
             vt.error_message = None
@@ -437,9 +462,22 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
                     segments=nonempty,
                     video_duration=video_duration,
                     transcription_id=vt.id,
+                    audio_analysis=audio_analysis,
                 )
             except Exception:
                 logger.exception("Post-transcription auto-edit hook failed for video %s", video_id)
+
+            # The AI creative director, if this video was signed up for one.
+            # Deliberately after the auto-edit above: the director reads the
+            # video as it will actually be watched, not the uncut take, so it
+            # must not run until the cut has been seeded. Never raises — the
+            # transcript and the cut are already done and are the valuable part.
+            try:
+                from app.services.director_trigger import run_post_cut_director
+
+                run_post_cut_director(db, video_id)
+            except Exception:
+                logger.exception("Post-cut director trigger failed for video %s", video_id)
 
             try:
                 from app.services.repurpose_pipeline import create_clips_for_completed_repurpose_jobs

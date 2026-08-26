@@ -4,10 +4,12 @@ import os
 from collections import defaultdict
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+import json
+
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
-from typing import List
+from typing import List, Optional
 
 from app.db.database import get_db
 from app.db.models import (
@@ -16,7 +18,6 @@ from app.db.models import (
     Comment,
     CommentLike,
     CommentAttachment,
-    Notification,
     User,
     UserSettings,
     VideoTranscription,
@@ -48,9 +49,14 @@ from app.api.models.comments import (
 from app.jobs.queue import (
     enqueue_mention_email_job,
     enqueue_comment_notification_email_job,
-    enqueue_push_notification_job,
 )
 from app.services.notification_prefs import wants_comment_emails
+from app.services.notifications import (
+    TYPE_COMMENT,
+    TYPE_MENTION,
+    NotificationSpec,
+    emit_notifications,
+)
 from app.services.mentions import extract_mention_handles, resolve_mentioned_users
 from app.services.comment_export import export_comments
 from app.services.comment_workflow import (
@@ -62,8 +68,8 @@ from app.services.comment_workflow import (
     sync_is_resolved_from_status,
 )
 from app.utils.security import get_current_user
-from app.websocket_manager import notifications_ws_manager
 from app.services.activity import log_activity
+from app.utils.cloudinary import upload_file_to_cloudinary_with_meta
 
 router = APIRouter(
     prefix="/projects/{project_id}/videos/{video_id}/comments",
@@ -199,6 +205,9 @@ def _comment_response(comment: Comment, current_user_id: int, db: Session) -> di
         "review_link_id": comment.review_link_id,
         "client_mutation_id": getattr(comment, "client_mutation_id", None),
         "revision": getattr(comment, "revision", 1) or 1,
+        # Set when this was copied forward from an earlier cut, so the UI can
+        # mark it "from v2" instead of implying it was raised against this one.
+        "carried_from_comment_id": getattr(comment, "carried_from_comment_id", None),
         "attachments": [
             {
                 "id": att.id,
@@ -380,8 +389,8 @@ async def add_comment(
     )
     actor_name = current_user.name or current_user.email or "A teammate"
 
-    created_notifications: list[Notification] = []
     notified_ids: set[int] = set()
+    specs: list[NotificationSpec] = []
 
     # --- @mentions: notify + email mentioned users (gated by email_mentions) ---
     handles = extract_mention_handles(comment.text or "")
@@ -393,16 +402,17 @@ async def add_comment(
             actor_user_id=current_user.id,
         )
         for recipient in recipients:
-            notification = Notification(
-                user_id=recipient.id,
-                type="mention",
-                project_id=project_id,
-                video_id=video_id,
-                comment_id=db_comment.id,
-                read=False,
+            specs.append(
+                NotificationSpec(
+                    user_id=recipient.id,
+                    type=TYPE_MENTION,
+                    project_id=project_id,
+                    video_id=video_id,
+                    comment_id=db_comment.id,
+                    actor_user_id=current_user.id,
+                    message=f"{actor_name} mentioned you in a comment",
+                )
             )
-            db.add(notification)
-            created_notifications.append(notification)
             notified_ids.add(recipient.id)
             settings = db.query(UserSettings).filter(UserSettings.user_id == recipient.id).first()
             if settings is not None and not settings.email_mentions:
@@ -428,16 +438,20 @@ async def add_comment(
     owner_ids -= {current_user.id}
     owner_ids -= notified_ids
     for owner_id in owner_ids:
-        owner_notification = Notification(
-            user_id=owner_id,
-            type="comment",
-            project_id=project_id,
-            video_id=video_id,
-            comment_id=db_comment.id,
-            read=False,
+        specs.append(
+            NotificationSpec(
+                user_id=owner_id,
+                type=TYPE_COMMENT,
+                project_id=project_id,
+                video_id=video_id,
+                comment_id=db_comment.id,
+                actor_user_id=current_user.id,
+                message=f"{actor_name} commented on {db_video.name}",
+                # A review pass leaves many comments at once; fold them into
+                # one alert per commenter per video.
+                group_key=f"comment:{video_id}:{current_user.id}",
+            )
         )
-        db.add(owner_notification)
-        created_notifications.append(owner_notification)
         if wants_comment_emails(db, owner_id):
             enqueue_comment_notification_email_job(
                 recipient_user_id=owner_id,
@@ -448,25 +462,7 @@ async def add_comment(
                 comment_url=comment_url,
             )
 
-    if created_notifications:
-        db.commit()
-        for notification in created_notifications:
-            enqueue_push_notification_job(notification.user_id, notification.id)
-            await notifications_ws_manager.send_to_user(
-                notification.user_id,
-                {
-                    "event": "notification.new",
-                    "payload": {
-                        "id": notification.id,
-                        "type": notification.type,
-                        "read": notification.read,
-                        "project_id": notification.project_id,
-                        "video_id": notification.video_id,
-                        "comment_id": notification.comment_id,
-                        "created_at": notification.created_at.isoformat() if notification.created_at else None,
-                    },
-                },
-            )
+    await emit_notifications(db, specs)
 
     return _comment_response(db_comment, current_user.id, db)
 
@@ -668,6 +664,83 @@ def bulk_comment_action(
             updated += 1
     db.commit()
     return {"ok": True, "updated": updated}
+
+
+_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+
+_ATTACHMENT_TYPE_PREFIXES = {
+    "voice_note": ("audio/", "video/webm"),  # Safari records audio as video/mp4-ish containers
+    "image": ("image/",),
+    "file": (),  # anything — it renders as a download chip, never executes
+}
+
+
+@router.post("/{comment_id}/attachments/upload", response_model=CommentResponse)
+def upload_comment_attachment(
+    project_id: int,
+    video_id: int,
+    comment_id: int,
+    file: UploadFile = File(...),
+    attachment_type: str = Form("file"),
+    duration_ms: Optional[int] = Form(None),
+    # JSON-encoded number array; Form fields cannot carry structured data.
+    waveform: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Store the binary and create the attachment in one request.
+
+    The JSON endpoint below takes a `file_url`, which presumes the caller
+    already has somewhere to put bytes — the UI never did, which is a large
+    part of why this whole feature sat unshipped with a finished schema.
+    """
+    if attachment_type not in _ATTACHMENT_TYPE_PREFIXES:
+        raise HTTPException(status_code=400, detail="Unknown attachment type")
+
+    prefixes = _ATTACHMENT_TYPE_PREFIXES[attachment_type]
+    content_type = (file.content_type or "").lower()
+    if prefixes and not content_type.startswith(prefixes):
+        raise HTTPException(
+            status_code=400,
+            detail=f"A {attachment_type.replace('_', ' ')} must be {prefixes[0]}*",
+        )
+
+    stream = file.file
+    stream.seek(0, 2)
+    size = int(stream.tell() or 0)
+    stream.seek(0)
+    if size > _ATTACHMENT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Attachments are capped at 25 MB")
+
+    parsed_waveform = None
+    if waveform:
+        try:
+            candidate = json.loads(waveform)
+            if isinstance(candidate, list):
+                parsed_waveform = [
+                    round(max(0.0, min(1.0, float(v))), 3) for v in candidate[:128]
+                ]
+        except (ValueError, TypeError):
+            parsed_waveform = None
+
+    resource_type = "image" if attachment_type == "image" else "video"
+    url = str(upload_file_to_cloudinary_with_meta(file, resource_type=resource_type)["url"])
+
+    return add_comment_attachment(
+        project_id=project_id,
+        video_id=video_id,
+        comment_id=comment_id,
+        body=CommentAttachmentCreate(
+            attachment_type=attachment_type,
+            file_url=url,
+            mime_type=content_type or None,
+            duration_ms=duration_ms,
+            bytes_size=size,
+            waveform=parsed_waveform,
+        ),
+        db=db,
+        current_user=current_user,
+    )
 
 
 @router.post("/{comment_id}/attachments", response_model=CommentResponse)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Final
 
@@ -21,13 +22,24 @@ GB_IN_BYTES: Final[int] = 1024 * 1024 * 1024
 PLAN_ALIASES: Final[dict[str, str]] = {
     # New packaging names
     "free": "free",
+    # `basic` was an alias for `free` while no Basic product was sold. It is a
+    # real paid tier now, so it maps to itself — anything that used to write
+    # "basic" meaning "free" would otherwise silently grant a paid tier. No
+    # rows carried the value at the time of the change, so nothing migrated.
+    "basic": "basic",
     "pro": "pro",
     "scale": "scale",
     "enterprise": "enterprise",
     # Backward compatibility with current DB/frontend values
-    "basic": "free",
     "elite": "scale",
 }
+
+#: Tiers that require money. `enterprise` is sold offline, so it never comes
+#: out of a self-serve checkout, but it is still a paid entitlement.
+PAID_PLANS: Final[frozenset[str]] = frozenset({"basic", "pro", "scale", "enterprise"})
+
+#: Tiers that can be bought through Stripe Checkout without talking to sales.
+SELF_SERVE_PLANS: Final[frozenset[str]] = frozenset({"basic", "pro", "scale"})
 
 PLAN_SPECS: Final[dict[str, PlanSpec]] = {
     "free": PlanSpec(
@@ -38,6 +50,16 @@ PLAN_SPECS: Final[dict[str, PlanSpec]] = {
         storage_addon_tb_price_usd=None,
         grace_days=7,
         ugc_credits_monthly=3,
+    ),
+    "basic": PlanSpec(
+        key="basic",
+        label="Basic",
+        seat_cap=5,
+        included_storage_bytes=250 * GB_IN_BYTES,
+        # No storage add-on: overage on Basic is the reason to move to Pro.
+        storage_addon_tb_price_usd=None,
+        grace_days=7,
+        ugc_credits_monthly=15,
     ),
     "pro": PlanSpec(
         key="pro",
@@ -69,10 +91,52 @@ PLAN_SPECS: Final[dict[str, PlanSpec]] = {
 }
 
 
-def normalize_plan_key(plan: str | None) -> str:
+def editube_product_prefixes() -> tuple[str, ...]:
+    """Product-name prefixes that mark a Stripe product as ours.
+
+    Overridable with `EDITUBE_STRIPE_PRODUCT_PREFIXES` (comma-separated) for
+    deployments whose products are named differently.
+    """
+    raw = os.getenv("EDITUBE_STRIPE_PRODUCT_PREFIXES", "editube")
+    return tuple(p.strip().lower() for p in raw.split(",") if p.strip())
+
+
+def is_editube_product(name: str | None) -> bool | None:
+    """True / False / None for "is this Stripe product ours?".
+
+    `None` means the product's name is not known locally — usually a price
+    webhook that referenced the product by id before the product itself was
+    synced. That is deliberately distinct from a confident False, because
+    refusing to map a genuine Editube price merely because its product name
+    has not arrived yet would silently break checkout.
+
+    This exists because one Stripe account serves several unrelated products.
+    Matching on the product name is the durable rule; per-price metadata is
+    what that rule is then expressed as.
+    """
+    if not name:
+        return None
+    lowered = name.strip().lower()
+    return any(lowered.startswith(prefix) for prefix in editube_product_prefixes())
+
+
+def resolve_plan_key(plan: str | None) -> str | None:
+    """Canonical plan key, or None when the input names no known plan.
+
+    The distinction matters wherever an absent plan and an unrecognised one
+    should be handled differently. `normalize_plan_key` collapses both to
+    "free", which is right for "what tier is this user on?" and wrong for
+    "did the caller ask for a real plan?" — `PUT /onboarding/plan` used the
+    collapsing version and so quietly downgraded anyone who sent "PRO".
+    """
     if not plan:
-        return "free"
-    return PLAN_ALIASES.get(plan, "free")
+        return None
+    return PLAN_ALIASES.get(plan.strip().lower())
+
+
+def normalize_plan_key(plan: str | None) -> str:
+    """Canonical plan key, defaulting to "free" for anything unrecognised."""
+    return resolve_plan_key(plan) or "free"
 
 
 def get_plan_spec(plan: str | None) -> PlanSpec:

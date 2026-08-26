@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from typing import Optional, List
 
 from app.db.database import get_db
+from app.services.video_status import normalize_status
 from app.db.models import Annotation, Comment, Project, Folder, Video, User
 from app.services.project_access import assert_write_project_content, can_access_project
 from app.api.models.folders import (
@@ -189,6 +190,7 @@ def get_project_contents(
             uploader_id=v.uploader_id,
             created_at=v.created_at,
             updated_at=v.updated_at,
+            status=normalize_status(v.status),
             comment_count=comment_counts.get(v.id, 0),
             task_count=task_counts.get(v.id, 0),
             contributors=contributors_map.get(v.id, []),
