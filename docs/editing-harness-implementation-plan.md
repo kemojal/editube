@@ -2,7 +2,7 @@
 
 ## Product Requirements and Implementation Plan
 
-- **Status:** Proposed — revised 2026-08-29 against a full audit of `editube` and `editube-frontend`
+- **Status:** In implementation — Phase 0 substrate and the Phase 1 engine + Subject-behind-text recipe landed on `feat/editing-harness` (backend `42cace1`, frontend `8c1db3b`, 2026-08-29): revisioned draft store with one write path and optimistic concurrency, TimeMap with cross-language fixtures, capability registry, harness run/operation engine with inverse-manifest revert, staged apply through the effect machinery, run-addressed REST surface, the compound-edits panel with the §16.3 draft-handover protocol, group fields through the loader round trip, `textOverlays` persistence, the four §5.3 Phase-0 export bug fixes, and the OpenRouter free-model planner with a live e2e. Remaining: the rest of Workstream E (captions/elements/speed/audio export), tracking repair (G7), Phases 2–5.
 - **Date:** 2026-08-29
 - **Scope:** Rough Cut editor, AI Creative Director, AI Review fixes, reusable editing recipes, and future editing agents
 - **Primary objective:** Turn natural-language or structured editing intent into safe, deterministic, reviewable, reversible, and export-correct compound edits.
