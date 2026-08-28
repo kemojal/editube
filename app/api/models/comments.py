@@ -41,8 +41,7 @@ class CommentUserResponse(BaseModel):
     email: str
     avatar_url: str | None = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class CommentResponse(BaseModel):
@@ -88,8 +87,7 @@ class CommentResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class CommentWithRepliesResponse(CommentResponse):

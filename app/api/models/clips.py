@@ -63,8 +63,7 @@ class ClipStyleOut(BaseModel):
     original_audio_volume: float
     video_keyframes: Any | None = None
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class ClipStyleUpdate(BaseModel):
@@ -210,8 +209,7 @@ class ClipOut(BaseModel):
     updated_at: datetime
     style: ClipStyleOut | None = None
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class ClipRenderRequest(BaseModel):
@@ -255,8 +253,7 @@ class TemplateOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 # --- Repurpose wizard -----------------------------------------------------
@@ -334,8 +331,7 @@ class RepurposeJobOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class RepurposeUserDefaultsUpdate(BaseModel):

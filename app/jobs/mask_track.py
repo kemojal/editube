@@ -308,7 +308,7 @@ def mask_track_job(ai_result_id: int) -> None:
     try:
         row = db.query(AiResult).filter(AiResult.id == ai_result_id).first()
         if row is None or row.result_type != "mask_track":
-            return
+            raise RuntimeError(f"Mask tracking result {ai_result_id} was removed before processing")
 
         if row.status not in ("queued", "processing"):
             # Already cancelled/failed before the worker picked it up.
@@ -463,5 +463,6 @@ def mask_track_job(ai_result_id: int) -> None:
                 db.commit()
         except Exception:
             logger.exception("mask_track_job: failed to record failure for ai_result=%s", ai_result_id)
+        raise
     finally:
         db.close()

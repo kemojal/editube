@@ -31,8 +31,7 @@ class NLESessionResponse(BaseModel):
     is_active: bool
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 # ── Markers (comment ↔ NLE marker interchange) ───────────────────────
@@ -103,8 +102,7 @@ class ProxyResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class ProxyListResponse(BaseModel):
@@ -144,8 +142,7 @@ class WatchFolderResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class WatchFolderFileEntry(BaseModel):

@@ -11,6 +11,7 @@ from alembic import context
 from app.db.database import Base, SQLALCHEMY_DATABASE_URL, connect_args_for
 # Import all models so Alembic can detect them for autogenerate
 import app.db.models  # noqa: F401
+import app.db.log_models  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

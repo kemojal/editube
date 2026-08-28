@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import UgcCreditLedger, User, Workspace
 from app.services.pricing import get_plan_spec
+from app.services.product_analytics import emit_after_commit
 
 
 def credit_cost_per_variation() -> int:
@@ -95,7 +96,24 @@ def reserve(db: Session, workspace_id: int, amount: int) -> bool:
     if amount <= 0:
         return True
     ensure_monthly_grant(db, workspace_id)
-    if balance(db, workspace_id) < amount:
+    available = balance(db, workspace_id)
+    if available < amount:
+        ws = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+        if ws is not None:
+            emit_after_commit(
+                "quota_threshold_reached",
+                event_id=f"quota:ugc_credits:{workspace_id}:{_current_period()}:{available}",
+                user_id=ws.owner_user_id,
+                workspace_id=workspace_id,
+                properties={
+                    "quota_key": "ugc_credits",
+                    "threshold_percent": 100,
+                    "used": max(0, amount - available),
+                    "cap": available,
+                    "needed": amount,
+                    "result": "blocked",
+                },
+            )
         return False
     _append(db, workspace_id, -amount, "reserve")
     db.commit()

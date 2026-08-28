@@ -73,6 +73,9 @@ class VideoFromUploadCreate(BaseModel):
     # Spoken language for transcription, ISO 639-1 (e.g. "en"). "auto"/""/absent = auto-detect.
     language: Optional[str] = None
     size_bytes: Optional[int] = None
+    # Trusted attribution for a completed Google Drive import. The API verifies
+    # ownership, terminal status, and the storage URL before accepting it.
+    drive_import_id: Optional[int] = None
     # When set, this registration becomes the next version in that video's
     # chain — same semantics as the multipart route's `version_of` form field,
     # so the resumable browser-to-storage path gets carry-forward, approval
@@ -98,8 +101,7 @@ class VideoTranscriptionNested(BaseModel):
     # Language Whisper actually detected (persisted even in auto-detect mode).
     detected_language: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class UploaderResponse(BaseModel):
@@ -108,8 +110,7 @@ class UploaderResponse(BaseModel):
     email: str
     avatar_url: str | None = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class VideoDetailResponse(BaseModel):
@@ -138,8 +139,7 @@ class VideoDetailResponse(BaseModel):
     # True when the viewer may moderate others' comments (workflow status, assignee, etc.).
     can_moderate: bool = False
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class ProjectSummary(BaseModel):
@@ -147,8 +147,7 @@ class ProjectSummary(BaseModel):
     name: str
     description: str | None = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class VideoWithProjectResponse(VideoDetailResponse):
@@ -170,8 +169,7 @@ class VideoVersionSummary(BaseModel):
     # without a request per version.
     status: str = "in_progress"
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 VideoWithProjectResponse.model_rebuild()

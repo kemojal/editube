@@ -128,7 +128,7 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
     try:
         row = db.query(AiResult).filter(AiResult.id == ai_result_id).first()
         if row is None or row.result_type != "rough_cut_effect":
-            return
+            raise RuntimeError(f"Rough-cut effect {ai_result_id} was removed before processing")
         payload = dict(row.result_data or {})
         video = db.query(Video).filter(Video.id == row.video_id).first()
         if video is None:
@@ -266,9 +266,10 @@ def rough_cut_effect_job(ai_result_id: int) -> None:
             _complete(db, row, clip_key, effect_type, output_url)
     except Exception as exc:
         if "row" in locals() and row is not None:
+            if _was_canceled(db, row):
+                return
             _fail(db, row, str(exc))
-        else:
-            raise
+        raise
     finally:
         db.close()
 

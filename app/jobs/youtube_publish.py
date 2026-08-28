@@ -25,6 +25,7 @@ from app.db.models import ThumbnailVariant, UserYoutubeConnection, Video, VideoC
 from app.services.youtube_chapters import chapter_lines_from_rows, merge_description_with_chapters
 from app.services.youtube_credentials import persist_google_credentials, refresh_credentials_if_needed
 from app.utils.token_crypto import decrypt_secret
+from app.services.product_analytics import emit, emit_once
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,33 @@ def _fail(db: Session, pub: VideoPublication, message: str) -> None:
         pub.status = "failed"
         pub.error_message = message[:4000]
         db.add(pub)
+        emit_once(
+            db,
+            "publication_failed",
+            event_id=f"publication:{pub.id}:failed",
+            user_id=pub.created_by,
+            properties={
+                "platform": "youtube",
+                "feature_key": "youtube_publish",
+                "publication_id": pub.id,
+                "error_code": "publish_failed",
+                "result": "failure",
+            },
+            source="worker",
+        )
+        emit_once(
+            db,
+            "feature_failed",
+            event_id=f"feature:youtube-publish:publication:{pub.id}:failed",
+            user_id=pub.created_by,
+            properties={
+                "feature_key": "youtube_publish",
+                "error_code": "publish_failed",
+                "failure_class": "processing",
+                "result": "failure",
+            },
+            source="worker",
+        )
         db.commit()
     except Exception:
         logger.exception("Could not persist publication failure for %s", pub.id)
@@ -60,10 +88,10 @@ def youtube_publish_job(publication_id: int) -> None:
         pub = db.query(VideoPublication).filter(VideoPublication.id == publication_id).first()
         if not pub:
             logger.error("youtube_publish_job: publication %s not found", publication_id)
-            return
+            raise RuntimeError(f"Publication {publication_id} not found")
         if (pub.platform or "").lower() != "youtube":
             logger.warning("youtube_publish_job: publication %s is not youtube", publication_id)
-            return
+            raise RuntimeError(f"Publication {publication_id} is not a YouTube publication")
 
         if pub.status == "published" and pub.external_id:
             logger.info("youtube_publish_job: publication %s already published", publication_id)
@@ -72,17 +100,17 @@ def youtube_publish_job(publication_id: int) -> None:
         video = db.query(Video).filter(Video.id == pub.video_id).first()
         if not video or not video.file_path:
             _fail(db, pub, "Video or file_path missing.")
-            return
+            raise RuntimeError("Video or file_path missing")
 
         user_id = pub.created_by
         if not user_id:
             _fail(db, pub, "Publication has no created_by user.")
-            return
+            raise RuntimeError("Publication has no created_by user")
 
         conn = db.query(UserYoutubeConnection).filter(UserYoutubeConnection.user_id == user_id).first()
         if not conn:
             _fail(db, pub, "YouTube is not connected for this user. Connect in Creator studio.")
-            return
+            raise RuntimeError("YouTube is not connected for this user")
 
         pub.status = "processing"
         pub.error_message = None
@@ -93,7 +121,7 @@ def youtube_publish_job(publication_id: int) -> None:
             decrypt_secret(conn.refresh_token_encrypted)
         except ValueError as e:
             _fail(db, pub, str(e))
-            return
+            raise
 
         creds = refresh_credentials_if_needed(db, conn)
 
@@ -143,6 +171,30 @@ def youtube_publish_job(publication_id: int) -> None:
             ]
             pub.extra = extra
             db.add(pub)
+            emit(
+                db,
+                "publication_completed",
+                user_id=user_id,
+                properties={
+                    "platform": "youtube",
+                    "feature_key": "youtube_publish",
+                    "publication_id": pub.id,
+                    "completion_type": "dry_run",
+                    "result": "success",
+                },
+                source="worker",
+            )
+            emit(
+                db,
+                "feature_completed",
+                user_id=user_id,
+                properties={
+                    "feature_key": "youtube_publish",
+                    "completion_type": "dry_run",
+                    "result": "success",
+                },
+                source="worker",
+            )
             db.commit()
             return
 
@@ -170,11 +222,11 @@ def youtube_publish_job(publication_id: int) -> None:
                     _, response = request.next_chunk()
             except HttpError as e:
                 _fail(db, pub, f"YouTube upload failed: {e}")
-                return
+                raise RuntimeError("YouTube upload failed") from e
 
             if not response or "id" not in response:
                 _fail(db, pub, "YouTube returned no video id.")
-                return
+                raise RuntimeError("YouTube returned no video id")
 
             vid = response["id"]
             pub.external_id = vid
@@ -213,6 +265,45 @@ def youtube_publish_job(publication_id: int) -> None:
             pub.status = "published"
             pub.published_at = datetime.utcnow()
             db.add(pub)
+            emit(
+                db,
+                "publication_completed",
+                user_id=user_id,
+                properties={
+                    "platform": "youtube",
+                    "feature_key": "youtube_publish",
+                    "publication_id": pub.id,
+                    "completion_type": "published",
+                    "result": "success",
+                },
+                source="worker",
+            )
+            emit(
+                db,
+                "feature_completed",
+                user_id=user_id,
+                properties={
+                    "feature_key": "youtube_publish",
+                    "completion_type": "published",
+                    "result": "success",
+                },
+                source="worker",
+            )
+            if pub.thumbnail_variant_id:
+                emit_once(
+                    db,
+                    "feature_result_used",
+                    event_id=f"feature:thumbnail:publication:{pub.id}:published",
+                    user_id=user_id,
+                    properties={
+                        "feature_key": "thumbnail",
+                        "publication_id": pub.id,
+                        "thumbnail_variant_id": pub.thumbnail_variant_id,
+                        "result_action": "published_with_thumbnail",
+                        "result": "success",
+                    },
+                    source="worker",
+                )
             db.commit()
 
         conn2 = db.query(UserYoutubeConnection).filter(UserYoutubeConnection.user_id == user_id).first()
@@ -232,5 +323,6 @@ def youtube_publish_job(publication_id: int) -> None:
                 _fail(db, pub, str(e)[:4000])
         except Exception:
             pass
+        raise
     finally:
         db.close()

@@ -13,7 +13,7 @@ user reviews rather than something that lands on its own.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, NoReturn
 
 from app.db.database import SessionLocal
 from app.db.models import AiResult, DirectorPlan, Video, VideoTranscription
@@ -48,12 +48,12 @@ def _project_aspect(draft: dict[str, Any]) -> str:
     return aspect if aspect in {"16:9", "9:16", "1:1"} else "16:9"
 
 
-def _fail(db: Any, row: DirectorPlan, message: str) -> dict[str, Any]:
+def _fail(db: Any, row: DirectorPlan, message: str) -> NoReturn:
     row.status = "failed"
     row.stage = None
     row.error_message = message[:2000]
     db.commit()
-    return {"status": "failed", "id": row.id, "error": message}
+    raise RuntimeError(message)
 
 
 def director_job(plan_id: int) -> dict[str, Any]:
@@ -65,7 +65,7 @@ def director_job(plan_id: int) -> dict[str, Any]:
     try:
         row = db.query(DirectorPlan).filter(DirectorPlan.id == plan_id).first()
         if row is None:
-            return {"status": "missing", "id": plan_id}
+            raise RuntimeError(f"Director plan {plan_id} was removed before processing")
         if row.cancel_requested:
             row.status = "cancelled"
             row.stage = None
@@ -190,11 +190,14 @@ def director_job(plan_id: int) -> dict[str, Any]:
         try:
             db.rollback()
             row = db.query(DirectorPlan).filter(DirectorPlan.id == plan_id).first()
-            if row is not None:
-                _fail(db, row, str(exc))
+            if row is not None and row.status != "failed":
+                row.status = "failed"
+                row.stage = None
+                row.error_message = str(exc)[:2000]
+                db.commit()
         except Exception:  # noqa: BLE001
             logger.exception("Could not record the director failure for %s", plan_id)
-        return {"status": "failed", "id": plan_id, "error": str(exc)}
+        raise
     finally:
         db.close()
 

@@ -20,8 +20,7 @@ class ProjectAnalytics(ProjectAnalyticsBase):
     createdAt: datetime
     updatedAt: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 class UserAnalyticsBase(BaseModel):
     userId: int
@@ -41,5 +40,4 @@ class UserAnalytics(UserAnalyticsBase):
     createdAt: datetime
     updatedAt: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}

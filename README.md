@@ -62,6 +62,122 @@ Transactional email (invitations, subscription welcome/cancel) uses SMTP when co
 | `SMTP_USE_TLS` | `true` / `false` (default `true`; uses STARTTLS) |
 | `FRONTEND_BASE_URL` | Used in email links (e.g. `https://app.example.com`) |
 
+## Encrypted API request logging
+
+The backend keeps a best-effort operational record for every HTTP API request, whether it succeeds or fails. WebSocket traffic is excluded. The log is intended for incident investigation and aggregate API reliability analytics; it is not a replacement for the existing product-analytics event pipeline.
+
+Each request metadata record includes:
+
+- request/correlation ID, timestamp, deployment environment, release, HTTP method, normalized route template, and endpoint name;
+- status code, duration, request/response sizes, client IP and user-agent keyed hashes, and authenticated user/workspace identifiers when available;
+- sanitized request headers, with authorization credentials, cookies, API keys, signatures, and other secrets removed;
+- payload-capture state, truncation state, error classification, and enough metadata to distinguish intentionally excluded bodies from dropped or failed captures.
+
+Eligible JSON request and response bodies are recursively redacted, size-bounded, and Fernet-encrypted before entering the background write queue. The default limits are 64 KiB for request bodies and 128 KiB for response bodies. Authentication, token, MFA, OAuth callback, Stripe webhook, health, documentation, `OPTIONS`, multipart, binary, download, and streaming payloads are metadata-only. Unknown routes also default to metadata-only. Oversized or malformed JSON is never partially stored because a truncated fragment cannot be safely redacted.
+
+Retention defaults are 30 days for request metadata, 14 days for failed-request payloads, and 3 days for successful-request payloads. The application invokes a restricted database maintenance function every 24 hours to build daily reliability rollups and remove expired data. Access audits and daily rollups default to 400 days.
+
+Writes are asynchronous, bounded, batched, and fail-open: an unavailable log database must not take down the customer API. At 80% queue occupancy, encrypted payloads are shed first so metadata can continue to flow; a completely full queue then drops records. Monitor the privileged log health endpoint and application warnings; “every request” is achievable while the logging path is healthy, not a durability guarantee during infrastructure failure.
+
+### Security and access
+
+Logs live in a dedicated PostgreSQL `log` schema. The public API writes with a least-privilege `editube_log_writer` role. A separate internal-admin process reads with `editube_log_reader`. Never configure either value with the Neon database-owner credentials, and never give the public API `LOG_READ_DATABASE_URL`.
+
+Decrypted payload access is restricted to explicitly granted internal administrators. A role string alone is insufficient: the account must have an active database grant and verified MFA. Workspace owners and producers are rejected even if a grant row is inserted accidentally. Every search/decrypt/reproduction operation requires a session-bound MFA step-up issued within the previous five minutes, a stated incident/debugging reason, and an append-only access-audit record. If the audit insert fails, access fails closed. Log payloads and cryptographic keys are never sent to product analytics, Sentry, or application logs.
+
+The system produces a sanitized reproduction manifest; it does not send outbound replay requests. Credentials and cookies are replaced. `GET`/`HEAD` manifests are marked safe-method candidates, while `POST`, `PUT`, `PATCH`, and `DELETE` must be reproduced in a non-production environment or through an endpoint-specific side-effect-controlled adapter.
+
+### Configuration
+
+| Variable | Description |
+|----------|-------------|
+| `LOG_WRITE_DATABASE_URL` | PostgreSQL URL for the insert-only `editube_log_writer` role. Use the Neon pooled hostname for runtime traffic. |
+| `LOG_READ_DATABASE_URL` | PostgreSQL URL for the restricted `editube_log_reader` role. Supply only to the internal-admin deployment. |
+| `LOG_PAYLOAD_ENCRYPTION_KEY` | Dedicated Fernet key used to encrypt captured payloads. Generate it independently; it does not come from Neon. |
+| `LOG_PAYLOAD_ENCRYPTION_KEY_ID` | Non-secret identifier for the active payload key, for example `2026-08-v1`; change it when rotating keys. |
+| `LOG_HMAC_KEY` | Independent random 32-byte URL-safe base64 key for stable keyed hashes. Do not reuse the Fernet, JWT, or database password. |
+| `LOG_PAYLOAD_DECRYPTION_KEYS` | Optional JSON map of retired key IDs to Fernet keys. Keep old keys only until their payloads have expired. |
+
+Runtime database URLs have these shapes:
+
+```dotenv
+LOG_WRITE_DATABASE_URL=postgresql://editube_log_writer:<writer-password>@<pooler-host>/neondb?sslmode=require&channel_binding=require
+LOG_READ_DATABASE_URL=postgresql://editube_log_reader:<reader-password>@<pooler-host>/neondb?sslmode=require&channel_binding=require
+LOG_PAYLOAD_ENCRYPTION_KEY=<generated-fernet-key>
+LOG_PAYLOAD_ENCRYPTION_KEY_ID=2026-08-v1
+LOG_HMAC_KEY=<generated-32-byte-base64-key>
+```
+
+Generate the two application keys locally, then place them directly in the deployment secret manager:
+
+```bash
+./.venv/bin/python - <<'PY'
+import base64
+import secrets
+from cryptography.fernet import Fernet
+
+print("LOG_WRITER_ROLE_PASSWORD=" + secrets.token_urlsafe(32))
+print("LOG_READER_ROLE_PASSWORD=" + secrets.token_urlsafe(32))
+print("LOG_PAYLOAD_ENCRYPTION_KEY=" + Fernet.generate_key().decode())
+print("LOG_HMAC_KEY=" + base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
+PY
+```
+
+Do not commit generated keys or production database URLs. Treat any credential pasted into chat, an issue, or source control as compromised and rotate it before deployment.
+
+### Database and role setup
+
+Use a direct, non-pooler owner URL only for migrations and bootstrap. Runtime connections should use the pooled hostname. Run these after generating two independent high-entropy role passwords:
+
+```bash
+export LOG_MIGRATION_DATABASE_URL='postgresql://<owner>:<rotated-owner-password>@<direct-host>/neondb?sslmode=require&channel_binding=require'
+DATABASE_URL="$LOG_MIGRATION_DATABASE_URL" .venv/bin/python -m alembic upgrade head
+
+export LOG_WRITER_ROLE_PASSWORD='<generated-writer-password>'
+export LOG_READER_ROLE_PASSWORD='<different-generated-reader-password>'
+.venv/bin/python scripts/setup_request_log_database.py --create-roles --check
+```
+
+The migration creates `log.api_requests`, `log.api_payloads`, `log.access_events`, `log.admin_access_grants`, `log.api_request_daily_rollups`, and the owner-controlled `log.retention_policy`, plus the restricted zero-argument retention/rollup function. The writer cannot shorten retention or directly delete rows. The setup script creates SQL roles without inherited Neon-owner privileges and verifies the expected positive and negative grants.
+
+Grant an existing internal administrator access only after the account has an internal role and verified MFA:
+
+```bash
+.venv/bin/python scripts/manage_request_log_admin.py grant \
+  --email incident-admin@example.com \
+  --granted-by security-owner@example.com \
+  --reason 'Approved for production incident response' \
+  --expires-days 90
+```
+
+Use the same script’s `revoke` and `list` commands for lifecycle management. Grant and revoke actions are written to `log.access_events`.
+
+### Deploy the two processes
+
+Public API (`uvicorn app.main:app`):
+
+- set `LOG_WRITE_DATABASE_URL`, the active encryption key/key ID, and `LOG_HMAC_KEY`;
+- do not set `LOG_READ_DATABASE_URL`;
+- keep the request-log writer role insert-only.
+
+Internal admin API (`uvicorn app.internal_admin:app`):
+
+- set `DATABASE_URL` for normal user/session/MFA verification;
+- set `LOG_READ_DATABASE_URL`, the active/retired decryption keys, and `LOG_HMAC_KEY`;
+- do not set `LOG_WRITE_DATABASE_URL` and explicitly set `LOG_REQUESTS_ENABLED=0`;
+- expose it only on a private network or identity-aware proxy and set `LOG_ADMIN_CORS_ORIGINS` to the exact internal UI origin.
+
+The public API refuses to start if a read URL is present, and the internal service refuses to start if a write URL is present. This makes accidental role co-location a deployment failure instead of a silent loss of isolation.
+
+The internal service intentionally disables OpenAPI and documentation routes. Its workflow is:
+
+1. `POST /internal/request-logs/mfa-step-up` with the current TOTP code.
+2. Send the returned token as `X-Log-Step-Up-Token` and a meaningful `X-Log-Access-Reason` on every privileged request.
+3. Search `GET /internal/request-logs`, decrypt `GET /internal/request-logs/{id}/payload`, build a safe manifest with `GET /internal/request-logs/{id}/reproduction`, or inspect privileged activity through `GET /internal/request-logs/access-events`.
+4. Check database visibility and the latest captured request through `GET /internal/request-logs/health` using the same privileged headers.
+
+Monitor `GET /health/request-logging` on the public API for queue depth, payload shedding, dropped records, failed writes, and writer-thread health. It returns HTTP 503 when capture is degraded without exposing database errors or secrets.
+
 ## Video transcription (RQ + faster-whisper)
 
 ### What happens

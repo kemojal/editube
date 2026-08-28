@@ -86,6 +86,7 @@ def ingest_upload(
     device_name: Optional[str] = None,
     location: Optional[str] = None,
     auto_proxy: bool = True,
+    ingest_source: Optional[str] = None,
 ) -> Video:
     """Ingest a video upload (from mobile app or agent), create video record, and optionally trigger proxy.
 
@@ -139,6 +140,7 @@ def ingest_upload(
         description=description or f"Uploaded from {device_name or 'mobile'}",
         version=version,
         file_path=file_url,
+        ingest_source=(ingest_source or "").strip().lower()[:40] or None,
         size_bytes=uploaded_size,
         duration=duration,
         uploader_id=user_id,
@@ -186,6 +188,40 @@ def ingest_upload(
             logger.warning("Auto-proxy not triggered for ingested video %s: %s", db_video.id, e)
 
     return db_video
+
+
+def record_ingested_video_result_use(
+    *,
+    video: Video,
+    user_id: int,
+    workspace_id: int | None,
+) -> None:
+    """Record the first meaningful open of media imported by an integration."""
+
+    source = (getattr(video, "ingest_source", None) or "").strip().lower()
+    # Preserve attribution for historical watch-folder rows created before the
+    # dedicated origin column existed, without sending the stored folder path.
+    legacy_watch_folder = (video.description or "").startswith(
+        "Auto-uploaded from watch folder:"
+    )
+    if source != "watch_folder" and not legacy_watch_folder:
+        return
+
+    from app.services.product_analytics import emit_after_commit
+
+    emit_after_commit(
+        "feature_result_used",
+        user_id=user_id,
+        workspace_id=workspace_id,
+        properties={
+            "feature_key": "watch_folder",
+            "project_id": video.project_id,
+            "video_id": video.id,
+            "result_action": "imported_video_opened",
+            "result": "success",
+        },
+        event_id=f"feature:watch-folder:video:{video.id}:first-open",
+    )
 
 
 def check_watch_folder_files(

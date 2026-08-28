@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, BigInteger, Float, String, ForeignKey, Text, Boolean, ARRAY, UniqueConstraint
+from sqlalchemy import Column, Integer, BigInteger, Float, String, ForeignKey, Text, Boolean, ARRAY, UniqueConstraint, Index, text
 from sqlalchemy.dialects.postgresql import JSONB, NUMRANGE
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql.sqltypes import TIMESTAMP
@@ -45,6 +45,9 @@ class User(Base):
     # Set when the user self-deletes their account; PII is anonymized and all
     # sessions/tokens revoked. A non-null value means the account is deactivated.
     deleted_at = Column(TIMESTAMP, nullable=True)
+    # Set atomically by the analytics endpoint the first time the authenticated
+    # dashboard renders. This makes the activation event cross-device safe.
+    first_dashboard_viewed_at = Column(TIMESTAMP, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -206,6 +209,19 @@ class Subscription(Base):
     current_period_start = Column(TIMESTAMP, nullable=True)
     current_period_end = Column(TIMESTAMP, nullable=True)
     cancel_at_period_end = Column(Boolean, server_default="false", nullable=False)
+    cancellation_requested_at = Column(TIMESTAMP, nullable=True)
+    cancellation_effective_at = Column(TIMESTAMP, nullable=True)
+    cancellation_feedback = Column(String, nullable=True)
+    cancellation_comment_encrypted = Column(Text, nullable=True)
+    cancellation_source = Column(String, nullable=True)
+    voluntary_churn = Column(Boolean, nullable=True)
+    currency = Column(String, nullable=True)
+    unit_amount = Column(BigInteger, nullable=True)
+    quantity = Column(Integer, nullable=True)
+    discount_amount = Column(BigInteger, nullable=True)
+    discount_percent = Column(Float, nullable=True)
+    recurring_interval = Column(String, nullable=True)
+    latest_invoice_id = Column(String, nullable=True, index=True)
     ended_at = Column(TIMESTAMP, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
@@ -271,6 +287,211 @@ class StripeWebhookEvent(Base):
     stripe_event_id = Column(String, unique=True, index=True, nullable=False)
     event_type = Column(String, nullable=True)
     processed_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+class AnalyticsOutbox(Base):
+    """Transactional product-event delivery queue.
+
+    Authoritative events are inserted in the same transaction as the state
+    change they describe. A worker delivers them to the configured analytics
+    provider; provider downtime never sits on a customer request path.
+    """
+
+    __tablename__ = "analytics_outbox"
+
+    event_id = Column(String, primary_key=True)
+    event_name = Column(String, nullable=False, index=True)
+    schema_version = Column(Integer, nullable=False, server_default="1")
+    occurred_at = Column(TIMESTAMP, nullable=False, index=True)
+    source = Column(String, nullable=False)
+    environment = Column(String, nullable=False)
+    release = Column(String, nullable=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    workspace_id = Column(
+        Integer, ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    anonymous_id = Column(String, nullable=True)
+    properties = Column(JSONB, nullable=False)
+    delivery_status = Column(String, nullable=False, server_default="pending", index=True)
+    attempt_count = Column(Integer, nullable=False, server_default="0")
+    next_attempt_at = Column(TIMESTAMP, nullable=True, index=True)
+    delivery_started_at = Column(TIMESTAMP, nullable=True)
+    last_error_code = Column(String, nullable=True)
+    delivered_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+class CheckoutAttempt(Base):
+    """First-party ledger used to model matured checkout abandonment safely."""
+
+    __tablename__ = "checkout_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    workspace_id = Column(
+        Integer, ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    stripe_checkout_session_id = Column(String, unique=True, nullable=False, index=True)
+    plan = Column(String, nullable=False)
+    recurring_interval = Column(String, nullable=False)
+    campaign_id = Column(String, nullable=True)
+    source = Column(String, nullable=False, server_default="billing_checkout")
+    trial_days = Column(Integer, nullable=False, server_default="0")
+    offer_applied = Column(Boolean, nullable=False, server_default="false")
+    status = Column(String, nullable=False, server_default="created", index=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False, index=True)
+    completed_at = Column(TIMESTAMP, nullable=True)
+    canceled_at = Column(TIMESTAMP, nullable=True)
+    abandoned_at = Column(TIMESTAMP, nullable=True)
+
+
+class AnalyticsConsent(Base):
+    """Auditable analytics/replay/content-improvement preference history."""
+
+    __tablename__ = "analytics_consents"
+    __table_args__ = (
+        UniqueConstraint("anonymous_consent_id", name="uq_analytics_consent_anonymous"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    anonymous_consent_id = Column(String, nullable=False)
+    consent_state = Column(String, nullable=False, server_default="essential_only")
+    analytics_enabled = Column(Boolean, nullable=False, server_default="false")
+    replay_enabled = Column(Boolean, nullable=False, server_default="false")
+    product_data_improvement_enabled = Column(
+        Boolean, nullable=False, server_default="false"
+    )
+    consent_version = Column(String, nullable=False)
+    region_policy = Column(String, nullable=False, server_default="default")
+    global_privacy_control = Column(Boolean, nullable=False, server_default="false")
+    consented_at = Column(TIMESTAMP, nullable=True)
+    withdrawn_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class AnalyticsConsentEvent(Base):
+    """Append-only evidence for each consent grant, rejection, or withdrawal."""
+
+    __tablename__ = "analytics_consent_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    anonymous_consent_id = Column(String, nullable=False, index=True)
+    consent_state = Column(String, nullable=False)
+    analytics_enabled = Column(Boolean, nullable=False)
+    replay_enabled = Column(Boolean, nullable=False)
+    product_data_improvement_enabled = Column(Boolean, nullable=False)
+    consent_version = Column(String, nullable=False)
+    region_policy = Column(String, nullable=False)
+    global_privacy_control = Column(Boolean, nullable=False)
+    occurred_at = Column(TIMESTAMP, server_default=func.now(), nullable=False, index=True)
+
+
+class AnalyticsFeedback(Base):
+    """Restricted qualitative evidence; free text never enters PostHog."""
+
+    __tablename__ = "analytics_feedback"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    workspace_id = Column(
+        Integer, ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    prompt_key = Column(String, nullable=False, index=True)
+    reason_code = Column(String, nullable=False, index=True)
+    comment_encrypted = Column(Text, nullable=True)
+    route_template = Column(String, nullable=True)
+    feature_key = Column(String, nullable=True, index=True)
+    analytics_session_id = Column(String, nullable=True)
+    consent_version = Column(String, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False, index=True)
+
+
+class AnalyticsDataRequest(Base):
+    """Auditable export/deletion request, including provider completion state."""
+
+    __tablename__ = "analytics_data_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    distinct_id = Column(String, nullable=False, index=True)
+    request_type = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, server_default="pending", index=True)
+    provider_status = Column(JSONB, nullable=True)
+    last_error_code = Column(String, nullable=True)
+    requested_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    completed_at = Column(TIMESTAMP, nullable=True)
+
+
+class SubscriptionLifecycleEvent(Base):
+    """Append-only Stripe subscription/revenue history for cohort metrics."""
+
+    __tablename__ = "subscription_lifecycle_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_key = Column(String, unique=True, nullable=False, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    source_event_id = Column(String, nullable=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    workspace_id = Column(
+        Integer, ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    stripe_subscription_id = Column(String, nullable=True, index=True)
+    stripe_invoice_id = Column(String, nullable=True, index=True)
+    plan = Column(String, nullable=True)
+    previous_plan = Column(String, nullable=True)
+    status = Column(String, nullable=True)
+    previous_status = Column(String, nullable=True)
+    currency = Column(String, nullable=True)
+    amount_minor = Column(BigInteger, nullable=True)
+    quantity = Column(Integer, nullable=True)
+    recurring_interval = Column(String, nullable=True)
+    voluntary = Column(Boolean, nullable=True)
+    reason_code = Column(String, nullable=True)
+    effective_at = Column(TIMESTAMP, nullable=True)
+    meta_info = Column(JSONB, nullable=True)
+    occurred_at = Column(TIMESTAMP, nullable=False, index=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+class WorkspaceActivation(Base):
+    """The first durable value moment for a workspace, exactly once."""
+
+    __tablename__ = "workspace_activations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(
+        Integer,
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    feature_key = Column(String, nullable=False, index=True)
+    resource_type = Column(String, nullable=True)
+    resource_id = Column(String, nullable=True)
+    achieved_at = Column(TIMESTAMP, server_default=func.now(), nullable=False, index=True)
 
 
 class Workspace(Base):
@@ -536,6 +757,9 @@ class Video(Base):
     # per-group ordinal (v1, v2, …). NULL only transiently before backfill.
     version_group_id = Column(String, nullable=True, index=True)
     file_path = Column(Text, nullable=False)
+    # Stable, non-sensitive origin used for lifecycle analytics and ingest QA.
+    # Never store a local watch-folder path here.
+    ingest_source = Column(String, nullable=True, index=True)
     ingest_page_url = Column(Text, nullable=True)
     thumbnail_url = Column(String, nullable=True)
     status = Column(String, server_default="in_progress", nullable=False)  # in_progress, in_review, approved, needs_changes
@@ -836,6 +1060,7 @@ class ReviewSession(Base):
     approved_at = Column(TIMESTAMP, nullable=True)
     country_code = Column(String, nullable=True)
     watermark_payload = Column(JSONB, nullable=True)
+    analytics_milestones = Column(JSONB, server_default="[]", nullable=False)
 
     review_link = relationship("ReviewLink", back_populates="sessions")
     events = relationship(
@@ -865,6 +1090,10 @@ class ReviewEvent(Base):
     seq = Column(Integer, nullable=True)
     meta_info = Column(JSONB, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "seq", name="uq_review_events_session_seq"),
+    )
 
     session = relationship("ReviewSession", back_populates="events")
 
@@ -2613,7 +2842,7 @@ class UgcCreditLedger(Base):
         Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True
     )
     delta = Column(Integer, nullable=False)  # +grant / -debit
-    reason = Column(String, nullable=False)  # monthly_grant|reserve|debit|refund|topup
+    reason = Column(String, nullable=False)  # monthly_grant|reserve|debit|refund|topup|account_credit_transfer
     variation_id = Column(
         Integer, ForeignKey("aiugc.ugc_variations.id", ondelete="SET NULL"), nullable=True
     )
@@ -2714,15 +2943,107 @@ class Referral(Base):
     signed_up_at = Column(TIMESTAMP, nullable=True)
     converted_at = Column(TIMESTAMP, nullable=True)
     rewarded_at = Column(TIMESTAMP, nullable=True)
+    #: Stripe invoice that proved cash was collected. Required for precise,
+    #: idempotent refund reversal; subscription status alone is not payment.
+    reward_source_invoice_id = Column(String, nullable=True, index=True)
+    reward_reversed_at = Column(TIMESTAMP, nullable=True)
+    reward_dispute_active = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+    reward_reinstated_at = Column(TIMESTAMP, nullable=True)
     #: Credits actually granted to the referrer, snapshotted so a later change
     #: to the program's terms does not rewrite history.
     reward_credits = Column(Integer, nullable=True)
+    #: Existing-account detection is intentionally hidden from the referrer,
+    #: but it must not strand one of their finite guest passes.
+    capacity_released_at = Column(TIMESTAMP, nullable=True)
+    capacity_release_reason = Column(String, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 
     referrer = relationship("User", foreign_keys=[referrer_user_id], back_populates="referrals_made")
     invitee = relationship("User", foreign_keys=[invitee_user_id])
     referral_code = relationship("ReferralCode")
+
+
+class ReferralInviteDelivery(Base):
+    """One concrete email delivery attempt, successful or failed."""
+
+    __tablename__ = "referral_invite_deliveries"
+    __table_args__ = (
+        UniqueConstraint("referral_id", "attempt_number", name="uq_referral_delivery_attempt"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    referral_id = Column(
+        Integer, ForeignKey("referrals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    referrer_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    attempt_number = Column(Integer, nullable=False)
+    status = Column(String, nullable=False, server_default="queued", index=True)
+    error_code = Column(String, nullable=True)
+    retry_count = Column(Integer, nullable=False, server_default="0")
+    next_retry_at = Column(TIMESTAMP, nullable=True, index=True)
+    last_attempt_at = Column(TIMESTAMP, nullable=True)
+    suppression_reason = Column(String, nullable=True)
+    sent_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False, index=True)
+
+    referral = relationship("Referral")
+
+
+class ReferralEmailSuppression(Base):
+    """Privacy-preserving bounce/complaint suppression for referral mail."""
+
+    __tablename__ = "referral_email_suppressions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email_hash = Column(String, unique=True, nullable=False, index=True)
+    reason = Column(String, nullable=False)
+    source = Column(String, nullable=False)
+    provider_event_id = Column(String, unique=True, nullable=True, index=True)
+    suppressed_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    expires_at = Column(TIMESTAMP, nullable=True)
+    cleared_at = Column(TIMESTAMP, nullable=True)
+    cleared_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class ReferralEmailEvent(Base):
+    """Idempotent, sanitized provider delivery-event receipt."""
+
+    __tablename__ = "referral_email_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    provider_event_id = Column(String, unique=True, nullable=False, index=True)
+    email_hash = Column(String, nullable=False, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    occurred_at = Column(TIMESTAMP, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+class ReferralAdminAuditEvent(Base):
+    """Append-only evidence for pass-capacity and suppression administration."""
+
+    __tablename__ = "referral_admin_audit_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    actor_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    subject_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_ref = Column(String, nullable=True, index=True)
+    payload = Column(JSONB, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False, index=True)
 
 
 class AccountCreditLedger(Base):
@@ -2747,7 +3068,7 @@ class AccountCreditLedger(Base):
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     delta = Column(Integer, nullable=False)  # +grant / -debit
-    #: referral_reward | referral_signup_bonus | grant | purchase | debit | reversal
+    #: referral_reward | referral_signup_bonus | grant | purchase | debit | reversal | workspace_transfer
     reason = Column(String, nullable=False)
     #: Stable identity of what caused this entry, e.g. "referral:42". Part of the
     #: idempotency key, so it must be null only for genuinely one-off entries.
@@ -2756,3 +3077,498 @@ class AccountCreditLedger(Base):
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
     user = relationship("User")
+
+
+# ---------------------------------------------------------------------------
+# Affiliate program (cash commissions)
+# ---------------------------------------------------------------------------
+
+
+class AffiliateProgramTerms(Base):
+    """Immutable commercial rules for one published affiliate-program version.
+
+    A partner and every commission entry point at the exact version they were
+    governed by. Changing a percentage therefore creates a new row instead of
+    silently rewriting the economics of old referrals.
+    """
+
+    __tablename__ = "affiliate_program_terms"
+
+    id = Column(Integer, primary_key=True, index=True)
+    version = Column(String, unique=True, nullable=False, index=True)
+    status = Column(String, nullable=False, server_default="draft", index=True)
+    commission_rate_bps = Column(Integer, nullable=False, server_default="3000")
+    commission_months = Column(Integer, nullable=False, server_default="12")
+    attribution_window_days = Column(Integer, nullable=False, server_default="60")
+    payout_minimum_minor = Column(BigInteger, nullable=False, server_default="5000")
+    hold_days = Column(Integer, nullable=False, server_default="30")
+    currency = Column(String, nullable=False, server_default="usd")
+    commission_basis = Column(
+        String,
+        nullable=False,
+        server_default="invoice_amount_paid_excluding_tax",
+    )
+    legal_text = Column(Text, nullable=False)
+    legal_copy_checksum = Column(String, nullable=False)
+    effective_at = Column(TIMESTAMP, nullable=True)
+    retired_at = Column(TIMESTAMP, nullable=True)
+    created_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+class AffiliateApplication(Base):
+    """A reviewable application snapshot; history is never overwritten."""
+
+    __tablename__ = "affiliate_applications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    email = Column(String, nullable=False)
+    display_name = Column(String, nullable=False)
+    business_name = Column(String, nullable=True)
+    website_url = Column(String, nullable=True)
+    country_code = Column(String, nullable=False)
+    audience_description = Column(Text, nullable=False)
+    audience_size = Column(Integer, nullable=True)
+    promotion_channels = Column(JSONB, nullable=False)
+    payout_currency = Column(String, nullable=False, server_default="usd")
+    status = Column(String, nullable=False, server_default="pending", index=True)
+    applicant_attested_at = Column(TIMESTAMP, nullable=False)
+    reviewed_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    review_notes = Column(Text, nullable=True)
+    reviewed_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class AffiliatePartner(Base):
+    """Approved partner identity, commercial overrides, and payout readiness."""
+
+    __tablename__ = "affiliate_partners"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    application_id = Column(
+        Integer,
+        ForeignKey("affiliate_applications.id", ondelete="RESTRICT"),
+        unique=True,
+        nullable=False,
+    )
+    terms_version_id = Column(
+        Integer,
+        ForeignKey("affiliate_program_terms.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    code = Column(String, unique=True, nullable=False, index=True)
+    status = Column(String, nullable=False, server_default="pending_terms", index=True)
+    custom_commission_rate_bps = Column(Integer, nullable=True)
+    custom_commission_months = Column(Integer, nullable=True)
+    stripe_connect_account_id = Column(String, unique=True, nullable=True, index=True)
+    payouts_enabled = Column(Boolean, nullable=False, server_default="false")
+    risk_status = Column(String, nullable=False, server_default="review", index=True)
+    hold_reason = Column(Text, nullable=True)
+    approved_at = Column(TIMESTAMP, nullable=False)
+    suspended_at = Column(TIMESTAMP, nullable=True)
+    closed_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user = relationship("User", foreign_keys=[user_id])
+    application = relationship("AffiliateApplication")
+    terms = relationship("AffiliateProgramTerms")
+
+
+class AffiliateCampaign(Base):
+    """Partner-managed tracking link with a stable slug and lifecycle."""
+
+    __tablename__ = "affiliate_campaigns"
+    __table_args__ = (
+        UniqueConstraint("partner_id", "slug", name="uq_affiliate_campaign_partner_slug"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    partner_id = Column(
+        Integer,
+        ForeignKey("affiliate_partners.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    slug = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    destination_path = Column(String, nullable=False, server_default="/")
+    status = Column(String, nullable=False, server_default="active", index=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    partner = relationship("AffiliatePartner")
+
+
+class AffiliateTermsAcceptance(Base):
+    """Append-only evidence that a partner accepted a specific ruleset."""
+
+    __tablename__ = "affiliate_terms_acceptances"
+    __table_args__ = (
+        UniqueConstraint(
+            "partner_id", "terms_version_id", name="uq_affiliate_terms_acceptance"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    partner_id = Column(
+        Integer,
+        ForeignKey("affiliate_partners.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    terms_version_id = Column(
+        Integer,
+        ForeignKey("affiliate_program_terms.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    accepted_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    ip_hash = Column(String, nullable=True)
+    user_agent_hash = Column(String, nullable=True)
+    accepted_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+class AffiliateClick(Base):
+    """Pseudonymous first-touch evidence; raw IPs and user agents are not kept."""
+
+    __tablename__ = "affiliate_clicks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    partner_id = Column(
+        Integer,
+        ForeignKey("affiliate_partners.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    token = Column(String, unique=True, nullable=False, index=True)
+    campaign_id = Column(
+        Integer,
+        ForeignKey("affiliate_campaigns.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    campaign = Column(String, nullable=True, index=True)
+    landing_path = Column(String, nullable=True)
+    referrer_host = Column(String, nullable=True)
+    ip_hash = Column(String, nullable=True)
+    user_agent_hash = Column(String, nullable=True)
+    risk_flags = Column(JSONB, nullable=True)
+    occurred_at = Column(TIMESTAMP, server_default=func.now(), nullable=False, index=True)
+    expires_at = Column(TIMESTAMP, nullable=False, index=True)
+    privacy_scrubbed_at = Column(TIMESTAMP, nullable=True)
+
+    partner = relationship("AffiliatePartner")
+    campaign_record = relationship("AffiliateCampaign")
+
+
+class AffiliateAttribution(Base):
+    """First eligible affiliate touch attached to one customer account."""
+
+    __tablename__ = "affiliate_attributions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    partner_id = Column(
+        Integer,
+        ForeignKey("affiliate_partners.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    click_id = Column(
+        Integer, ForeignKey("affiliate_clicks.id", ondelete="RESTRICT"), nullable=False
+    )
+    invitee_user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    terms_version_id = Column(
+        Integer,
+        ForeignKey("affiliate_program_terms.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    status = Column(String, nullable=False, server_default="active", index=True)
+    void_reason = Column(String, nullable=True)
+    risk_flags = Column(JSONB, nullable=True)
+    attributed_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    first_paid_at = Column(TIMESTAMP, nullable=True)
+    commission_ends_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    partner = relationship("AffiliatePartner")
+    click = relationship("AffiliateClick")
+    invitee = relationship("User", foreign_keys=[invitee_user_id])
+    terms = relationship("AffiliateProgramTerms")
+
+
+class AffiliateComplianceProfile(Base):
+    """Tax and sanctions clearance required before a payout can be drafted."""
+
+    __tablename__ = "affiliate_compliance_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    partner_id = Column(
+        Integer,
+        ForeignKey("affiliate_partners.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    tax_residency_country = Column(String, nullable=True)
+    tax_form_type = Column(String, nullable=True)
+    tax_form_reference_hash = Column(String, nullable=True)
+    tax_verified_at = Column(TIMESTAMP, nullable=True)
+    tax_verified_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    sanctions_status = Column(String, nullable=False, server_default="pending", index=True)
+    sanctions_checked_at = Column(TIMESTAMP, nullable=True)
+    sanctions_checked_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    withholding_rate_bps = Column(Integer, nullable=False, server_default="0")
+    review_note = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    partner = relationship("AffiliatePartner")
+
+
+class AffiliateLaunchApproval(Base):
+    """One MFA-backed human approval of an immutable terms version."""
+
+    __tablename__ = "affiliate_launch_approvals"
+    __table_args__ = (
+        Index(
+            "uq_affiliate_launch_approval_active_role",
+            "terms_version_id",
+            "approval_role",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+            sqlite_where=text("revoked_at IS NULL"),
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    terms_version_id = Column(
+        Integer,
+        ForeignKey("affiliate_program_terms.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    approval_role = Column(String, nullable=False, index=True)
+    approved_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    terms_checksum = Column(String, nullable=False)
+    note = Column(Text, nullable=False)
+    approved_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    revoked_at = Column(TIMESTAMP, nullable=True)
+    revoked_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    terms = relationship("AffiliateProgramTerms")
+
+
+class AffiliateCommissionEntry(Base):
+    """Append-only signed commission ledger.
+
+    Positive entries accrue commission. Refunds, disputes, and manual
+    corrections append negative entries; the original evidence remains intact.
+    """
+
+    __tablename__ = "affiliate_commission_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    partner_id = Column(
+        Integer,
+        ForeignKey("affiliate_partners.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    attribution_id = Column(
+        Integer,
+        ForeignKey("affiliate_attributions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    terms_version_id = Column(
+        Integer,
+        ForeignKey("affiliate_program_terms.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    source_key = Column(String, unique=True, nullable=False, index=True)
+    source_event_id = Column(String, nullable=True, index=True)
+    entry_type = Column(String, nullable=False, index=True)
+    stripe_invoice_id = Column(String, nullable=True, index=True)
+    stripe_charge_id = Column(String, nullable=True, index=True)
+    amount_minor = Column(BigInteger, nullable=False)
+    commissionable_minor = Column(BigInteger, nullable=False)
+    rate_bps = Column(Integer, nullable=False)
+    currency = Column(String, nullable=False, index=True)
+    available_at = Column(TIMESTAMP, nullable=False, index=True)
+    description = Column(String, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False, index=True)
+
+    partner = relationship("AffiliatePartner")
+    attribution = relationship("AffiliateAttribution")
+    terms = relationship("AffiliateProgramTerms")
+
+
+class AffiliateCommissionState(Base):
+    """Mutable projection used to prevent overlapping refund/dispute reversal.
+
+    This is not the financial record; the signed ledger above remains append-
+    only. The projection records the latest target so two different Stripe
+    event families cannot reverse the same invoice twice.
+    """
+
+    __tablename__ = "affiliate_commission_states"
+
+    id = Column(Integer, primary_key=True, index=True)
+    stripe_invoice_id = Column(String, unique=True, nullable=False, index=True)
+    partner_id = Column(
+        Integer, ForeignKey("affiliate_partners.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    attribution_id = Column(
+        Integer, ForeignKey("affiliate_attributions.id", ondelete="RESTRICT"), nullable=False
+    )
+    accrual_entry_id = Column(
+        Integer,
+        ForeignKey("affiliate_commission_entries.id", ondelete="RESTRICT"),
+        unique=True,
+        nullable=False,
+    )
+    accrued_minor = Column(BigInteger, nullable=False)
+    refund_target_minor = Column(BigInteger, nullable=False, server_default="0")
+    refund_target_commissionable_minor = Column(
+        BigInteger, nullable=False, server_default="0"
+    )
+    dispute_active = Column(Boolean, nullable=False, server_default="false")
+    projected_minor = Column(BigInteger, nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    accrual_entry = relationship("AffiliateCommissionEntry")
+
+
+class AffiliatePayout(Base):
+    """One reviewed transfer batch to an affiliate partner."""
+
+    __tablename__ = "affiliate_payouts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    partner_id = Column(
+        Integer,
+        ForeignKey("affiliate_partners.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    currency = Column(String, nullable=False, index=True)
+    gross_amount_minor = Column(BigInteger, nullable=False)
+    withholding_rate_bps = Column(Integer, nullable=False, server_default="0")
+    withholding_minor = Column(BigInteger, nullable=False, server_default="0")
+    amount_minor = Column(BigInteger, nullable=False)
+    threshold_minor = Column(BigInteger, nullable=False)
+    status = Column(String, nullable=False, server_default="draft", index=True)
+    period_start = Column(TIMESTAMP, nullable=True)
+    period_end = Column(TIMESTAMP, nullable=False)
+    stripe_transfer_id = Column(String, unique=True, nullable=True, index=True)
+    failure_reason = Column(Text, nullable=True)
+    created_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approved_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approved_at = Column(TIMESTAMP, nullable=True)
+    processed_at = Column(TIMESTAMP, nullable=True)
+    paid_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    partner = relationship("AffiliatePartner")
+
+
+class AffiliatePayoutItem(Base):
+    __tablename__ = "affiliate_payout_items"
+    __table_args__ = (
+        UniqueConstraint("commission_entry_id", name="uq_affiliate_payout_entry"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    payout_id = Column(
+        Integer,
+        ForeignKey("affiliate_payouts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    commission_entry_id = Column(
+        Integer,
+        ForeignKey("affiliate_commission_entries.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    amount_minor = Column(BigInteger, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    payout = relationship("AffiliatePayout")
+    commission_entry = relationship("AffiliateCommissionEntry")
+
+
+class AffiliateAuditEvent(Base):
+    """Sanitized operational and administrative audit trail."""
+
+    __tablename__ = "affiliate_audit_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    actor_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    partner_id = Column(
+        Integer,
+        ForeignKey("affiliate_partners.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    subject_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_ref = Column(String, nullable=True, index=True)
+    payload = Column(JSONB, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False, index=True)

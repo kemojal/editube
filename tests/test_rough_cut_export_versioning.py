@@ -26,7 +26,17 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import ActivityFeed, AiResult, Project, User, Video, VideoTranscription
+from app.db.models import (
+    ActivityFeed,
+    AiResult,
+    AnalyticsOutbox,
+    Project,
+    User,
+    Video,
+    VideoTranscription,
+    Workspace,
+    WorkspaceMember,
+)
 from app.jobs import rough_cut_export as rce
 
 
@@ -39,6 +49,8 @@ def _compile_jsonb_for_sqlite(type_, compiler, **kw):
 class _SqliteDbTestCase(unittest.TestCase):
     tables = [
         User.__table__,
+        Workspace.__table__,
+        WorkspaceMember.__table__,
         Project.__table__,
         Video.__table__,
         VideoTranscription.__table__,
@@ -46,6 +58,7 @@ class _SqliteDbTestCase(unittest.TestCase):
         # register_video_version (called by the job when register_as_version
         # is set) logs a real activity entry now — the table must exist.
         ActivityFeed.__table__,
+        AnalyticsOutbox.__table__,
     ]
 
     def setUp(self) -> None:

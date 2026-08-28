@@ -8,8 +8,10 @@ from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from app.db.database import get_db
 from app.db.models import ApiToken, User, UserSettings, UserSession
+from app.services.request_context import bind_user
 
 # Personal access tokens are issued as ``edt_<40 hex>`` and stored only as a hash.
 API_TOKEN_PREFIX = "edt_"
@@ -61,6 +63,30 @@ def create_user_session(db: Session, user_id: int) -> str:
     db.add(session)
     db.commit()
     return session_id
+
+
+def previous_user_activity_gap_days(
+    db: Session,
+    user_id: int,
+    *,
+    now: datetime | None = None,
+) -> int | None:
+    """Whole days since the user's last authenticated session activity.
+
+    Call this immediately before creating a new session. It deliberately uses
+    server-side session history instead of browser storage, so a return from a
+    different device can still qualify for the paid-user feedback trigger.
+    """
+
+    previous = (
+        db.query(func.max(UserSession.last_activity_at))
+        .filter(UserSession.user_id == user_id)
+        .scalar()
+    )
+    if previous is None:
+        return None
+    elapsed = (now or datetime.utcnow()) - previous
+    return max(0, int(elapsed.total_seconds() // 86_400))
 
 
 def _session_timeout_minutes_for_user(db: Session, user_id: int) -> int:
@@ -119,15 +145,40 @@ def authenticate_api_token(db: Session, token: str) -> User:
     user = db.query(User).filter(User.id == record.user_id).first()
     if user is None or user.deleted_at is not None:
         raise credentials_exception
+    first_use = record.last_used_at is None
     record.last_used_at = datetime.utcnow()
     db.commit()
+    if first_use:
+        # Import lazily to keep the security module free of analytics import
+        # cycles during application startup. Provider failure is isolated by
+        # the outbox helper and can never invalidate a successful API request.
+        from app.services.product_analytics import emit_after_commit
+
+        emit_after_commit(
+            "feature_result_used",
+            user_id=user.id,
+            properties={
+                "feature_key": "api_tokens",
+                "result_action": "authenticated_api_request",
+                "result": "success",
+            },
+            event_id=f"api-token:{record.id}:first-use",
+        )
     return user
 
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     if token and token.startswith(API_TOKEN_PREFIX):
-        return authenticate_api_token(db, token)
-    return authenticate_access_token(db, token, touch_session=True)
+        user = authenticate_api_token(db, token)
+    else:
+        user = authenticate_access_token(db, token, touch_session=True)
+    bind_user(
+        user_id=user.id,
+        plan=user.plan,
+        subscription_status=user.subscription_status,
+        user_role=user.role,
+    )
+    return user
 
 
 

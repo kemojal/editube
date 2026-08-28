@@ -17,7 +17,7 @@
 
 # app/api/models/users.py
 
-from pydantic import BaseModel, EmailStr, ConfigDict
+from pydantic import BaseModel, EmailStr, ConfigDict, Field
 from typing import List, Optional, Dict
 from typing import Literal
 from sqlalchemy import Column, Integer, String
@@ -51,6 +51,7 @@ class UserResponse(BaseModel):
     auth_provider: Optional[str] = None
     google_sub: Optional[str] = None
     mfa_required: bool = False
+    created_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -158,8 +159,14 @@ class UserCreate(UserBase):
     #: Invite code from a `?ref=` link, if the account arrived on one. Optional
     #: and never fatal — a stale code must not block a signup.
     referral_code: Optional[str] = None
+    #: Opaque server-issued first-touch token from an approved affiliate link.
+    #: The backend verifies its partner, age and eligibility; a partner code by
+    #: itself is never trusted as proof of attribution.
+    affiliate_click_token: Optional[str] = None
 
-class UserUpdate(UserBase):
+class UserUpdate(BaseModel):
+    email: EmailStr
+    name: str
     password: str | None = None
 
 class UserLogin(BaseModel):
@@ -194,6 +201,15 @@ class UserRegisterSchema(BaseModel):
 class UserLoginSchema(BaseModel):
     email: str
     password: str
+
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetComplete(BaseModel):
+    token: str = Field(min_length=20, max_length=4096)
+    password: str = Field(min_length=8, max_length=128)
 
 
 

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from ...db.database import get_db
 from app.db.models import Project, Video, VideoTranscription, User
 from ...utils.security import get_current_user
+from app.services.product_analytics import emit
 
 router = APIRouter(prefix="/mcp", tags=["MCP"])
 
@@ -168,7 +169,42 @@ def _handle_message(msg: dict, db: Session, user: User):
         name = params.get("name")
         args = params.get("arguments") or {}
         try:
-            return result(_dispatch_tool(name, args, db, user))
+            payload = _dispatch_tool(name, args, db, user)
+            if not payload.get("isError"):
+                safe_tool_key = name if name in {tool["name"] for tool in TOOLS} else "unknown"
+                emit(
+                    db,
+                    "mcp_connection_used",
+                    user=user,
+                    properties={
+                        "feature_key": "mcp",
+                        "tool_key": safe_tool_key,
+                        "result": "success",
+                    },
+                )
+                emit(
+                    db,
+                    "feature_completed",
+                    user=user,
+                    properties={
+                        "feature_key": "mcp",
+                        "tool_key": safe_tool_key,
+                        "completion_type": "tool_operation",
+                        "result": "success",
+                    },
+                )
+                emit(
+                    db,
+                    "feature_result_used",
+                    user=user,
+                    properties={
+                        "feature_key": "mcp",
+                        "tool_key": safe_tool_key,
+                        "result_type": "tool_result",
+                        "result": "success",
+                    },
+                )
+            return result(payload)
         except KeyError:
             return error(-32602, f"Unknown tool: {name}")
         except Exception as exc:  # surface tool failures without crashing the session
@@ -197,11 +233,13 @@ async def mcp_endpoint(
     # A JSON-RPC batch (list) or a single message.
     if isinstance(body, list):
         responses = [r for r in (_handle_message(m, db, current_user) for m in body) if r is not None]
+        db.commit()
         if not responses:
             return Response(status_code=202)
         return JSONResponse(responses)
 
     response = _handle_message(body, db, current_user)
+    db.commit()
     if response is None:
         return Response(status_code=202)
     return JSONResponse(response)

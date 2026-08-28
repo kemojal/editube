@@ -24,12 +24,14 @@ from app.services.notifications import (
 from app.services.transcription_enqueue import prepare_and_enqueue_transcription
 from app.services.video_status import (
     DECISION_APPROVED,
+    STATUS_APPROVED,
     IllegalStatusTransition,
     InvalidVideoStatus,
     apply_video_status,
     record_decision,
 )
 from app.services.word_alignment import realign_words_to_text
+from app.services.ingest_service import record_ingested_video_result_use
 from app.services.project_access import assert_write_project_content, can_access_project
 from app.services.youtube_stream_resolve import (
     YoutubeStreamResolveError,
@@ -240,6 +242,11 @@ def get_video_by_id(
     if not can_access_project(db, current_user.id, db_project):
         raise HTTPException(status_code=403, detail="Not authorized to access this video")
 
+    record_ingested_video_result_use(
+        video=db_video,
+        user_id=current_user.id,
+        workspace_id=db_project.workspace_id if db_project else None,
+    )
     return _video_with_project_payload(db, db_video, current_user.id)
 
 
@@ -332,7 +339,16 @@ def update_video_status(
     db_video, db_project = _load_video_for_write(video_id, db, current_user)
 
     try:
-        apply_video_status(db, db_video, data.status, actor_user_id=current_user.id)
+        if data.status == STATUS_APPROVED:
+            record_decision(
+                db,
+                db_video,
+                DECISION_APPROVED,
+                actor_user_id=current_user.id,
+                skip_transition_check=False,
+            )
+        else:
+            apply_video_status(db, db_video, data.status, actor_user_id=current_user.id)
     except (InvalidVideoStatus, IllegalStatusTransition) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

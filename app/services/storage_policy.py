@@ -16,6 +16,33 @@ from app.db.models import (
     WorkspaceMember,
 )
 from app.services.pricing import get_plan_spec
+from app.services.product_analytics import emit_after_commit
+
+
+def _record_quota_threshold(
+    *,
+    user_id: int,
+    workspace_id: int,
+    quota_key: str,
+    threshold_percent: int,
+    used: int,
+    cap: int,
+    result: str,
+) -> None:
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    emit_after_commit(
+        "quota_threshold_reached",
+        event_id=f"quota:{quota_key}:{workspace_id}:{threshold_percent}:{day}",
+        user_id=user_id,
+        workspace_id=workspace_id,
+        properties={
+            "quota_key": quota_key,
+            "threshold_percent": threshold_percent,
+            "used": used,
+            "cap": cap,
+            "result": result,
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -90,13 +117,29 @@ def assert_storage_upload_allowed(
     snapshot = get_workspace_storage_snapshot(
         db, user=user, workspace_id=workspace_id, incoming_bytes=incoming_bytes
     )
+    owner = workspace_billing_owner(db, workspace_id, fallback=user)
+    utilization = (
+        int((snapshot.projected_bytes / snapshot.cap_bytes) * 100)
+        if snapshot.cap_bytes > 0
+        else 100
+    )
+    threshold = 100 if utilization >= 100 else 90 if utilization >= 90 else 80 if utilization >= 80 else 0
+    if threshold:
+        _record_quota_threshold(
+            user_id=owner.id,
+            workspace_id=workspace_id,
+            quota_key="storage_bytes",
+            threshold_percent=threshold,
+            used=snapshot.projected_bytes,
+            cap=snapshot.cap_bytes,
+            result="blocked" if snapshot.over_cap else "warning",
+        )
     if not snapshot.over_cap:
         return snapshot
 
     # The grace window belongs to the account being billed, not to whichever
     # member tripped the cap — otherwise every new collaborator brings a fresh
     # one and the cap never actually bites.
-    owner = workspace_billing_owner(db, workspace_id, fallback=user)
     grace_until = owner.storage_grace_until
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     if grace_until and grace_until > now:
@@ -159,6 +202,17 @@ def assert_seat_available(db: Session, workspace_id: int, *, adding: int = 1) ->
     if cap is None:
         return
     if used + max(adding, 0) > cap:
+        ws = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+        if ws is not None:
+            _record_quota_threshold(
+                user_id=ws.owner_user_id,
+                workspace_id=workspace_id,
+                quota_key="workspace_seats",
+                threshold_percent=100,
+                used=used + max(adding, 0),
+                cap=cap,
+                result="blocked",
+            )
         raise SeatCapExceeded(cap=cap, used=used)
 
 

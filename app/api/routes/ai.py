@@ -32,11 +32,22 @@ from app.services.rough_cut_workspace import (
     get_workspace_draft,
     prepare_workspace_save,
 )
+from app.services.job_analytics import record_job_canceled
+from app.services.product_analytics import emit
+from app.services.editor_feature_analytics import changed_active_editor_features
 
 router = APIRouter(
     prefix="/videos",
     tags=["AI Features"],
 )
+
+_ROUGH_CUT_EFFECT_FEATURE_KEYS = {
+    "audio": "audio_edit",
+    "adjust": "color_adjust",
+    "remove_bg": "background_removal",
+    "retouch": "retouch",
+    "speed": "rough_cut",
+}
 
 
 def _check_video_access(video_id: int, db: Session, current_user: User) -> Video:
@@ -211,7 +222,7 @@ def translate_subtitles(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _check_video_access(video_id, db, current_user)
+    video = _check_video_access(video_id, db, current_user)
     target_language = str(body.get("target_language", "en")).lower()
     tr = db.query(VideoTranscription).filter(VideoTranscription.video_id == video_id).first()
     segments = tr.segments if tr and tr.segments else []
@@ -222,6 +233,21 @@ def translate_subtitles(
         f"target_language={target_language}\nsegments={segments}"
     )
     translated = generate_json(prompt, fallback=fallback)
+    project = db.query(Project).filter(Project.id == video.project_id).first()
+    emit(
+        db,
+        "feature_completed",
+        user=current_user,
+        workspace_id=project.workspace_id if project else None,
+        properties={
+            "feature_key": "translation",
+            "project_id": video.project_id,
+            "video_id": video.id,
+            "target_language": target_language,
+            "completion_type": "translation_generated",
+            "result": "success",
+        },
+    )
     return _upsert_result(db, video_id, f"translation_{target_language}", translated)
 
 
@@ -608,11 +634,32 @@ def save_rough_cut_draft(
     current_user: User = Depends(get_current_user),
 ):
     requested_video = _check_video_access(video_id, db, current_user)
+    _, existing_row = get_workspace_draft(db, requested_video)
+    previous_payload = (
+        dict(existing_row.result_data)
+        if existing_row is not None and isinstance(existing_row.result_data, dict)
+        else {}
+    )
     workspace_video, payload = prepare_workspace_save(
         db,
         requested_video,
         body.model_dump(mode="json", exclude_none=False),
     )
+    project = db.query(Project).filter(Project.id == workspace_video.project_id).first()
+    for feature_key in changed_active_editor_features(previous_payload, payload):
+        emit(
+            db,
+            "feature_completed",
+            user=current_user,
+            workspace_id=project.workspace_id if project else None,
+            properties={
+                "feature_key": feature_key,
+                "project_id": workspace_video.project_id,
+                "video_id": workspace_video.id,
+                "completion_type": "draft_saved",
+                "result": "success",
+            },
+        )
     return _upsert_result(
         db,
         workspace_video.id,
@@ -1112,7 +1159,8 @@ def cancel_rough_cut_effect(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _check_video_access(video_id, db, current_user)
+    video = _check_video_access(video_id, db, current_user)
+    project = db.query(Project).filter(Project.id == video.project_id).first()
     row = (
         db.query(AiResult)
         .filter(AiResult.id == result_id, AiResult.video_id == video_id, AiResult.result_type == "rough_cut_effect")
@@ -1164,6 +1212,16 @@ def cancel_rough_cut_effect(
         # in the gap cannot resurrect a cancelled row.
         data["canceled"] = True
         row.result_data = data
+        record_job_canceled(
+            db,
+            job_kind="rough_cut_effect",
+            job_id=row.id,
+            feature_key=_ROUGH_CUT_EFFECT_FEATURE_KEYS.get(
+                str(data.get("effectType") or "").strip(), "rough_cut"
+            ),
+            user=current_user,
+            project=project,
+        )
         db.commit()
 
         clip_key = str(data.get("clipKey") or "").strip()
@@ -1310,7 +1368,8 @@ def cancel_mask_track(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _check_video_access(video_id, db, current_user)
+    video = _check_video_access(video_id, db, current_user)
+    project = db.query(Project).filter(Project.id == video.project_id).first()
     row = (
         db.query(AiResult)
         .filter(AiResult.id == result_id, AiResult.video_id == video_id, AiResult.result_type == "mask_track")
@@ -1333,12 +1392,20 @@ def cancel_mask_track(
         except Exception:
             pass
     if row.status in ("queued", "processing"):
-        row.status = "failed"
-        row.error_message = "Mask tracking cancelled."
-        data["status"] = "failed"
-        data["error"] = "Mask tracking cancelled."
+        row.status = "canceled"
+        row.error_message = None
+        data["status"] = "canceled"
+        data.pop("error", None)
         data["progress"] = 0
         row.result_data = data
+        record_job_canceled(
+            db,
+            job_kind="mask_track",
+            job_id=row.id,
+            feature_key="mask_tracking",
+            user=current_user,
+            project=project,
+        )
         db.commit()
     return {"ok": True, "video_id": video_id, "ai_result_id": result_id}
 
@@ -1378,6 +1445,9 @@ class RoughCutExportBody(BaseModel):
     # resolves owned media and completed effect outputs instead of trusting
     # client URLs.
     timelineLayers: list[dict[str, Any]] = Field(default_factory=list)
+    # Cut/edge transitions. Preset names are resolved and allow-listed again
+    # in the worker; clip indices are advisory and source ranges are canonical.
+    transitions: list[dict[str, Any]] = Field(default_factory=list)
     # Pre-rasterized full-frame transparent PNG overlays (text, lower thirds,
     # brand) with their output-timeline spans:
     # {png (base64, no data: prefix), start, end, fadeIn?, fadeOut?}.
@@ -1399,7 +1469,8 @@ def start_rough_cut_export(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _check_video_access(video_id, db, current_user)
+    video = _check_video_access(video_id, db, current_user)
+    project = db.query(Project).filter(Project.id == video.project_id).first()
 
     fmt = (body.format or "mp4").lower()
     if fmt not in ("mp4", "wav"):
@@ -1439,6 +1510,7 @@ def start_rough_cut_export(
         "audioRanges": body.audioRanges,
         "mutedRanges": body.mutedRanges,
         "timelineLayers": body.timelineLayers[:64],
+        "transitions": body.transitions[:128],
         "burnIns": burn_ins,
         "burnInsRejected": burn_ins_rejected,
         "burnInsIncludeLowerThirds": body.burnInsIncludeLowerThirds,
@@ -1467,6 +1539,20 @@ def start_rough_cut_export(
     if rq_job_id:
         pdata["rqJobId"] = rq_job_id
         row.result_data = pdata
+        emit(
+            db,
+            "feature_started",
+            event_id=f"rough-cut-export:{row.id}:feature-started",
+            user=current_user,
+            workspace_id=project.workspace_id if project else None,
+            properties={
+                "feature_key": "export",
+                "project_id": video.project_id,
+                "video_id": video.id,
+                "export_format": fmt,
+                "entry_point": "rough_cut",
+            },
+        )
         db.commit()
     if not rq_job_id:
         row.status = "failed"
@@ -1479,6 +1565,38 @@ def start_rough_cut_export(
         pdata["error"] = msg
         pdata["progress"] = 0
         row.result_data = pdata
+        emit(
+            db,
+            "job_failed",
+            event_id=f"rough-cut-export:{row.id}:queue-failed",
+            user=current_user,
+            workspace_id=project.workspace_id if project else None,
+            properties={
+                "job_id": f"export:{row.id}",
+                "job_type": "rough_cut_export_job",
+                "feature_key": "export",
+                "project_id": video.project_id,
+                "video_id": video.id,
+                "error_code": "queue_unavailable",
+                "failure_class": "queue",
+                "result": "failure",
+            },
+        )
+        emit(
+            db,
+            "feature_failed",
+            event_id=f"rough-cut-export:{row.id}:feature-queue-failed",
+            user=current_user,
+            workspace_id=project.workspace_id if project else None,
+            properties={
+                "feature_key": "export",
+                "project_id": video.project_id,
+                "video_id": video.id,
+                "error_code": "queue_unavailable",
+                "failure_class": "queue",
+                "result": "failure",
+            },
+        )
         db.commit()
 
     db.refresh(row)
@@ -1528,7 +1646,8 @@ def cancel_rough_cut_export(
     current_user: User = Depends(get_current_user),
 ):
     """Best-effort cancel: remove queued RQ job if still pending; mark AiResult cancelled."""
-    _check_video_access(video_id, db, current_user)
+    video = _check_video_access(video_id, db, current_user)
+    project = db.query(Project).filter(Project.id == video.project_id).first()
     row = (
         db.query(AiResult)
         .filter(AiResult.video_id == video_id, AiResult.result_type == "rough_cut_export")
@@ -1553,12 +1672,21 @@ def cancel_rough_cut_export(
         except Exception:
             pass
     if row.status in ("queued", "processing"):
-        row.status = "failed"
-        row.error_message = "Export cancelled."
+        row.status = "canceled"
+        row.error_message = None
         pdata = dict(row.result_data or {})
         pdata["progress"] = 0
-        pdata["error"] = "Export cancelled."
+        pdata["status"] = "canceled"
+        pdata.pop("error", None)
         row.result_data = pdata
+        record_job_canceled(
+            db,
+            job_kind="rough_cut_export",
+            job_id=row.id,
+            feature_key="export",
+            user=current_user,
+            project=project,
+        )
         db.commit()
     return {"ok": True, "video_id": video_id}
 

@@ -6,6 +6,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.models import Project, ProjectCollaborator, User, WorkspaceMember
+from app.services.request_context import bind_workspace
 
 
 def get_workspace_member(
@@ -22,18 +23,21 @@ def get_workspace_member(
 
 def can_access_project(db: Session, user_id: int, project: Project) -> bool:
     if project.creator_id == user_id:
+        bind_workspace(project.workspace_id)
         return True
     if (
         db.query(ProjectCollaborator)
         .filter(ProjectCollaborator.project_id == project.id, ProjectCollaborator.user_id == user_id)
         .first()
     ):
+        bind_workspace(project.workspace_id)
         return True
     wm = get_workspace_member(db, project.workspace_id, user_id)
     if not wm:
         return False
     if wm.role == "client":
         return False
+    bind_workspace(project.workspace_id)
     return True
 
 

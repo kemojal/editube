@@ -23,12 +23,280 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.db.database import SessionLocal
-from app.db.models import AiResult, GeneratedMedia, Video, VideoTranscription
+from app.db.models import AiResult, GeneratedMedia, Project, Video, VideoTranscription
 from app.services.mask_matte import render_matte_video
 from app.services.color_adjust_keyframes import build_keyframed_adjust_filter_chain
 from app.jobs.rough_cut_effect import _resolve_media_source
 from app.utils.cloudinary import cloudinary_credentials_configured, upload_local_path_to_cloudinary
+from app.services.product_analytics import emit_once
 
+_XFADE_TRANSITIONS = {
+    "fade", "wipeleft", "wiperight", "wipeup", "wipedown", "slideleft",
+    "slideright", "slideup", "slidedown", "circlecrop", "rectcrop",
+    "distance", "fadeblack", "fadewhite", "radial", "smoothleft",
+    "smoothright", "smoothup", "smoothdown", "circleopen", "circleclose",
+    "vertopen", "vertclose", "horzopen", "horzclose", "dissolve",
+    "pixelize", "diagtl", "diagtr", "diagbl", "diagbr", "hlslice",
+    "hrslice", "vuslice", "vdslice", "hblur", "fadegrays", "wipetl",
+    "wipetr", "wipebl", "wipebr", "squeezeh", "squeezev", "zoomin",
+    "fadefast", "fadeslow", "hlwind", "hrwind", "vuwind", "vdwind",
+    "coverleft", "coverright", "coverup", "coverdown", "revealleft",
+    "revealright", "revealup", "revealdown",
+}
+
+
+def _record_export_feature_result_use(
+    db: Session,
+    *,
+    row: AiResult,
+    video: Video | None,
+    feature_keys: set[str],
+) -> None:
+    if video is None or not feature_keys:
+        return
+    project = db.query(Project).filter(Project.id == video.project_id).first()
+    for feature_key in sorted(feature_keys):
+        emit_once(
+            db,
+            "feature_result_used",
+            event_id=f"rough-cut-export:{row.id}:result-used:{feature_key}",
+            user_id=video.uploader_id,
+            workspace_id=project.workspace_id if project else None,
+            source="worker",
+            properties={
+                "feature_key": feature_key,
+                "project_id": video.project_id,
+                "video_id": video.id,
+                "job_id": str(row.id),
+                "job_type": "rough_cut_export_job",
+                "result_action": "included_in_export",
+                "result": "success",
+            },
+        )
+
+
+def _range_index(value: object, ranges: list[tuple[float, float]]) -> int | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        start = float(value.get("start"))
+        end = float(value.get("end"))
+    except (TypeError, ValueError):
+        return None
+    for index, (candidate_start, candidate_end) in enumerate(ranges):
+        if abs(candidate_start - start) <= 0.015 and abs(candidate_end - end) <= 0.015:
+            return index
+    return None
+
+
+def _normalize_transitions(value: object, ranges: list[tuple[float, float]]) -> list[dict[str, object]]:
+    """Validate transition payloads and clamp them against their clip pair.
+
+    A malformed transition is an omitted decoration, never a failed export.
+    Source ranges outrank indices because the worker normalizes source order.
+    """
+    if not isinstance(value, list) or not ranges:
+        return []
+    output: list[dict[str, object]] = []
+    seen: set[tuple[str, int, int]] = set()
+    for raw in value[:128]:
+        if not isinstance(raw, dict):
+            continue
+        placement = str(raw.get("placement") or "")
+        if placement not in {"between", "in", "out"}:
+            continue
+        left_index = _range_index(raw.get("leftRange"), ranges)
+        right_index = _range_index(raw.get("rightRange"), ranges)
+        if left_index is None:
+            try:
+                candidate = int(raw.get("leftIndex"))
+                left_index = candidate if 0 <= candidate < len(ranges) else None
+            except (TypeError, ValueError):
+                left_index = None
+        if right_index is None:
+            try:
+                candidate = int(raw.get("rightIndex"))
+                right_index = candidate if 0 <= candidate < len(ranges) else None
+            except (TypeError, ValueError):
+                right_index = None
+        if placement == "between" and (left_index is None or right_index != left_index + 1):
+            continue
+        if placement == "in" and right_index is None:
+            continue
+        if placement == "out" and left_index is None:
+            continue
+        alignment = str(raw.get("alignment") or "center")
+        if alignment not in {"start", "center", "end"}:
+            alignment = "center"
+        left_duration = ranges[left_index][1] - ranges[left_index][0] if left_index is not None else float("inf")
+        right_duration = ranges[right_index][1] - ranges[right_index][0] if right_index is not None else float("inf")
+        if placement == "in":
+            available = right_duration
+        elif placement == "out":
+            available = left_duration
+        elif alignment == "start":
+            available = right_duration
+        elif alignment == "end":
+            available = left_duration
+        else:
+            available = min(left_duration, right_duration) * 2
+        maximum = min(5.0, available)
+        if maximum < 0.1:
+            continue
+        try:
+            duration = float(raw.get("duration", 0.6))
+        except (TypeError, ValueError):
+            duration = 0.6
+        if not math.isfinite(duration):
+            duration = 0.6
+        duration = max(0.1, min(maximum, duration))
+        preset = str(raw.get("exportPreset") or "dissolve").lower()
+        if preset not in _XFADE_TRANSITIONS:
+            preset = "dissolve"
+        key = (placement, -1 if left_index is None else left_index, -1 if right_index is None else right_index)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append({
+            "id": str(raw.get("id") or f"transition-{len(output)}"),
+            "presetId": str(raw.get("presetId") or "cross-dissolve"),
+            "preset": preset,
+            "placement": placement,
+            "leftIndex": left_index,
+            "rightIndex": right_index,
+            "duration": duration,
+            "alignment": alignment,
+        })
+    return output
+
+
+def _transition_video_command(
+    parts: list[Path],
+    durations: list[float],
+    transitions: list[dict[str, object]],
+    *,
+    audio_path: Path,
+    crf: int,
+    output: Path,
+) -> list[str] | None:
+    """Build a duration-preserving transition graph.
+
+    Each connected clip pair receives half-duration cloned handles. Xfade then
+    consumes those handles, so the output remains exactly sum(durations) instead
+    of getting shorter once per transition. Unconnected groups hard-cut via
+    concat. Audio is muxed from the already length-correct segment concat; its
+    clip-edge fades are applied while each WAV part is built.
+    """
+    if not parts or not transitions:
+        return None
+    between_by_left = {
+        int(item["leftIndex"]): item
+        for item in transitions
+        if item.get("placement") == "between" and isinstance(item.get("leftIndex"), int)
+    }
+    edge_in = {int(item["rightIndex"]): item for item in transitions if item.get("placement") == "in" and isinstance(item.get("rightIndex"), int)}
+    edge_out = {int(item["leftIndex"]): item for item in transitions if item.get("placement") == "out" and isinstance(item.get("leftIndex"), int)}
+    command = ["ffmpeg", "-y"]
+    for part in parts:
+        command.extend(["-i", str(part)])
+    command.extend(["-i", str(audio_path)])
+    filters: list[str] = []
+    groups: list[str] = []
+    group_start = 0
+    group_index = 0
+    while group_start < len(parts):
+        group_end = group_start
+        while group_end in between_by_left and group_end + 1 < len(parts):
+            group_end += 1
+        labels: list[str] = []
+        for index in range(group_start, group_end + 1):
+            previous = between_by_left.get(index - 1)
+            following = between_by_left.get(index)
+            head = 0.0
+            if previous:
+                previous_duration = float(previous["duration"])
+                previous_alignment = previous.get("alignment", "center")
+                head = previous_duration if previous_alignment == "end" else previous_duration / 2 if previous_alignment == "center" else 0.0
+            tail = 0.0
+            if following:
+                following_duration = float(following["duration"])
+                following_alignment = following.get("alignment", "center")
+                tail = following_duration if following_alignment == "start" else following_duration / 2 if following_alignment == "center" else 0.0
+            chain = f"[{index}:v]settb=AVTB,format=yuv420p"
+            if head > 0:
+                chain += f",tpad=start_mode=clone:start_duration={head:.6f}"
+            if tail > 0:
+                chain += f",tpad=stop_mode=clone:stop_duration={tail:.6f}"
+            if index in edge_in:
+                fade = min(durations[index], float(edge_in[index]["duration"]))
+                chain += f",fade=t=in:st=0:d={fade:.6f}:color=black"
+            if index in edge_out:
+                fade = min(durations[index], float(edge_out[index]["duration"]))
+                chain += f",fade=t=out:st={max(0.0, durations[index] - fade):.6f}:d={fade:.6f}:color=black"
+            label = f"tv{index}"
+            filters.append(f"{chain}[{label}]")
+            labels.append(label)
+        current = labels[0]
+        elapsed = durations[group_start]
+        for local, left_index in enumerate(range(group_start, group_end)):
+            item = between_by_left[left_index]
+            transition_duration = float(item["duration"])
+            alignment = item.get("alignment", "center")
+            incoming_handle = transition_duration if alignment == "end" else transition_duration / 2 if alignment == "center" else 0.0
+            next_label = labels[local + 1]
+            out_label = f"tx{group_index}_{local}"
+            offset = max(0.0, elapsed - incoming_handle)
+            filters.append(
+                f"[{current}][{next_label}]xfade=transition={item['preset']}:duration={transition_duration:.6f}:offset={offset:.6f}[{out_label}]"
+            )
+            current = out_label
+            elapsed += durations[left_index + 1]
+        groups.append(current)
+        group_start = group_end + 1
+        group_index += 1
+    if len(groups) > 1:
+        concat_inputs = "".join(f"[{label}]" for label in groups)
+        filters.append(f"{concat_inputs}concat=n={len(groups)}:v=1:a=0[tvout]")
+        video_label = "tvout"
+    else:
+        video_label = groups[0]
+    command.extend([
+        "-filter_complex", ";".join(filters),
+        "-map", f"[{video_label}]",
+        "-map", f"{len(parts)}:a:0",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", "-shortest", str(output),
+    ])
+    return command
+
+
+def _transition_audio_settings(
+    base: dict[str, Any] | None,
+    index: int,
+    transitions: list[dict[str, object]],
+) -> dict[str, Any] | None:
+    """Fold linked transition ramps into the segment's existing audio edit."""
+    result = dict(base or {})
+    fade_in = float(result.get("fadeIn") or 0.0)
+    fade_out = float(result.get("fadeOut") or 0.0)
+    for item in transitions:
+        duration = float(item.get("duration") or 0.0)
+        placement = item.get("placement")
+        if placement == "between":
+            if item.get("rightIndex") == index:
+                fade_in = max(fade_in, duration / 2)
+            if item.get("leftIndex") == index:
+                fade_out = max(fade_out, duration / 2)
+        elif placement == "in" and item.get("rightIndex") == index:
+            fade_in = max(fade_in, duration)
+        elif placement == "out" and item.get("leftIndex") == index:
+            fade_out = max(fade_out, duration)
+    if fade_in > 0:
+        result["fadeIn"] = fade_in
+    if fade_out > 0:
+        result["fadeOut"] = fade_out
+    return result or None
 logger = logging.getLogger(__name__)
 
 # Absolute bound on any timeline position. The old bound was the primary
@@ -2800,8 +3068,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
     try:
         row = db.query(AiResult).filter(AiResult.id == ai_result_id).first()
         if row is None or row.result_type != "rough_cut_export":
-            logger.error("rough_cut_export_job: missing row id=%s", ai_result_id)
-            return
+            raise RuntimeError(f"Rough-cut export {ai_result_id} was removed before processing")
 
         payload = dict(row.result_data or {})
         # Burn-in frames are an INPUT, not a result. Left on the row they were
@@ -2821,6 +3088,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
         # a hostile/malformed range extending far past the actual media.
         source_duration = _ffprobe_duration(media_src) if media_src else None
         normalized = _normalize_ranges(payload.get("keepRanges"), max_end=source_duration)
+        transitions = _normalize_transitions(payload.get("transitions"), normalized)
 
         row.status = "processing"
         row.error_message = None
@@ -2999,11 +3267,16 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 # Gain/fades/mutes are baked into each segment here, not after
                 # the concat: both concats run `-c copy` and a filtered stream
                 # cannot be copied. PCM re-encodes anyway, so this is free.
-                segment_af = _segment_audio_filter(
+                segment_audio = _transition_audio_settings(
                     # Tolerant: `start`/`end` here have been clamped against the
                     # probed duration, so the last clip's key no longer matches
                     # the browser's numbers exactly.
                     _match_audio_range(audio_ranges, start, end),
+                    index,
+                    transitions,
+                )
+                segment_af = _segment_audio_filter(
+                    segment_audio,
                     muted_ranges,
                     segment_start=start,
                     segment_end=start + dur,
@@ -3147,10 +3420,21 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 return
 
             if want_mp4_video and vid_parts:
-                v_list = tmp_path / "list_v.txt"
-                v_list.write_text("".join(f"file '{p.as_posix()}'\n" for p in vid_parts), encoding="utf-8")
                 merged_vid = tmp_path / "merged_v.mp4"
-                _run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(v_list), "-c", "copy", str(merged_vid)])
+                transition_command = _transition_video_command(
+                    vid_parts,
+                    [max(0.04, end - start) for start, end in normalized],
+                    transitions,
+                    audio_path=merged_wav,
+                    crf=crf,
+                    output=merged_vid,
+                )
+                if transition_command:
+                    _run_ffmpeg(transition_command)
+                else:
+                    v_list = tmp_path / "list_v.txt"
+                    v_list.write_text("".join(f"file '{p.as_posix()}'\n" for p in vid_parts), encoding="utf-8")
+                    _run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(v_list), "-c", "copy", str(merged_vid)])
                 final_video = merged_vid
 
                 if timeline_tail > 0.02:
@@ -3396,6 +3680,21 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
 
             row.result_data = _merge_result_payload(row.result_data, meta)
             row.status = "completed"
+            used_features: set[str] = set()
+            if subtitle_entries:
+                used_features.add("captions")
+            if burn_in_entries:
+                used_features.add("text_overlay")
+            if masks and not meta.get("maskingFailed"):
+                used_features.add("masking")
+            if transitions:
+                used_features.add("transitions")
+            _record_export_feature_result_use(
+                db,
+                row=row,
+                video=video,
+                feature_keys=used_features,
+            )
             db.commit()
             logger.info("rough_cut_export_job: MP4 completed video_id=%s", video_id)
     except Exception as exc:  # noqa: BLE001
@@ -3412,6 +3711,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 db.commit()
         except Exception:  # noqa: BLE001
             logger.exception("rough_cut_export_job: failed to persist error state")
+        raise
 
     finally:
         db.close()

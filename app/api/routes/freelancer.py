@@ -69,10 +69,59 @@ from app.api.models.freelancer import (
 from app.services.contract_pdf import build_signed_contract_pdf
 from app.utils.email import send_transactional_email
 from app.utils.return_path import safe_internal_path
+from app.services.product_analytics import emit_once
 
 
 router = APIRouter(prefix="/freelancer", tags=["Freelancer"])
 public_router = APIRouter(prefix="/public/freelancer", tags=["Freelancer-Public"])
+
+
+def _emit_project_event(
+    db: Session,
+    event_name: str,
+    *,
+    project: Project,
+    event_id: str,
+    user: User | None = None,
+    user_id: int | None = None,
+    source: str = "api",
+    properties: dict | None = None,
+) -> None:
+    emit_once(
+        db,
+        event_name,
+        event_id=event_id,
+        user=user,
+        user_id=user_id,
+        workspace_id=project.workspace_id,
+        source=source,
+        properties={"project_id": project.id, **(properties or {})},
+    )
+
+
+def _emit_feature(
+    db: Session,
+    event_name: str,
+    *,
+    project: Project,
+    feature_key: str,
+    event_id: str,
+    user: User | None = None,
+    user_id: int | None = None,
+    source: str = "api",
+    result: str = "success",
+    properties: dict | None = None,
+) -> None:
+    _emit_project_event(
+        db,
+        event_name,
+        project=project,
+        event_id=event_id,
+        user=user,
+        user_id=user_id,
+        source=source,
+        properties={"feature_key": feature_key, "result": result, **(properties or {})},
+    )
 
 
 def _owned(db: Session, project_id: int, user: User) -> Project:
@@ -235,8 +284,20 @@ def update_scope(
     current_user: User = Depends(get_current_user),
 ):
     project = _owned(db, project_id, current_user)
+    was_published = bool(project.portfolio_public and (project.portfolio_slug or "").strip())
     for k, v in body.dict(exclude_unset=True).items():
         setattr(project, k, v)
+    is_published = bool(project.portfolio_public and (project.portfolio_slug or "").strip())
+    if is_published and not was_published:
+        _emit_feature(
+            db,
+            "feature_completed",
+            project=project,
+            feature_key="portfolio",
+            event_id=f"feature:portfolio:project:{project.id}:published",
+            user=current_user,
+            properties={"completion_type": "public_portfolio_published"},
+        )
     db.commit()
     db.refresh(project)
     return project
@@ -359,6 +420,28 @@ def create_invoice(
     db.flush()
     db.refresh(inv)
     _recalc_invoice(inv)
+    _emit_project_event(
+        db,
+        "client_invoice_created",
+        project=project,
+        event_id=f"client-invoice:{inv.id}:created",
+        user=current_user,
+        properties={
+            "invoice_id": inv.id,
+            "currency": inv.currency,
+            "amount_cents": inv.total_cents,
+            "result": "success",
+        },
+    )
+    _emit_feature(
+        db,
+        "feature_completed",
+        project=project,
+        feature_key="invoices",
+        event_id=f"feature:invoices:invoice:{inv.id}:created",
+        user=current_user,
+        properties={"invoice_id": inv.id},
+    )
     db.commit()
     db.refresh(inv)
     return _serialize_invoice(inv)
@@ -409,10 +492,19 @@ def _stripe_key() -> Optional[str]:
     return None
 
 
-def _mark_invoice_paid(db: Session, inv: Invoice) -> None:
+def _mark_invoice_paid(
+    db: Session,
+    inv: Invoice,
+    *,
+    actor: User | None = None,
+    source: str = "api",
+) -> bool:
     """Idempotent — flip invoice + linked milestones + touch project."""
     if inv.status == "paid":
-        return
+        return False
+    project = db.query(Project).filter(Project.id == inv.project_id).first()
+    if project is None:
+        return False
     inv.status = "paid"
     inv.paid_at = datetime.utcnow()
     # Auto-complete any milestone linked to this invoice.
@@ -424,6 +516,43 @@ def _mark_invoice_paid(db: Session, inv: Invoice) -> None:
     for m in linked:
         if m.status != "completed":
             m.status = "completed"
+            _emit_project_event(
+                db,
+                "milestone_completed",
+                project=project,
+                event_id=f"milestone:{m.id}:completed",
+                user=actor,
+                user_id=None if actor else inv.created_by,
+                source=source,
+                properties={"milestone_id": m.id, "invoice_id": inv.id, "result": "success"},
+            )
+    _emit_project_event(
+        db,
+        "client_invoice_paid",
+        project=project,
+        event_id=f"client-invoice:{inv.id}:paid",
+        user=actor,
+        user_id=None if actor else inv.created_by,
+        source=source,
+        properties={
+            "invoice_id": inv.id,
+            "currency": inv.currency,
+            "amount_cents": inv.total_cents,
+            "result": "success",
+        },
+    )
+    _emit_feature(
+        db,
+        "feature_result_used",
+        project=project,
+        feature_key="invoices",
+        event_id=f"feature:invoices:invoice:{inv.id}:paid",
+        user=actor,
+        user_id=None if actor else inv.created_by,
+        source=source,
+        properties={"invoice_id": inv.id, "result_type": "payment"},
+    )
+    return True
 
 
 @router.post("/invoices/{invoice_id}/send", response_model=InvoiceResponse)
@@ -531,6 +660,23 @@ def send_invoice(invoice_id: int, db: Session = Depends(get_db), current_user: U
 
     inv.status = "sent"
     inv.sent_at = datetime.utcnow()
+    _emit_project_event(
+        db,
+        "client_invoice_sent",
+        project=project,
+        event_id=f"client-invoice:{inv.id}:sent",
+        user=current_user,
+        properties={"invoice_id": inv.id, "delivery_method": "stripe", "result": "success"},
+    )
+    _emit_feature(
+        db,
+        "feature_result_used",
+        project=project,
+        feature_key="invoices",
+        event_id=f"feature:invoices:invoice:{inv.id}:sent",
+        user=current_user,
+        properties={"invoice_id": inv.id, "result_type": "invoice_sent"},
+    )
     db.commit()
     db.refresh(inv)
     return _serialize_invoice(inv)
@@ -542,7 +688,7 @@ def mark_paid(invoice_id: int, db: Session = Depends(get_db), current_user: User
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
     _owned(db, inv.project_id, current_user)
-    _mark_invoice_paid(db, inv)
+    _mark_invoice_paid(db, inv, actor=current_user)
     db.commit()
     db.refresh(inv)
     return _serialize_invoice(inv)
@@ -588,7 +734,7 @@ async def freelancer_stripe_webhook(request: Request, db: Session = Depends(get_
                 q = q.filter(Invoice.stripe_connect_account_id == connected_acct)
             inv = q.first()
         if inv is not None:
-            _mark_invoice_paid(db, inv)
+            _mark_invoice_paid(db, inv, source="stripe_webhook")
             db.commit()
     return {"received": True}
 
@@ -663,6 +809,30 @@ def seed_50_50_milestones(
     )
     db.add(deposit)
     db.add(final_m)
+    db.flush()
+    for milestone in (deposit, final_m):
+        _emit_project_event(
+            db,
+            "milestone_created",
+            project=project,
+            event_id=f"milestone:{milestone.id}:created",
+            user=current_user,
+            properties={
+                "milestone_id": milestone.id,
+                "currency": milestone.currency,
+                "amount_cents": milestone.amount_cents,
+                "result": "success",
+            },
+        )
+    _emit_feature(
+        db,
+        "feature_completed",
+        project=project,
+        feature_key="milestones",
+        event_id=f"feature:milestones:project:{project.id}:seed-5050",
+        user=current_user,
+        properties={"milestone_count": 2, "creation_method": "seed_5050"},
+    )
     db.commit()
     db.refresh(deposit)
     db.refresh(final_m)
@@ -676,9 +846,32 @@ def create_milestone(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _owned(db, project_id, current_user)
+    project = _owned(db, project_id, current_user)
     m = ProjectMilestone(project_id=project_id, **body.dict())
     db.add(m)
+    db.flush()
+    _emit_project_event(
+        db,
+        "milestone_created",
+        project=project,
+        event_id=f"milestone:{m.id}:created",
+        user=current_user,
+        properties={
+            "milestone_id": m.id,
+            "currency": m.currency,
+            "amount_cents": m.amount_cents,
+            "result": "success",
+        },
+    )
+    _emit_feature(
+        db,
+        "feature_completed",
+        project=project,
+        feature_key="milestones",
+        event_id=f"feature:milestones:milestone:{m.id}:created",
+        user=current_user,
+        properties={"milestone_id": m.id, "creation_method": "manual"},
+    )
     db.commit()
     db.refresh(m)
     return m
@@ -694,9 +887,28 @@ def update_milestone(
     m = db.query(ProjectMilestone).filter(ProjectMilestone.id == milestone_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Milestone not found")
-    _owned(db, m.project_id, current_user)
+    project = _owned(db, m.project_id, current_user)
+    previous_status = m.status
     for k, v in body.dict(exclude_unset=True).items():
         setattr(m, k, v)
+    if previous_status != "completed" and m.status == "completed":
+        _emit_project_event(
+            db,
+            "milestone_completed",
+            project=project,
+            event_id=f"milestone:{m.id}:completed",
+            user=current_user,
+            properties={"milestone_id": m.id, "completion_method": "manual", "result": "success"},
+        )
+        _emit_feature(
+            db,
+            "feature_result_used",
+            project=project,
+            feature_key="milestones",
+            event_id=f"feature:milestones:milestone:{m.id}:completed",
+            user=current_user,
+            properties={"milestone_id": m.id, "result_type": "completed"},
+        )
     db.commit()
     db.refresh(m)
     return m
@@ -719,7 +931,7 @@ def delete_milestone(milestone_id: int, db: Session = Depends(get_db), current_u
 
 @router.get("/projects/{project_id}/contracts", response_model=List[ContractResponse])
 def list_contracts(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    _owned(db, project_id, current_user)
+    project = _owned(db, project_id, current_user)
     return (
         db.query(Contract)
         .filter(Contract.project_id == project_id)
@@ -745,6 +957,16 @@ def create_contract(
         signing_token=secrets.token_urlsafe(24),
     )
     db.add(c)
+    db.flush()
+    _emit_feature(
+        db,
+        "feature_completed",
+        project=project,
+        feature_key="contracts",
+        event_id=f"feature:contracts:contract:{c.id}:created",
+        user=current_user,
+        properties={"contract_id": c.id},
+    )
     db.commit()
     db.refresh(c)
     return c
@@ -760,7 +982,7 @@ def update_contract(
     c = db.query(Contract).filter(Contract.id == contract_id).first()
     if not c:
         raise HTTPException(status_code=404, detail="Contract not found")
-    _owned(db, c.project_id, current_user)
+    project = _owned(db, c.project_id, current_user)
     for k, v in body.dict(exclude_unset=True).items():
         setattr(c, k, v)
     db.commit()
@@ -787,6 +1009,23 @@ def send_contract(contract_id: int, db: Session = Depends(get_db), current_user:
             f"Please open this link to review and sign:\n{sign_url}\n",
             f"<p>Please <a href=\"{sign_url}\">open this link</a> to review and sign.</p>",
         )
+    _emit_project_event(
+        db,
+        "contract_sent",
+        project=project,
+        event_id=f"contract:{c.id}:sent",
+        user=current_user,
+        properties={"contract_id": c.id, "email_delivered": email_sent, "result": "success"},
+    )
+    _emit_feature(
+        db,
+        "feature_result_used",
+        project=project,
+        feature_key="contracts",
+        event_id=f"feature:contracts:contract:{c.id}:sent",
+        user=current_user,
+        properties={"contract_id": c.id, "result_type": "contract_sent"},
+    )
     db.commit()
     db.refresh(c)
     if hasattr(ContractResponse, "model_validate"):
@@ -834,6 +1073,9 @@ def public_sign_contract(token: str, body: ContractSignBody, db: Session = Depen
         raise HTTPException(status_code=404, detail="Contract not found")
     if c.signed_at:
         raise HTTPException(status_code=400, detail="Already signed")
+    project = db.query(Project).filter(Project.id == c.project_id).first()
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
     c.signer_name = body.signer_name
     c.signer_email = body.signer_email
     c.signature_data = body.signature_data
@@ -853,6 +1095,21 @@ def public_sign_contract(token: str, body: ContractSignBody, db: Session = Depen
             c.pdf_url = url
     except Exception:
         logger.exception("Signed contract PDF generation failed")
+    _emit_project_event(
+        db,
+        "contract_signed",
+        project=project,
+        event_id=f"contract:{c.id}:signed",
+        properties={"contract_id": c.id, "actor_type": "guest", "result": "success"},
+    )
+    _emit_feature(
+        db,
+        "feature_result_used",
+        project=project,
+        feature_key="contracts",
+        event_id=f"feature:contracts:contract:{c.id}:signed",
+        properties={"contract_id": c.id, "actor_type": "guest", "result_type": "contract_signed"},
+    )
     db.commit()
     db.refresh(c)
     return ContractPublicResponse(
@@ -873,13 +1130,25 @@ def public_sign_contract(token: str, body: ContractSignBody, db: Session = Depen
 
 @router.get("/projects/{project_id}/time", response_model=List[TimeEntryResponse])
 def list_time(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    _owned(db, project_id, current_user)
-    return (
+    project = _owned(db, project_id, current_user)
+    rows = (
         db.query(TimeEntry)
         .filter(TimeEntry.project_id == project_id)
         .order_by(TimeEntry.started_at.desc())
         .all()
     )
+    if rows:
+        _emit_feature(
+            db,
+            "feature_result_used",
+            project=project,
+            feature_key="time_tracking",
+            event_id=f"feature:time-tracking:project:{project.id}:report-opened",
+            user=current_user,
+            properties={"result_type": "time_report_opened", "entry_count": len(rows)},
+        )
+        db.commit()
+    return rows
 
 
 @router.post("/projects/{project_id}/time/start", response_model=TimeEntryResponse)
@@ -899,6 +1168,24 @@ def start_timer(
         hourly_rate_cents=body.hourly_rate_cents or project.hourly_rate_cents,
     )
     db.add(entry)
+    db.flush()
+    _emit_project_event(
+        db,
+        "time_entry_started",
+        project=project,
+        event_id=f"time-entry:{entry.id}:started",
+        user=current_user,
+        properties={"time_entry_id": entry.id, "billable": entry.billable, "result": "success"},
+    )
+    _emit_feature(
+        db,
+        "feature_started",
+        project=project,
+        feature_key="time_tracking",
+        event_id=f"feature:time-tracking:entry:{entry.id}:started",
+        user=current_user,
+        properties={"time_entry_id": entry.id, "entry_type": "timer"},
+    )
     db.commit()
     db.refresh(entry)
     return entry
@@ -909,11 +1196,33 @@ def stop_timer(entry_id: int, db: Session = Depends(get_db), current_user: User 
     entry = db.query(TimeEntry).filter(TimeEntry.id == entry_id).first()
     if not entry:
         raise HTTPException(status_code=404, detail="Time entry not found")
-    _owned(db, entry.project_id, current_user)
+    project = _owned(db, entry.project_id, current_user)
     if entry.ended_at:
         return entry
     entry.ended_at = datetime.utcnow()
     entry.duration_seconds = int((entry.ended_at - entry.started_at).total_seconds())
+    _emit_project_event(
+        db,
+        "time_entry_stopped",
+        project=project,
+        event_id=f"time-entry:{entry.id}:stopped",
+        user=current_user,
+        properties={
+            "time_entry_id": entry.id,
+            "billable": entry.billable,
+            "duration_seconds": entry.duration_seconds,
+            "result": "success",
+        },
+    )
+    _emit_feature(
+        db,
+        "feature_completed",
+        project=project,
+        feature_key="time_tracking",
+        event_id=f"feature:time-tracking:entry:{entry.id}:completed",
+        user=current_user,
+        properties={"time_entry_id": entry.id, "entry_type": "timer"},
+    )
     db.commit()
     db.refresh(entry)
     return entry
@@ -926,9 +1235,33 @@ def create_time_entry(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _owned(db, project_id, current_user)
+    project = _owned(db, project_id, current_user)
     entry = TimeEntry(project_id=project_id, user_id=current_user.id, **body.dict())
     db.add(entry)
+    db.flush()
+    _emit_project_event(
+        db,
+        "time_entry_stopped",
+        project=project,
+        event_id=f"time-entry:{entry.id}:manual",
+        user=current_user,
+        properties={
+            "time_entry_id": entry.id,
+            "billable": entry.billable,
+            "duration_seconds": entry.duration_seconds,
+            "entry_type": "manual",
+            "result": "success",
+        },
+    )
+    _emit_feature(
+        db,
+        "feature_completed",
+        project=project,
+        feature_key="time_tracking",
+        event_id=f"feature:time-tracking:entry:{entry.id}:manual",
+        user=current_user,
+        properties={"time_entry_id": entry.id, "entry_type": "manual"},
+    )
     db.commit()
     db.refresh(entry)
     return entry
@@ -972,13 +1305,25 @@ _COMPLEXITY_MULT = {"simple": 2.0, "standard": 4.0, "complex": 8.0}
 
 @router.get("/projects/{project_id}/estimates", response_model=List[EstimateResponse])
 def list_estimates(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    _owned(db, project_id, current_user)
-    return (
+    project = _owned(db, project_id, current_user)
+    rows = (
         db.query(ProjectEstimate)
         .filter(ProjectEstimate.project_id == project_id)
         .order_by(ProjectEstimate.created_at.desc())
         .all()
     )
+    if rows:
+        _emit_feature(
+            db,
+            "feature_result_used",
+            project=project,
+            feature_key="estimates",
+            event_id=f"feature:estimates:project:{project.id}:saved-estimates-opened",
+            user=current_user,
+            properties={"result_type": "saved_estimates_opened", "estimate_count": len(rows)},
+        )
+        db.commit()
+    return rows
 
 
 @router.post("/projects/{project_id}/estimates", response_model=EstimateResponse)
@@ -1017,6 +1362,30 @@ def create_estimate(
         currency=body.currency or project.currency or "USD",
     )
     db.add(est)
+    db.flush()
+    _emit_project_event(
+        db,
+        "estimate_created",
+        project=project,
+        event_id=f"estimate:{est.id}:created",
+        user=current_user,
+        properties={
+            "estimate_id": est.id,
+            "currency": est.currency,
+            "amount_cents": est.total_cents,
+            "complexity": est.complexity,
+            "result": "success",
+        },
+    )
+    _emit_feature(
+        db,
+        "feature_completed",
+        project=project,
+        feature_key="estimates",
+        event_id=f"feature:estimates:estimate:{est.id}:created",
+        user=current_user,
+        properties={"estimate_id": est.id},
+    )
     db.commit()
     db.refresh(est)
     return est
@@ -1047,6 +1416,35 @@ def public_portfolio(slug: str, db: Session = Depends(get_db)):
         .filter(Video.project_id == project.id, Video.status == "approved")
         .all()
     )
+    view_id = secrets.token_hex(12)
+    _emit_project_event(
+        db,
+        "portfolio_viewed",
+        project=project,
+        event_id=f"portfolio:{project.id}:view:{view_id}",
+        properties={"feature_key": "portfolio", "video_count": len(videos), "result": "success"},
+    )
+    _emit_feature(
+        db,
+        "feature_opened",
+        project=project,
+        feature_key="portfolio",
+        event_id=f"feature:portfolio:project:{project.id}:view:{view_id}",
+        properties={"video_count": len(videos), "actor_type": "visitor"},
+    )
+    _emit_feature(
+        db,
+        "feature_result_used",
+        project=project,
+        feature_key="portfolio",
+        event_id=f"feature:portfolio:project:{project.id}:result-view:{view_id}",
+        properties={
+            "video_count": len(videos),
+            "actor_type": "visitor",
+            "result_type": "public_portfolio_viewed",
+        },
+    )
+    db.commit()
     return PortfolioResponse(
         slug=slug,
         project_name=project.name,

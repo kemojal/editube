@@ -138,7 +138,15 @@ from app.services.review_media import (
     proxy_review_media,
     verify_review_media_sig,
 )
+from app.services.product_analytics import emit, emit_after_commit, emit_once
 from app.services.review_comment_groups import build_review_scene_groups
+from app.services.review_analytics import (
+    bounded_position,
+    build_watch_heatmap,
+    is_playback_complete,
+    new_playback_milestones,
+    normalize_progress_range,
+)
 from app.services.project_access import can_access_project, list_users_for_mentions
 from app.services.comment_visibility import COMMENT_VISIBILITY_PUBLIC, is_client_visible
 from app.services.workspace_branding_resolve import branding_public_dict
@@ -321,6 +329,7 @@ def create_review_link(
         version_label=body.version_label,
     )
     db.add(link)
+    db.flush()
     log_security_audit_event(
         db,
         action="review_link.create",
@@ -331,6 +340,24 @@ def create_review_link(
         project_id=project_id,
         video_id=video_id,
         metadata={"nda_required": getattr(body, "nda_required", False), "geofence_mode": getattr(body, "geofence_mode", "off")},
+    )
+    project = db.query(Project).filter(Project.id == project_id).first()
+    emit(
+        db,
+        "review_link_created",
+        user=current_user,
+        workspace_id=project.workspace_id if project else None,
+        properties={
+            "feature_key": "review_link",
+            "project_id": project_id,
+            "video_id": video_id,
+            "review_link_id": link.id,
+            "password_protected": bool(body.password),
+            "email_required": bool(body.require_email),
+            "nda_required": bool(getattr(body, "nda_required", False)),
+            "download_allowed": bool(body.allow_download),
+            "result": "success",
+        },
     )
     db.commit()
     db.refresh(link)
@@ -373,11 +400,13 @@ def update_review_link(
         raise HTTPException(status_code=404, detail="Review link not found")
 
     data = body.dict(exclude_unset=True)
+    revoked_change: bool | None = None
     if "password" in data:
         pw = data.pop("password")
         link.password_hash = get_password_hash(pw) if pw else None
     if "revoked" in data:
         revoked = data.pop("revoked")
+        revoked_change = bool(revoked)
         link.revoked_at = datetime.now(timezone.utc) if revoked else None
         if revoked and not data.get("revocation_reason"):
             data["revocation_reason"] = "manual"
@@ -395,6 +424,22 @@ def update_review_link(
         review_link_id=link.id,
         metadata={"changed_fields": sorted(list(data.keys()))},
     )
+    if revoked_change is True:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        emit(
+            db,
+            "review_link_revoked",
+            user=current_user,
+            workspace_id=project.workspace_id if project else None,
+            properties={
+                "feature_key": "review_link",
+                "project_id": project_id,
+                "video_id": video_id,
+                "review_link_id": link.id,
+                "revocation_reason": link.revocation_reason or "manual",
+                "result": "success",
+            },
+        )
     db.commit()
     db.refresh(link)
     return _link_to_response(link, db)
@@ -427,6 +472,21 @@ def delete_review_link(
         video_id=video_id,
         review_link_id=link.id,
     )
+    project = db.query(Project).filter(Project.id == project_id).first()
+    emit(
+        db,
+        "review_link_revoked",
+        user=current_user,
+        workspace_id=project.workspace_id if project else None,
+        properties={
+            "feature_key": "review_link",
+            "project_id": project_id,
+            "video_id": video_id,
+            "review_link_id": link.id,
+            "revocation_reason": "deleted",
+            "result": "success",
+        },
+    )
     db.delete(link)
     db.commit()
     return {"ok": True}
@@ -455,11 +515,11 @@ def link_analytics(
         .order_by(ReviewSession.last_viewed_at.desc())
         .all()
     )
-    # Heatmap: bucket progress events per second
-    buckets: dict[int, int] = defaultdict(int)
+    video = db.query(Video).filter(Video.id == link.video_id).first()
     session_ids = [s.id for s in sessions]
+    progress_events: list[ReviewEvent] = []
     if session_ids:
-        events = (
+        progress_events = (
             db.query(ReviewEvent)
             .filter(
                 ReviewEvent.session_id.in_(session_ids),
@@ -467,18 +527,19 @@ def link_analytics(
             )
             .all()
         )
-        for e in events:
-            start = int(e.position or 0)
-            end = int(e.range_end or start + 1)
-            for s in range(start, max(start + 1, end)):
-                buckets[s] += 1
-
+    watch_map = build_watch_heatmap(
+        progress_events,
+        video.duration if video else None,
+    )
     heatmap = [
-        ReviewHeatmapBucket(second=k, views=v) for k, v in sorted(buckets.items())
+        ReviewHeatmapBucket(second=second, views=views)
+        for second, views in watch_map.unique_views.items()
     ]
     rewatch_hotspots = [
-        ReviewHeatmapBucket(second=k, views=v)
-        for k, v in sorted(buckets.items(), key=lambda item: item[1], reverse=True)[:20]
+        ReviewHeatmapBucket(second=second, views=views)
+        for second, views in sorted(
+            watch_map.replay_views.items(), key=lambda item: (-item[1], item[0])
+        )[:20]
     ]
     signoff_count = (
         db.query(func.count(ReviewSignoff.id))
@@ -672,6 +733,21 @@ def send_owner_invite(
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=20),
     )
     db.add(rec)
+    project = db.query(Project).filter(Project.id == project_id).first()
+    emit(
+        db,
+        "review_link_invite_sent",
+        user=current_user,
+        workspace_id=project.workspace_id if project else None,
+        properties={
+            "feature_key": "review_link",
+            "project_id": project_id,
+            "video_id": video_id,
+            "review_link_id": link.id,
+            "invite_method": "email",
+            "result": "success",
+        },
+    )
     db.commit()
     sent = send_review_magic_link_email(
         to_email=rec.email,
@@ -917,7 +993,28 @@ async def review_media_proxy(
     ):
         status, headers = await head_upstream_video(fp)
         return Response(status_code=status, headers=headers)
-    return await proxy_review_media(request=request, video=video, purpose=purpose, db=db)
+    response = await proxy_review_media(request=request, video=video, purpose=purpose, db=db)
+    if purpose == "download" and request.method == "GET":
+        project = db.query(Project).filter(Project.id == video.project_id).first()
+        from starlette.background import BackgroundTask
+
+        response.background = BackgroundTask(
+            emit_after_commit,
+            "review_download_completed",
+            workspace_id=project.workspace_id if project else None,
+            anonymous_id=f"review-session:{session.id}",
+            properties={
+                "feature_key": "delivery",
+                "project_id": video.project_id,
+                "video_id": video.id,
+                "review_link_id": link.id,
+                "review_session_id": session.id,
+                "completion_type": "media_response_finished",
+                "result": "success",
+            },
+            source="review_service",
+        )
+    return response
 
 
 @public_router.get("/{token}/download-url")
@@ -948,6 +1045,23 @@ def review_download_url(
         country_code=getattr(session, "country_code", None),
         user_agent=session.user_agent,
     )
+    project = db.query(Project).filter(Project.id == video.project_id).first()
+    emit(
+        db,
+        "review_download_attempted",
+        workspace_id=project.workspace_id if project else None,
+        anonymous_id=f"review-session:{session.id}",
+        properties={
+            "feature_key": "delivery",
+            "project_id": video.project_id,
+            "video_id": video.id,
+            "review_link_id": link.id,
+            "review_session_id": session.id,
+            "result": "allowed",
+        },
+        source="review_service",
+    )
+    db.commit()
     url = build_review_media_url(
         api_base=_api_base(request),
         token=token,
@@ -1091,6 +1205,7 @@ def start_session(
         if not accepted:
             return PublicReviewAuthResponse(ok=False, error="NDA acceptance required")
 
+    created_new_session = session is None
     if session:
         session.view_count = (session.view_count or 0) + 1
         session.last_viewed_at = now
@@ -1164,6 +1279,38 @@ def start_session(
         user_agent=user_agent,
         metadata={"forensic_asset_id": forensic_asset.id, "recording_detection_mode": getattr(link, "recording_detection_mode", "monitor")},
     )
+    project = db.query(Project).filter(Project.id == video.project_id).first() if video else None
+    review_properties = {
+        "feature_key": "review_link",
+        "project_id": video.project_id if video else None,
+        "video_id": link.video_id,
+        "review_link_id": link.id,
+        "review_session_id": session.id,
+        "session_is_new": created_new_session,
+        "view_count": session.view_count or 1,
+        "password_required": bool(link.password_hash),
+        "email_required": bool(link.require_email),
+        "nda_required": bool(getattr(link, "nda_required", False)),
+        "country_code": country_code,
+        "result": "success",
+    }
+    emit(
+        db,
+        "review_link_opened",
+        workspace_id=project.workspace_id if project else None,
+        anonymous_id=f"review-session:{session.id}",
+        properties=review_properties,
+        source="review_service",
+    )
+    if created_new_session:
+        emit(
+            db,
+            "review_guest_session_started",
+            workspace_id=project.workspace_id if project else None,
+            anonymous_id=f"review-session:{session.id}",
+            properties=review_properties,
+            source="review_service",
+        )
     db.commit()
 
     video_payload = _public_video_streaming(video, request, link.token, session.id) if video else None
@@ -1249,16 +1396,17 @@ def accept_nda(
 
 
 def _get_session_or_404(
-    link: ReviewLink, session_id: int, db: Session
+    link: ReviewLink,
+    session_id: int,
+    db: Session,
+    *,
+    for_update: bool = False,
 ) -> ReviewSession:
-    session = (
-        db.query(ReviewSession)
-        .filter(
-            ReviewSession.id == session_id,
-            ReviewSession.review_link_id == link.id,
-        )
-        .first()
+    query = db.query(ReviewSession).filter(
+        ReviewSession.id == session_id,
+        ReviewSession.review_link_id == link.id,
     )
+    session = query.with_for_update().first() if for_update else query.first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
@@ -1272,32 +1420,60 @@ def record_event(
 ):
     link = _get_link_or_404(token, db)
     _assert_link_usable(link)
-    session = _get_session_or_404(link, body.session_id, db)
+    session = _get_session_or_404(link, body.session_id, db, for_update=True)
+    if body.seq is not None:
+        existing_event = (
+            db.query(ReviewEvent.id)
+            .filter(
+                ReviewEvent.session_id == session.id,
+                ReviewEvent.seq == body.seq,
+            )
+            .first()
+        )
+        if existing_event:
+            return {"ok": True, "deduplicated": True}
+
+    video = db.query(Video).filter(Video.id == link.video_id).first()
+    duration = video.duration if video else None
+    position = bounded_position(body.position, duration)
+    progress_range = normalize_progress_range(body.position, body.range_end, duration)
 
     ev = ReviewEvent(
         session_id=session.id,
         event_type=body.event_type,
-        position=max(0, int(body.position)),
+        position=position,
         seq=body.seq,
         meta_info=getattr(body, "meta_info", None),
-        range_end=(
-            max(int(body.position), int(body.range_end))
-            if body.range_end is not None
-            else None
-        ),
+        range_end=progress_range[1] if progress_range else None,
     )
     db.add(ev)
 
     # Update aggregates cheaply
     session.last_viewed_at = datetime.now(timezone.utc)
-    pos = int(body.position or 0)
-    if pos > (session.max_position or 0):
-        session.max_position = pos
-    if body.event_type == "progress" and body.range_end is not None:
-        delta = max(0, int(body.range_end) - pos)
+    furthest_position = progress_range[1] if progress_range else position
+    if furthest_position > (session.max_position or 0):
+        session.max_position = furthest_position
+    if body.event_type == "progress" and progress_range is not None:
+        delta = progress_range[1] - progress_range[0]
         session.total_watch_seconds = (session.total_watch_seconds or 0) + delta
-    if body.event_type == "ended":
-        session.reached_end = True
+    ended = body.event_type == "ended"
+    session.reached_end = bool(session.reached_end) or is_playback_complete(
+        session.max_position,
+        duration,
+        ended=ended,
+    )
+
+    prior_milestones = session.analytics_milestones or []
+    milestones = new_playback_milestones(
+        session.max_position,
+        duration,
+        ended=ended,
+        already_reached=prior_milestones,
+    )
+    if milestones:
+        session.analytics_milestones = sorted(
+            {int(value) for value in prior_milestones}.union(milestones)
+        )
 
     if body.event_type in {"download_attempt", "recording_signal", "permission_change"}:
         log_security_audit_event(
@@ -1314,6 +1490,56 @@ def record_event(
             user_agent=session.user_agent,
             metadata=getattr(body, "meta_info", None) or {},
         )
+    project = db.query(Project).filter(Project.id == video.project_id).first() if video else None
+    common = {
+        "feature_key": "review_link",
+        "project_id": video.project_id if video else None,
+        "video_id": link.video_id,
+        "review_link_id": link.id,
+        "review_session_id": session.id,
+    }
+    for milestone in milestones:
+        emit(
+            db,
+            "review_playback_milestone_reached",
+            workspace_id=project.workspace_id if project else None,
+            anonymous_id=f"review-session:{session.id}",
+            properties={
+                **common,
+                "milestone_percent": milestone,
+                "result": "success",
+            },
+            source="review_service",
+            event_id=f"review-milestone:{session.id}:{milestone}",
+        )
+    if body.event_type == "seek":
+        meta = body.meta_info if isinstance(body.meta_info, dict) else {}
+        from_raw = meta.get("from_position", meta.get("from", body.position))
+        to_raw = meta.get("to_position", meta.get("to", body.range_end))
+        try:
+            from_position = bounded_position(float(from_raw), duration)
+            to_position = bounded_position(float(to_raw), duration)
+        except (TypeError, ValueError):
+            from_position = to_position = 0
+        delta = to_position - from_position
+        if abs(delta) >= 5:
+            event_name = (
+                "review_skip_forward_detected" if delta > 0 else "review_rewatch_detected"
+            )
+            emit(
+                db,
+                event_name,
+                workspace_id=project.workspace_id if project else None,
+                anonymous_id=f"review-session:{session.id}",
+                properties={
+                    **common,
+                    "from_second": from_position,
+                    "to_second": to_position,
+                    "delta_seconds": abs(delta),
+                    "result": "observed",
+                },
+                source="review_service",
+            )
     db.commit()
     return {"ok": True}
 
@@ -1614,6 +1840,53 @@ async def create_public_comment(
             event_type="comment",
             position=max(0, int(body.timecode or 0)),
         )
+    )
+    video_for_analytics = db.query(Video).filter(Video.id == link.video_id).first()
+    project_for_analytics = (
+        db.query(Project).filter(Project.id == video_for_analytics.project_id).first()
+        if video_for_analytics
+        else None
+    )
+    emit_once(
+        db,
+        "review_comment_created",
+        event_id=f"review-comment:{comment.id}:created",
+        workspace_id=project_for_analytics.workspace_id if project_for_analytics else None,
+        anonymous_id=f"review-session:{session.id}",
+        properties={
+            "feature_key": "comments",
+            "project_id": video_for_analytics.project_id if video_for_analytics else None,
+            "video_id": link.video_id,
+            "review_link_id": link.id,
+            "review_session_id": session.id,
+            "comment_kind": cr_kind,
+            "is_reply": body.parent_id is not None,
+            "has_drawing": bool(body.drawing_data),
+            "has_range": body.end_timecode is not None,
+            "position_second": max(0, int(body.timecode or 0)),
+            "result": "success",
+        },
+        source="review_service",
+    )
+    emit_once(
+        db,
+        "feature_completed",
+        event_id=f"feature:comments:comment:{comment.id}:created",
+        user_id=link.created_by,
+        workspace_id=project_for_analytics.workspace_id if project_for_analytics else None,
+        anonymous_id=f"review-session:{session.id}",
+        properties={
+            "feature_key": "comments",
+            "project_id": video_for_analytics.project_id if video_for_analytics else None,
+            "video_id": link.video_id,
+            "review_link_id": link.id,
+            "review_session_id": session.id,
+            "comment_id": comment.id,
+            "actor_type": "guest",
+            "completion_type": "comment_persisted",
+            "result": "success",
+        },
+        source="review_service",
     )
     db.commit()
     db.refresh(comment)
@@ -1957,6 +2230,9 @@ async def approve(
             review_session_id=session.id,
             review_link_id=link.id,
             note=getattr(body, "note", None),
+            # A guest can receive a direct link before the editor formally
+            # moves the cut to in-review; their explicit decision is still real.
+            skip_transition_check=True,
         )
     db.commit()
 
@@ -2019,6 +2295,7 @@ async def request_changes(
         review_session_id=session.id,
         review_link_id=link.id,
         note=note,
+        skip_transition_check=True,
     )
 
     created_comment: Comment | None = None
@@ -2039,6 +2316,24 @@ async def request_changes(
         )
         sync_is_resolved_from_status(created_comment)
         db.add(created_comment)
+
+    emit(
+        db,
+        "review_change_requested",
+        workspace_id=project.workspace_id if project else None,
+        anonymous_id=f"review-session:{session.id}",
+        properties={
+            "feature_key": "approval",
+            "project_id": video.project_id,
+            "video_id": video.id,
+            "review_link_id": link.id,
+            "review_session_id": session.id,
+            "has_note": bool(note),
+            "comment_created": created_comment is not None,
+            "result": "changes_requested",
+        },
+        source="review_service",
+    )
 
     db.commit()
 
@@ -2118,6 +2413,57 @@ def signoff(
         record.pdf_url = upload_review_signoff_pdf(pdf_bytes, record.id)
     except Exception:
         logger.exception("Review sign-off PDF failed")
+    video = db.query(Video).filter(Video.id == link.video_id).first()
+    project = db.query(Project).filter(Project.id == video.project_id).first() if video else None
+    emit(
+        db,
+        "review_signoff_created",
+        workspace_id=project.workspace_id if project else None,
+        anonymous_id=f"review-session:{session.id}",
+        properties={
+            "feature_key": "signoff",
+            "project_id": video.project_id if video else None,
+            "video_id": link.video_id,
+            "review_link_id": link.id,
+            "review_session_id": session.id,
+            "signature_type": sig_type,
+            "pdf_created": bool(record.pdf_url),
+            "result": "success",
+        },
+        source="review_service",
+    )
+    emit(
+        db,
+        "feature_completed",
+        workspace_id=project.workspace_id if project else None,
+        anonymous_id=f"review-session:{session.id}",
+        properties={
+            "feature_key": "signoff",
+            "project_id": video.project_id if video else None,
+            "video_id": link.video_id,
+            "review_link_id": link.id,
+            "review_session_id": session.id,
+            "completion_type": "review_signoff",
+            "result": "success",
+        },
+        source="review_service",
+    )
+    emit(
+        db,
+        "feature_result_used",
+        workspace_id=project.workspace_id if project else None,
+        anonymous_id=f"review-session:{session.id}",
+        properties={
+            "feature_key": "signoff",
+            "project_id": video.project_id if video else None,
+            "video_id": link.video_id,
+            "review_link_id": link.id,
+            "review_session_id": session.id,
+            "result_action": "review_cycle_advanced",
+            "result": "success",
+        },
+        source="review_service",
+    )
     db.commit()
     db.refresh(record)
     return PublicReviewSignoffResponse(

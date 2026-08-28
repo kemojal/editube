@@ -54,7 +54,7 @@ def generate_media_job(media_id: int) -> dict[str, object]:
     try:
         row = db.query(GeneratedMedia).filter(GeneratedMedia.id == media_id).first()
         if row is None:
-            return {"status": "missing", "id": media_id}
+            raise RuntimeError(f"Generated media {media_id} was removed before processing")
         if row.cancel_requested:
             row.status = "cancelled"
             db.commit()
@@ -141,7 +141,7 @@ def generate_media_job(media_id: int) -> dict[str, object]:
             row.status = "failed"
             row.error_message = str(exc)[:2000]
             db.commit()
-        return {"status": "failed", "id": media_id, "error": str(exc)}
+        raise
 
     finally:
         db.close()

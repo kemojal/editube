@@ -18,8 +18,7 @@ class WorkspaceAssetLinkResponse(BaseModel):
     file_url: str
     created_at: Optional[datetime] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 class ProjectBase(BaseModel):
     name: str
@@ -53,8 +52,7 @@ class UserResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 class ProjectResponse(BaseModel):
     id: int
@@ -69,5 +67,4 @@ class ProjectResponse(BaseModel):
     thumbnail_url: str | None = None
     latest_video_id: int | None = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}

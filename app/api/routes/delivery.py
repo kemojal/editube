@@ -33,12 +33,62 @@ from app.db.models import (
 from app.jobs.queue import enqueue_delivery_package_job
 from app.services.project_access import can_access_project
 from app.services.workspace_branding_resolve import branding_public_dict
+from app.services.product_analytics import emit_once
 from app.utils.security import get_current_user
 
 router = APIRouter(prefix="/delivery", tags=["Delivery"])
 public_router = APIRouter(prefix="/delivery", tags=["Delivery (public)"])
 
 _DEFAULT_EXPIRES_DAYS = int(os.getenv("DELIVERY_LINK_DEFAULT_DAYS", "30"))
+
+
+def _emit_delivery_event(
+    db: Session,
+    event_name: str,
+    *,
+    project: Project,
+    event_id: str,
+    user: User | None = None,
+    user_id: int | None = None,
+    properties: dict | None = None,
+) -> None:
+    emit_once(
+        db,
+        event_name,
+        event_id=event_id,
+        user=user,
+        user_id=user_id,
+        workspace_id=project.workspace_id,
+        properties={"project_id": project.id, **(properties or {})},
+    )
+
+
+def _emit_delivery_download(
+    db: Session,
+    *,
+    project: Project,
+    scope_id: str,
+    properties: dict,
+    user: User | None = None,
+) -> None:
+    download_id = secrets.token_hex(12)
+    common = {"feature_key": "delivery", "result": "success", **properties}
+    _emit_delivery_event(
+        db,
+        "delivery_downloaded",
+        project=project,
+        event_id=f"delivery:{scope_id}:download:{download_id}",
+        user=user,
+        properties=common,
+    )
+    _emit_delivery_event(
+        db,
+        "feature_result_used",
+        project=project,
+        event_id=f"feature:delivery:{scope_id}:download:{download_id}",
+        user=user,
+        properties={**common, "result_type": "download"},
+    )
 
 
 def _require_delivery_enabled() -> None:
@@ -80,7 +130,7 @@ def create_delivery_package(
     video = db.query(Video).filter(Video.id == body.video_id).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
-    _require_owner_project(video.project_id, db, current_user)
+    project = _require_owner_project(video.project_id, db, current_user)
     pkg = DeliveryPackage(
         project_id=video.project_id,
         video_id=video.id,
@@ -89,12 +139,43 @@ def create_delivery_package(
         requested_by_user_id=current_user.id,
     )
     db.add(pkg)
+    db.flush()
+    _emit_delivery_event(
+        db,
+        "delivery_package_started",
+        project=project,
+        event_id=f"delivery-package:{pkg.id}:started",
+        user=current_user,
+        properties={"delivery_package_id": pkg.id, "video_id": video.id, "result": "success"},
+    )
+    _emit_delivery_event(
+        db,
+        "feature_started",
+        project=project,
+        event_id=f"feature:delivery:package:{pkg.id}:started",
+        user=current_user,
+        properties={"feature_key": "delivery", "delivery_package_id": pkg.id, "result": "success"},
+    )
     db.commit()
     db.refresh(pkg)
     if not enqueue_delivery_package_job(pkg.id):
         pkg.status = "failed"
         pkg.error_message = "Could not queue package build (set REDIS_URL and run an RQ worker)."
         db.add(pkg)
+        _emit_delivery_event(
+            db,
+            "feature_failed",
+            project=project,
+            event_id=f"feature:delivery:package:{pkg.id}:queue-failed",
+            user=current_user,
+            properties={
+                "feature_key": "delivery",
+                "delivery_package_id": pkg.id,
+                "failure_class": "queue",
+                "error_code": "delivery_queue_unavailable",
+                "result": "failure",
+            },
+        )
         db.commit()
         db.refresh(pkg)
     return pkg
@@ -110,7 +191,7 @@ def get_delivery_package(
     pkg = db.query(DeliveryPackage).filter(DeliveryPackage.id == package_id).first()
     if not pkg:
         raise HTTPException(status_code=404, detail="Delivery package not found")
-    _require_owner_project(pkg.project_id, db, current_user)
+    project = _require_owner_project(pkg.project_id, db, current_user)
     return pkg
 
 
@@ -172,6 +253,18 @@ def package_download_url(
     _require_owner_project(pkg.project_id, db, current_user)
     if not pkg.zip_url:
         raise HTTPException(status_code=400, detail="Package zip is not ready")
+    _emit_delivery_download(
+        db,
+        project=project,
+        scope_id=f"package:{pkg.id}:owner",
+        user=current_user,
+        properties={
+            "delivery_package_id": pkg.id,
+            "download_scope": "package",
+            "actor_type": "owner",
+        },
+    )
+    db.commit()
     return {"ok": True, "url": pkg.zip_url}
 
 
@@ -313,6 +406,10 @@ def public_delivery_asset_download_url(
     )
     if not asset or asset.delivery_package_id != link.delivery_package_id:
         raise HTTPException(status_code=404, detail="Asset not found")
+    pkg = db.query(DeliveryPackage).filter(DeliveryPackage.id == link.delivery_package_id).first()
+    project = db.query(Project).filter(Project.id == pkg.project_id).first() if pkg else None
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
     receipt = DeliveryReceipt(
         delivery_link_id=link.id,
         delivery_asset_id=asset.id,
@@ -325,11 +422,23 @@ def public_delivery_asset_download_url(
     db.add(receipt)
     db.add(
         ActivityFeed(
-            project_id=db.query(DeliveryPackage).filter(DeliveryPackage.id == link.delivery_package_id).first().project_id,
+            project_id=project.id,
             user_id=None,
             action="delivery_asset_downloaded",
             meta_info=f"{asset.asset_type}:{asset.filename}",
         )
+    )
+    _emit_delivery_download(
+        db,
+        project=project,
+        scope_id=f"asset:{asset.id}:guest",
+        properties={
+            "delivery_package_id": pkg.id,
+            "delivery_asset_id": asset.id,
+            "asset_type": asset.asset_type,
+            "download_scope": "asset",
+            "actor_type": "guest",
+        },
     )
     db.commit()
     return {"ok": True, "url": asset.file_url}
@@ -351,6 +460,9 @@ def public_delivery_package_download(
     pkg = db.query(DeliveryPackage).filter(DeliveryPackage.id == link.delivery_package_id).first()
     if not pkg or not pkg.zip_url:
         raise HTTPException(status_code=404, detail="Package zip not ready")
+    project = db.query(Project).filter(Project.id == pkg.project_id).first()
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
     db.add(
         DeliveryReceipt(
             delivery_link_id=link.id,
@@ -361,6 +473,16 @@ def public_delivery_package_download(
             ip_address=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
         )
+    )
+    _emit_delivery_download(
+        db,
+        project=project,
+        scope_id=f"package:{pkg.id}:guest",
+        properties={
+            "delivery_package_id": pkg.id,
+            "download_scope": "package",
+            "actor_type": "guest",
+        },
     )
     db.commit()
     return RedirectResponse(url=pkg.zip_url, status_code=302)

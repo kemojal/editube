@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -50,6 +51,7 @@ from app.services.ugc_platforms import get_preset, list_presets
 from app.services.ugc_variation_engine import InsufficientCreditsError, build_variations
 from app.ugc_providers import get_avatar_provider
 from app.utils.security import get_current_user
+from app.services.product_analytics import emit, emit_once
 
 logger = logging.getLogger(__name__)
 
@@ -448,16 +450,58 @@ def rerender_variation(
         raise HTTPException(status_code=402, detail={"error": "insufficient_credits", "needed": cost})
     v.status = "queued"
     v.render_error = None
+    operation_id = secrets.token_hex(10)
+    emit_once(
+        db,
+        "feature_started",
+        event_id=f"feature:ugc-render:variation:{v.id}:operation:{operation_id}:started",
+        user=user,
+        workspace_id=c.workspace_id,
+        properties={
+            "feature_key": "ugc_render",
+            "campaign_id": c.id,
+            "variation_id": v.id,
+            "operation_id": operation_id,
+            "render_mode": "rerender",
+            "result": "queued",
+        },
+    )
     db.commit()
-    job_id = enqueue_ugc_render_job(v.id)
+    job_id = enqueue_ugc_render_job(v.id, "ugc_render", operation_id)
     if job_id:
         v.rq_job_id = job_id
         db.commit()
     elif _no_redis():
         from app.jobs.ugc_render import ugc_render_job
 
-        ugc_render_job(v.id)
+        ugc_render_job(v.id, "ugc_render", operation_id)
         db.refresh(v)
+    else:
+        v.status = "failed"
+        v.render_error = "Could not queue render."
+        ugc_credits.refund(
+            db,
+            c.workspace_id,
+            cost,
+            variation_id=v.id,
+        )
+        emit_once(
+            db,
+            "feature_failed",
+            event_id=f"feature:ugc-render:variation:{v.id}:operation:{operation_id}:queue-failed",
+            user=user,
+            workspace_id=c.workspace_id,
+            properties={
+                "feature_key": "ugc_render",
+                "campaign_id": c.id,
+                "variation_id": v.id,
+                "operation_id": operation_id,
+                "failure_class": "queue",
+                "error_code": "queue_unavailable",
+                "result": "failure",
+            },
+        )
+        db.commit()
     return _variation_out(v)
 
 
@@ -480,16 +524,57 @@ def regenerate_variation(
         raise HTTPException(status_code=402, detail={"error": "insufficient_credits", "needed": cost})
     v.status = "queued"
     v.render_error = None
+    operation_id = secrets.token_hex(10)
+    emit_once(
+        db,
+        "feature_started",
+        event_id=f"feature:ugc-regenerate:variation:{v.id}:operation:{operation_id}:started",
+        user=user,
+        workspace_id=c.workspace_id,
+        properties={
+            "feature_key": "ugc_regenerate",
+            "campaign_id": c.id,
+            "variation_id": v.id,
+            "operation_id": operation_id,
+            "result": "queued",
+        },
+    )
     db.commit()
-    job_id = enqueue_ugc_render_job(v.id)
+    job_id = enqueue_ugc_render_job(v.id, "ugc_regenerate", operation_id)
     if job_id:
         v.rq_job_id = job_id
         db.commit()
     elif _no_redis():
         from app.jobs.ugc_render import ugc_render_job
 
-        ugc_render_job(v.id)
+        ugc_render_job(v.id, "ugc_regenerate", operation_id)
         db.refresh(v)
+    else:
+        v.status = "failed"
+        v.render_error = "Could not queue regeneration."
+        ugc_credits.refund(
+            db,
+            c.workspace_id,
+            cost,
+            variation_id=v.id,
+        )
+        emit_once(
+            db,
+            "feature_failed",
+            event_id=f"feature:ugc-regenerate:variation:{v.id}:operation:{operation_id}:queue-failed",
+            user=user,
+            workspace_id=c.workspace_id,
+            properties={
+                "feature_key": "ugc_regenerate",
+                "campaign_id": c.id,
+                "variation_id": v.id,
+                "operation_id": operation_id,
+                "failure_class": "queue",
+                "error_code": "queue_unavailable",
+                "result": "failure",
+            },
+        )
+        db.commit()
     return _variation_out(v)
 
 

@@ -26,8 +26,7 @@ class AnnotationUserResponse(BaseModel):
     email: str
     avatar_url: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class AnnotationResponse(BaseModel):
@@ -42,5 +41,4 @@ class AnnotationResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}

@@ -61,6 +61,7 @@ from app.publishers import get_publisher
 from app.services.youtube_chapters import youtube_description_block
 from app.utils.security import get_current_user
 from app.services.project_access import can_access_project
+from app.services.product_analytics import emit, emit_once
 
 
 router = APIRouter(prefix="/creator", tags=["Creator"])
@@ -171,6 +172,50 @@ def publish_publication(
                 detail="The user who created this draft must connect YouTube (Studio → Connect YouTube).",
             )
     get_publisher(pub.platform).start_publish(db, pub)
+    feature_key = "youtube_publish" if (pub.platform or "").lower() == "youtube" else None
+    if pub.status == "failed":
+        emit(
+            db,
+            "publication_failed",
+            user=current_user,
+            properties={
+                "platform": (pub.platform or "unknown").lower(),
+                "feature_key": feature_key,
+                "publication_id": pub.id,
+                "error_code": "queue_unavailable",
+                "result": "failure",
+            },
+        )
+        if feature_key:
+            emit(
+                db,
+                "feature_failed",
+                user=current_user,
+                properties={
+                    "feature_key": feature_key,
+                    "error_code": "queue_unavailable",
+                    "failure_class": "queue",
+                    "result": "failure",
+                },
+            )
+    else:
+        emit(
+            db,
+            "publication_queued",
+            user=current_user,
+            properties={
+                "platform": (pub.platform or "unknown").lower(),
+                "feature_key": feature_key,
+                "publication_id": pub.id,
+            },
+        )
+        if feature_key:
+            emit(
+                db,
+                "feature_started",
+                user=current_user,
+                properties={"feature_key": feature_key, "entry_point": "creator_publish"},
+            )
     db.commit()
     db.refresh(pub)
     return pub
@@ -209,7 +254,8 @@ def create_aspect_export(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _get_owned_video(db, video_id, current_user)
+    video = _get_owned_video(db, video_id, current_user)
+    project = video.project
     exp = VideoAspectExport(
         video_id=video_id,
         aspect_ratio=body.aspect_ratio,
@@ -220,10 +266,52 @@ def create_aspect_export(
     db.add(exp)
     db.commit()
     db.refresh(exp)
-    if not enqueue_aspect_export_job(exp.id):
+    if enqueue_aspect_export_job(exp.id):
+        common = {
+            "user": current_user,
+            "workspace_id": project.workspace_id if project else None,
+            "properties": {
+                "feature_key": "multi_aspect_export",
+                "job_type": "aspect_export",
+                "resource_id": exp.id,
+                "project_id": video.project_id,
+                "video_id": video.id,
+                "aspect_ratio": exp.aspect_ratio,
+                "result": "queued",
+            },
+        }
+        emit_once(
+            db,
+            "feature_started",
+            event_id=f"feature:multi-aspect-export:aspect:{exp.id}:started",
+            **common,
+        )
+        db.commit()
+    else:
         exp.status = "failed"
         exp.error_message = "Could not queue export (set REDIS_URL and run an RQ worker)."
         db.add(exp)
+        common = {
+            "user": current_user,
+            "workspace_id": project.workspace_id if project else None,
+            "properties": {
+                "feature_key": "multi_aspect_export",
+                "job_type": "aspect_export",
+                "resource_id": exp.id,
+                "project_id": video.project_id,
+                "video_id": video.id,
+                "failure_class": "queue",
+                "error_code": "queue_unavailable",
+                "result": "failure",
+            },
+        }
+        emit_once(db, "job_failed", event_id=f"aspect-export:{exp.id}:queue-failed", **common)
+        emit_once(
+            db,
+            "feature_failed",
+            event_id=f"feature:multi-aspect-export:aspect:{exp.id}:queue-failed",
+            **common,
+        )
         db.commit()
         db.refresh(exp)
     return exp
@@ -242,7 +330,8 @@ def delete_aspect_export(export_id: int, db: Session = Depends(get_db), current_
 
 @router.get("/videos/{video_id}/delivery-exports", response_model=List[DeliveryExportResponse])
 def list_delivery_exports(video_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    _get_owned_video(db, video_id, current_user)
+    video = _get_owned_video(db, video_id, current_user)
+    project = video.project
     return (
         db.query(DeliveryExport)
         .filter(DeliveryExport.video_id == video_id)
@@ -273,10 +362,52 @@ def create_delivery_exports(
     db.commit()
     for row in rows:
         db.refresh(row)
-        if not enqueue_multi_format_export_job(row.id):
+        if enqueue_multi_format_export_job(row.id):
+            common = {
+                "user": current_user,
+                "workspace_id": project.workspace_id if project else None,
+                "properties": {
+                    "feature_key": "multi_aspect_export",
+                    "job_type": "multi_format_export",
+                    "resource_id": row.id,
+                    "project_id": video.project_id,
+                    "video_id": video.id,
+                    "profile_key": row.profile_key,
+                    "result": "queued",
+                },
+            }
+            emit_once(
+                db,
+                "feature_started",
+                event_id=f"feature:multi-aspect-export:delivery:{row.id}:started",
+                **common,
+            )
+        else:
             row.status = "failed"
             row.error_message = "Could not queue export (set REDIS_URL and run an RQ worker)."
             db.add(row)
+            common = {
+                "user": current_user,
+                "workspace_id": project.workspace_id if project else None,
+                "properties": {
+                    "feature_key": "multi_aspect_export",
+                    "job_type": "multi_format_export",
+                    "resource_id": row.id,
+                    "project_id": video.project_id,
+                    "video_id": video.id,
+                    "profile_key": row.profile_key,
+                    "failure_class": "queue",
+                    "error_code": "queue_unavailable",
+                    "result": "failure",
+                },
+            }
+            emit_once(db, "job_failed", event_id=f"multi-format-export:{row.id}:queue-failed", **common)
+            emit_once(
+                db,
+                "feature_failed",
+                event_id=f"feature:multi-aspect-export:delivery:{row.id}:queue-failed",
+                **common,
+            )
     db.commit()
     for row in rows:
         db.refresh(row)
@@ -314,7 +445,7 @@ def create_chapter(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _get_owned_video(db, video_id, current_user)
+    video = _get_owned_video(db, video_id, current_user)
     chap = VideoChapter(
         video_id=video_id,
         start_time=body.start_time,
@@ -324,6 +455,22 @@ def create_chapter(
         order_index=body.order_index or 0,
     )
     db.add(chap)
+    db.flush()
+    emit_once(
+        db,
+        "feature_completed",
+        event_id=f"feature:chapters:chapter:{chap.id}:created",
+        user=current_user,
+        workspace_id=video.project.workspace_id if video.project else None,
+        properties={
+            "feature_key": "chapters",
+            "project_id": video.project_id,
+            "video_id": video.id,
+            "chapter_id": chap.id,
+            "completion_type": "chapter_persisted",
+            "result": "success",
+        },
+    )
     db.commit()
     db.refresh(chap)
     return chap
@@ -372,13 +519,30 @@ def auto_chapters(video_id: int, db: Session = Depends(get_db), current_user: Us
 def youtube_chapter_description_block(
     video_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
 ):
-    _get_owned_video(db, video_id, current_user)
+    video = _get_owned_video(db, video_id, current_user)
     chapters = (
         db.query(VideoChapter)
         .filter(VideoChapter.video_id == video_id)
         .order_by(VideoChapter.start_time.asc(), VideoChapter.order_index.asc())
         .all()
     )
+    if chapters:
+        emit_once(
+            db,
+            "feature_result_used",
+            event_id=f"feature:chapters:video:{video.id}:description-block-opened",
+            user=current_user,
+            workspace_id=video.project.workspace_id if video.project else None,
+            properties={
+                "feature_key": "chapters",
+                "project_id": video.project_id,
+                "video_id": video.id,
+                "chapter_count": len(chapters),
+                "result_action": "youtube_description_block_opened",
+                "result": "success",
+            },
+        )
+        db.commit()
     return YoutubeChapterBlockResponse(block=youtube_description_block(chapters))
 
 
@@ -436,9 +600,24 @@ def create_brand_deal(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _get_owned_project(db, project_id, current_user)
+    project = _get_owned_project(db, project_id, current_user)
     deal = BrandDeal(project_id=project_id, **body.dict())
     db.add(deal)
+    db.flush()
+    emit(
+        db,
+        "feature_completed",
+        user=current_user,
+        workspace_id=project.workspace_id,
+        properties={
+            "feature_key": "brand_deal",
+            "project_id": project.id,
+            "brand_deal_id": deal.id,
+            "currency": deal.currency,
+            "amount_cents": deal.amount_cents,
+            "result": "success",
+        },
+    )
     db.commit()
     db.refresh(deal)
     return deal
@@ -454,11 +633,27 @@ def update_brand_deal(
     deal = db.query(BrandDeal).filter(BrandDeal.id == deal_id).first()
     if not deal:
         raise HTTPException(status_code=404, detail="Brand deal not found")
-    _get_owned_project(db, deal.project_id, current_user)
+    project = _get_owned_project(db, deal.project_id, current_user)
+    previous_payout_status = deal.payout_status
     for k, v in body.dict(exclude_unset=True).items():
         setattr(deal, k, v)
     if body.payout_status == "paid" and not deal.paid_at:
         deal.paid_at = datetime.utcnow()
+    if previous_payout_status != deal.payout_status:
+        emit(
+            db,
+            "feature_result_used",
+            user=current_user,
+            workspace_id=project.workspace_id,
+            properties={
+                "feature_key": "brand_deal",
+                "project_id": project.id,
+                "brand_deal_id": deal.id,
+                "result_type": "payout_status_changed",
+                "payout_status": deal.payout_status,
+                "result": "success",
+            },
+        )
     db.commit()
     db.refresh(deal)
     return deal
@@ -497,9 +692,25 @@ def create_thumbnail(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _get_owned_video(db, video_id, current_user)
+    video = _get_owned_video(db, video_id, current_user)
     t = ThumbnailVariant(video_id=video_id, label=body.label, image_url=body.image_url)
     db.add(t)
+    db.flush()
+    emit_once(
+        db,
+        "feature_completed",
+        event_id=f"feature:thumbnail:variant:{t.id}:created",
+        user=current_user,
+        workspace_id=video.project.workspace_id if video.project else None,
+        properties={
+            "feature_key": "thumbnail",
+            "project_id": video.project_id,
+            "video_id": video.id,
+            "thumbnail_variant_id": t.id,
+            "completion_type": "thumbnail_variant_stored",
+            "result": "success",
+        },
+    )
     db.commit()
     db.refresh(t)
     return t
@@ -515,7 +726,8 @@ def update_thumbnail(
     t = db.query(ThumbnailVariant).filter(ThumbnailVariant.id == thumb_id).first()
     if not t:
         raise HTTPException(status_code=404, detail="Thumbnail not found")
-    _get_owned_video(db, t.video_id, current_user)
+    video = _get_owned_video(db, t.video_id, current_user)
+    was_winner = bool(t.is_winner)
     data = body.dict(exclude_unset=True)
     if data.get("is_winner"):
         db.query(ThumbnailVariant).filter(
@@ -524,6 +736,22 @@ def update_thumbnail(
         ).update({"is_winner": False})
     for k, v in data.items():
         setattr(t, k, v)
+    if bool(t.is_winner) and not was_winner:
+        emit_once(
+            db,
+            "feature_result_used",
+            event_id=f"feature:thumbnail:variant:{t.id}:selected",
+            user=current_user,
+            workspace_id=video.project.workspace_id if video.project else None,
+            properties={
+                "feature_key": "thumbnail",
+                "project_id": video.project_id,
+                "video_id": video.id,
+                "thumbnail_variant_id": t.id,
+                "result_action": "thumbnail_selected",
+                "result": "success",
+            },
+        )
     db.commit()
     db.refresh(t)
     return t

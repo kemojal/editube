@@ -2,18 +2,20 @@ import asyncio
 import logging
 import os
 import re
+import time
+import uuid
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .api import api_router
-from .db.database import SessionLocal
+from .db.database import SessionLocal, get_db
 from .utils.security import authenticate_access_token
 from .websocket_manager import notifications_ws_manager, review_room_ws_manager
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import Session, joinedload
 
 from .db.models import (
     Clip,
@@ -25,11 +27,35 @@ from .db.models import (
     Project,
 )
 from .services.project_access import can_access_project, can_moderate_video_comments
+from .services.observability import capture_exception, init_sentry
+from .services.product_analytics import emit_after_commit, emit_once
+from .services.request_context import (
+    begin_request,
+    bind_route,
+    current_request_context,
+    end_request,
+)
 
 load_dotenv()
 
+init_sentry("api")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _record_dependency_degraded(dependency_key: str, status: str, error_code: str) -> None:
+    hour = time.strftime("%Y%m%d%H", time.gmtime())
+    emit_after_commit(
+        "dependency_degraded",
+        event_id=f"dependency:{dependency_key}:{status}:{hour}",
+        properties={
+            "dependency_key": dependency_key,
+            "dependency_status": status,
+            "error_code": error_code,
+            "result": "failure",
+        },
+    )
 
 
 @asynccontextmanager
@@ -42,7 +68,64 @@ async def _app_lifespan(app: FastAPI):
     digest_hours = float(digest_hours_raw) if digest_hours_raw else 0.0
     retention_hours_raw = os.getenv("RETENTION_SCAN_INTERVAL_HOURS", "").strip()
     retention_hours = float(retention_hours_raw) if retention_hours_raw else 0.0
+    affiliate_minutes_raw = os.getenv("AFFILIATE_MONITOR_INTERVAL_MINUTES", "").strip()
+    affiliate_minutes = float(affiliate_minutes_raw) if affiliate_minutes_raw else 0.0
+    affiliate_privacy_hours_raw = os.getenv(
+        "AFFILIATE_PRIVACY_RETENTION_INTERVAL_HOURS", ""
+    ).strip()
+    affiliate_privacy_hours = (
+        float(affiliate_privacy_hours_raw) if affiliate_privacy_hours_raw else 0.0
+    )
+    referral_retry_minutes_raw = os.getenv(
+        "REFERRAL_DELIVERY_RETRY_INTERVAL_MINUTES", "5"
+    ).strip()
+    referral_retry_minutes = (
+        float(referral_retry_minutes_raw) if referral_retry_minutes_raw else 0.0
+    )
+    analytics_retention_hours_raw = os.getenv(
+        "ANALYTICS_RETENTION_INTERVAL_HOURS", "24"
+    ).strip()
+    analytics_retention_hours = (
+        float(analytics_retention_hours_raw) if analytics_retention_hours_raw else 0.0
+    )
+    analytics_quality_seconds_raw = os.getenv(
+        "ANALYTICS_QUALITY_INTERVAL_SECONDS", "300"
+    ).strip()
+    analytics_quality_seconds = (
+        max(60, int(analytics_quality_seconds_raw))
+        if analytics_quality_seconds_raw
+        else 0
+    )
     tasks: list[asyncio.Task] = []
+
+    from app.request_logging.config import RequestLogSettings
+    from app.request_logging.writer import start_global_writer, stop_global_writer
+
+    request_log_settings = RequestLogSettings.from_env()
+    if request_log_settings.read_database_url:
+        raise RuntimeError(
+            "Public API must not receive LOG_READ_DATABASE_URL; "
+            "deploy app.internal_admin separately"
+        )
+    if request_log_settings.enabled:
+        from app.request_logging.crypto import PayloadCipher
+
+        # Validate Fernet/HMAC material at startup instead of discovering a
+        # malformed production secret on the first customer request.
+        PayloadCipher(request_log_settings)
+        request_log_writer = start_global_writer(request_log_settings)
+
+        async def _request_log_retention_loop() -> None:
+            while True:
+                await asyncio.sleep(request_log_settings.retention_interval_hours * 3600)
+                try:
+                    result = await asyncio.to_thread(request_log_writer.maintain)
+                    if any(result.values()):
+                        logger.info("Request-log retention completed counts=%s", result)
+                except Exception:
+                    logger.exception("Request-log retention/rollup maintenance failed")
+
+        tasks.append(asyncio.create_task(_request_log_retention_loop()))
 
     redis_url = (os.getenv("REDIS_URL") or "").strip()
     if redis_url:
@@ -106,6 +189,172 @@ async def _app_lifespan(app: FastAPI):
 
         tasks.append(asyncio.create_task(_retention_loop()))
 
+    if affiliate_minutes > 0:
+
+        async def _affiliate_monitor_loop() -> None:
+            last_signature: tuple | None = None
+            last_delivery = 0.0
+            cooldown_minutes = max(
+                5.0,
+                float(os.getenv("AFFILIATE_ALERT_COOLDOWN_MINUTES", "60") or "60"),
+            )
+            while True:
+                await asyncio.sleep(affiliate_minutes * 60)
+                try:
+                    from app.services.affiliate_reconciliation import (
+                        database_reconciliation_report,
+                        send_monitor_webhook,
+                    )
+
+                    def _build_report() -> dict:
+                        monitor_db = SessionLocal()
+                        try:
+                            return database_reconciliation_report(monitor_db)
+                        finally:
+                            monitor_db.close()
+
+                    report = await asyncio.to_thread(_build_report)
+                    if report["status"] == "ok":
+                        last_signature = None
+                        continue
+                    signature = tuple(
+                        sorted((issue["code"], issue["severity"]) for issue in report["issues"])
+                    )
+                    now_monotonic = asyncio.get_running_loop().time()
+                    should_deliver = (
+                        signature != last_signature
+                        or now_monotonic - last_delivery >= cooldown_minutes * 60
+                    )
+                    logger.warning(
+                        "Affiliate reconciliation monitor status=%s issues=%s",
+                        report["status"],
+                        report["issue_counts"],
+                    )
+                    if should_deliver:
+                        await asyncio.to_thread(send_monitor_webhook, report)
+                        last_signature = signature
+                        last_delivery = now_monotonic
+                except Exception:
+                    logger.exception("Scheduled affiliate reconciliation monitor failed")
+
+        tasks.append(asyncio.create_task(_affiliate_monitor_loop()))
+
+    if affiliate_privacy_hours > 0:
+
+        async def _affiliate_privacy_loop() -> None:
+            while True:
+                try:
+                    from app.services.affiliate_privacy import (
+                        apply_affiliate_privacy_retention,
+                    )
+
+                    privacy_db = SessionLocal()
+                    try:
+                        result = await asyncio.to_thread(
+                            apply_affiliate_privacy_retention,
+                            privacy_db,
+                        )
+                    finally:
+                        privacy_db.close()
+                    if any(result.values()):
+                        logger.info("Affiliate privacy retention completed counts=%s", result)
+                except Exception:
+                    logger.exception("Scheduled affiliate privacy retention failed")
+                await asyncio.sleep(affiliate_privacy_hours * 3600)
+
+        tasks.append(asyncio.create_task(_affiliate_privacy_loop()))
+
+    if referral_retry_minutes > 0:
+
+        async def _referral_delivery_retry_loop() -> None:
+            while True:
+                await asyncio.sleep(referral_retry_minutes * 60)
+                retry_db = SessionLocal()
+                try:
+                    from app.services.referrals import retry_failed_invite_deliveries
+
+                    result = await asyncio.to_thread(
+                        retry_failed_invite_deliveries,
+                        retry_db,
+                    )
+                    if result["attempted"]:
+                        logger.info("Referral delivery retries completed counts=%s", result)
+                except Exception:
+                    logger.exception("Scheduled referral delivery retry failed")
+                finally:
+                    retry_db.close()
+
+        tasks.append(asyncio.create_task(_referral_delivery_retry_loop()))
+
+    if analytics_retention_hours > 0:
+
+        async def _analytics_retention_loop() -> None:
+            while True:
+                # Do not block application startup/shutdown on a database sweep;
+                # deploy migrations first, then run at the configured cadence.
+                await asyncio.sleep(analytics_retention_hours * 3600)
+                try:
+                    from app.services.analytics_retention import apply_analytics_retention
+
+                    retention_db = SessionLocal()
+                    try:
+                        result = await asyncio.to_thread(
+                            apply_analytics_retention,
+                            retention_db,
+                        )
+                    finally:
+                        retention_db.close()
+                    if any(result.values()):
+                        logger.info("Analytics retention completed counts=%s", result)
+                except Exception:
+                    logger.exception("Analytics retention sweep failed")
+
+        tasks.append(asyncio.create_task(_analytics_retention_loop()))
+
+    analytics_interval_raw = os.getenv("ANALYTICS_DELIVERY_INTERVAL_SECONDS", "30").strip()
+    analytics_interval = max(10, int(analytics_interval_raw or "30"))
+    if redis_url and os.getenv("POSTHOG_PROJECT_API_KEY", "").strip():
+
+        async def _analytics_delivery_loop() -> None:
+            while True:
+                try:
+                    from app.jobs.queue import enqueue_analytics_delivery_job
+
+                    enqueue_analytics_delivery_job()
+                except Exception:
+                    logger.exception("Scheduled analytics delivery enqueue failed")
+                await asyncio.sleep(analytics_interval)
+
+        tasks.append(asyncio.create_task(_analytics_delivery_loop()))
+
+    if redis_url and os.getenv("POSTHOG_PROJECT_ID", "").strip():
+
+        async def _analytics_privacy_request_loop() -> None:
+            while True:
+                try:
+                    from app.jobs.queue import enqueue_analytics_privacy_job
+
+                    enqueue_analytics_privacy_job()
+                except Exception:
+                    logger.exception("Scheduled analytics privacy enqueue failed")
+                await asyncio.sleep(max(60, analytics_interval))
+
+        tasks.append(asyncio.create_task(_analytics_privacy_request_loop()))
+
+    if analytics_quality_seconds > 0:
+
+        async def _analytics_quality_loop() -> None:
+            while True:
+                await asyncio.sleep(analytics_quality_seconds)
+                try:
+                    from app.jobs.analytics_quality import analytics_quality_job
+
+                    await asyncio.to_thread(analytics_quality_job)
+                except Exception:
+                    logger.exception("Scheduled analytics quality monitor failed")
+
+        tasks.append(asyncio.create_task(_analytics_quality_loop()))
+
     yield
 
     for task in tasks:
@@ -114,6 +363,7 @@ async def _app_lifespan(app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+    stop_global_writer()
 
 
 app = FastAPI(
@@ -171,7 +421,59 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
+
+
+_CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
+_TRACE_ID_RE = re.compile(r"^[a-fA-F0-9]{16,32}$")
+
+
+@app.middleware("http")
+async def request_correlation_and_failure_analytics(request: Request, call_next):
+    incoming_request_id = (request.headers.get("x-request-id") or "").strip()
+    request_id = (
+        incoming_request_id
+        if _CORRELATION_ID_RE.fullmatch(incoming_request_id)
+        else str(uuid.uuid4())
+    )
+    sentry_trace = (request.headers.get("sentry-trace") or "").split("-", 1)[0]
+    trace_id = sentry_trace if _TRACE_ID_RE.fullmatch(sentry_trace) else None
+    analytics_session_id = (request.headers.get("x-analytics-session-id") or "").strip()
+    if not _CORRELATION_ID_RE.fullmatch(analytics_session_id):
+        analytics_session_id = None
+
+    context_token = begin_request(
+        request_id=request_id,
+        trace_id=trace_id,
+        analytics_session_id=analytics_session_id,
+    )
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+        route = request.scope.get("route")
+        route_template = getattr(route, "path", None)
+        bind_route(route_template)
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        if (
+            (response.status_code >= 500 or response.status_code == 429)
+            and not getattr(request.state, "failure_analytics_emitted", False)
+        ):
+            emit_after_commit(
+                "api_request_failed",
+                properties={
+                    "method": request.method,
+                    "status_class": f"{response.status_code // 100}xx",
+                    "duration_ms": duration_ms,
+                    "error_code": f"http_{response.status_code}",
+                    "result": "failure",
+                },
+            )
+        response.headers["X-Request-ID"] = request_id
+        return response
+    finally:
+        end_request(context_token)
 
 # Storage backends (R2 / Cloudinary / local) are configured lazily by app.storage;
 # no global cloudinary.config() needed here. See docs/r2-storage-migration-plan.md.
@@ -206,6 +508,14 @@ async def uploads_media_cors_fallback(request: Request, call_next):
     elif request.method in ("GET", "HEAD", "OPTIONS"):
         response.headers["Access-Control-Allow-Origin"] = "*"
     return response
+
+
+# Innermost user middleware: downstream dependency ContextVar mutations remain
+# visible here, while the outer correlation middleware still supplies the
+# request ID. WebSocket scopes are passed through untouched.
+from app.request_logging.middleware import RequestLoggingMiddleware  # noqa: E402
+
+app.add_middleware(RequestLoggingMiddleware)
 
 
 # Include the WebSocket app
@@ -285,6 +595,36 @@ async def review_room_websocket(websocket: WebSocket, token: str):
             return
         room_id = f"review:{link.id}"
         await review_room_ws_manager.connect(room_id, session_id, websocket)
+        video = db.query(Video).filter(Video.id == link.video_id).first()
+        project = db.query(Project).filter(Project.id == video.project_id).first() if video else None
+        if project is not None:
+            analytics_room_id = f"review-link:{link.id}:session:{session.id}"
+            common = {
+                "workspace_id": project.workspace_id,
+                "source": "review_service",
+                "properties": {
+                    "project_id": project.id,
+                    "video_id": video.id,
+                    "review_link_id": link.id,
+                    "review_session_id": session.id,
+                    "feature_key": "live_review_room",
+                    "actor_type": "guest",
+                    "result": "success",
+                },
+            }
+            emit_once(
+                db,
+                "review_live_room_joined",
+                event_id=f"{analytics_room_id}:joined",
+                **common,
+            )
+            emit_once(
+                db,
+                "feature_started",
+                event_id=f"feature:live-review-room:{analytics_room_id}:started",
+                **common,
+            )
+            db.commit()
         base_presence = {
             "session_id": session.id,
             "guest_name": session.guest_name or "Guest",
@@ -389,6 +729,25 @@ async def review_room_websocket(websocket: WebSocket, token: str):
                         },
                     ),
                 )
+                if project is not None:
+                    emit_once(
+                        db,
+                        "feature_result_used",
+                        event_id=f"feature:live-review-room:{analytics_room_id}:result-used",
+                        workspace_id=project.workspace_id,
+                        source="review_service",
+                        properties={
+                            "project_id": project.id,
+                            "video_id": video.id,
+                            "review_link_id": link.id,
+                            "review_session_id": session.id,
+                            "feature_key": "live_review_room",
+                            "result_type": "playback_sync",
+                            "actor_type": "guest",
+                            "result": "success",
+                        },
+                    )
+                    db.commit()
             elif event == "chat.message":
                 body = (payload.get("body") or "").strip()
                 if not body:
@@ -522,6 +881,31 @@ async def team_video_websocket(websocket: WebSocket, video_id: int):
             return
         room_id = f"team-video:{video_id}"
         await review_room_ws_manager.connect(room_id, user.id, websocket)
+        analytics_connection_id = uuid.uuid4().hex
+        common = {
+            "user": user,
+            "workspace_id": project.workspace_id,
+            "properties": {
+                "project_id": project.id,
+                "video_id": video.id,
+                "feature_key": "live_review_room",
+                "actor_type": "member",
+                "result": "success",
+            },
+        }
+        emit_once(
+            db,
+            "review_live_room_joined",
+            event_id=f"team-live-room:{video.id}:{analytics_connection_id}:joined",
+            **common,
+        )
+        emit_once(
+            db,
+            "feature_started",
+            event_id=f"feature:live-review-room:{video.id}:{analytics_connection_id}:started",
+            **common,
+        )
+        db.commit()
         base_presence = {
             "session_id": user.id,
             "user_id": user.id,
@@ -635,6 +1019,22 @@ async def team_video_websocket(websocket: WebSocket, video_id: int):
                         },
                     ),
                 )
+                emit_once(
+                    db,
+                    "feature_result_used",
+                    event_id=f"feature:live-review-room:{video.id}:{analytics_connection_id}:result-used",
+                    user=user,
+                    workspace_id=project.workspace_id,
+                    properties={
+                        "project_id": project.id,
+                        "video_id": video.id,
+                        "feature_key": "live_review_room",
+                        "result_type": "playback_sync",
+                        "actor_type": "member",
+                        "result": "success",
+                    },
+                )
+                db.commit()
             elif event == "chat.message":
                 body = (payload.get("body") or "").strip()
                 if not body:
@@ -889,6 +1289,78 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/health/request-logging")
+def request_logging_health():
+    """Sanitized public-process writer health for infrastructure monitoring."""
+    from app.request_logging.config import RequestLogSettings
+    from app.request_logging.writer import get_global_writer
+
+    settings = RequestLogSettings.from_env()
+    if not settings.enabled:
+        return {"status": "disabled", "enabled": False}
+    snapshot = get_global_writer(settings).health()
+    degraded = (
+        not snapshot["thread_alive"]
+        or snapshot["dropped"] > 0
+        or snapshot["failed"] > 0
+        or snapshot["queue_depth"] >= int(snapshot["queue_capacity"] * 0.8)
+    )
+    if degraded:
+        _record_dependency_degraded(
+            "request_log_writer",
+            "degraded",
+            "request_log_writer_degraded",
+        )
+    return JSONResponse(
+        {
+            "status": "degraded" if degraded else "ok",
+            "enabled": True,
+            "thread_alive": snapshot["thread_alive"],
+            "queue_depth": snapshot["queue_depth"],
+            "queue_capacity": snapshot["queue_capacity"],
+            "enqueued": snapshot["enqueued"],
+            "written": snapshot["written"],
+            "payloads_shed": snapshot["payloads_shed"],
+            "dropped": snapshot["dropped"],
+            "failed": snapshot["failed"],
+            "error_present": bool(snapshot["last_error"]),
+        },
+        status_code=503 if degraded else 200,
+    )
+
+
+@app.get("/health/affiliate")
+def affiliate_health(db: Session = Depends(get_db)):
+    """Sanitized affiliate-accounting health for Dokploy or uptime monitors."""
+    try:
+        from app.services.affiliate_reconciliation import (
+            cached_database_reconciliation_report,
+        )
+
+        report = cached_database_reconciliation_report(db)
+        payload = {
+            "status": report["status"],
+            "generated_at": report["generated_at"],
+            "checked": report["checked"],
+            "issue_counts": report["issue_counts"],
+        }
+        return JSONResponse(
+            payload,
+            status_code=503 if report["status"] == "critical" else 200,
+        )
+    except Exception:
+        logger.exception("Affiliate health check failed")
+        _record_dependency_degraded(
+            "affiliate_reconciliation",
+            "down",
+            "affiliate_health_unavailable",
+        )
+        return JSONResponse(
+            {"status": "critical", "error": "affiliate_health_unavailable"},
+            status_code=503,
+        )
+
+
 @app.get("/health/queue")
 async def queue_health():
     """
@@ -908,6 +1380,7 @@ async def queue_health():
     redis_url = (os.getenv("REDIS_URL") or "").strip()
     if not redis_url:
         result["error"] = "REDIS_URL not configured"
+        _record_dependency_degraded("queue", "degraded", "redis_not_configured")
         return result
 
     try:
@@ -928,9 +1401,12 @@ async def queue_health():
         result["worker_count"] = default_workers
         result["worker_connected"] = default_workers > 0
         result["status"] = "ok" if result["worker_connected"] else "degraded"
+        if not result["worker_connected"]:
+            _record_dependency_degraded("queue", "degraded", "worker_not_connected")
     except Exception as exc:  # noqa: BLE001
         result["status"] = "down"
         result["error"] = str(exc)[:300]
+        _record_dependency_degraded("queue", "down", "redis_unreachable")
 
     return result
 
@@ -958,9 +1434,31 @@ if __name__ == "__main__":
 
 @app.exception_handler(Exception)
 async def unicorn_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled error: {exc}")
+    route = request.scope.get("route")
+    bind_route(getattr(route, "path", None))
+    context = current_request_context()
+    logger.error(
+        "Unhandled request error request_id=%s route=%s",
+        context.request_id,
+        context.route_template,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    capture_exception(exc)
+    request.state.failure_analytics_emitted = True
+    emit_after_commit(
+        "api_request_failed",
+        properties={
+            "method": request.method,
+            "status_class": "5xx",
+            "error_code": "unhandled_exception",
+            "result": "failure",
+        },
+    )
     return JSONResponse(
         status_code=500,
         content={"message": "Internal server error"},
-        headers=_cors_headers_for_request(request),
+        headers={
+            **_cors_headers_for_request(request),
+            "X-Request-ID": context.request_id or str(uuid.uuid4()),
+        },
     )

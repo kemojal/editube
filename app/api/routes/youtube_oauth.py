@@ -17,9 +17,42 @@ from sqlalchemy.orm import Session
 from app.db.database import get_db
 from app.db.models import User, UserYoutubeConnection
 from app.services.youtube_credentials import YOUTUBE_SCOPES, persist_tokens_from_exchange
+from app.services.product_analytics import emit, emit_after_commit
 from app.utils.security import ALGORITHM, SECRET_KEY, get_current_user
 
 router = APIRouter(prefix="/users/google/youtube", tags=["YouTube"])
+
+
+def _record_oauth_failure(db: Session, state: str | None, error_code: str) -> None:
+    if not state:
+        return
+    try:
+        user_id = _decode_state(state)
+    except HTTPException:
+        return
+    emit(
+        db,
+        "integration_connect_failed",
+        user_id=user_id,
+        properties={
+            "provider": "youtube",
+            "feature_key": "youtube_publish",
+            "error_code": error_code,
+            "result": "failure",
+        },
+    )
+    emit(
+        db,
+        "feature_failed",
+        user_id=user_id,
+        properties={
+            "feature_key": "youtube_publish",
+            "error_code": error_code,
+            "failure_class": "oauth",
+            "result": "failure",
+        },
+    )
+    db.commit()
 
 
 def _require_google_client() -> tuple[str, str]:
@@ -121,6 +154,14 @@ def youtube_authorize_url(req: Request, db: Session = Depends(get_db), current_u
         }
     )
     url = f"https://accounts.google.com/o/oauth2/v2/auth?{params}"
+    if isinstance(db, Session):
+        emit(
+            db,
+            "integration_connect_started",
+            user=current_user,
+            properties={"provider": "youtube", "feature_key": "youtube_publish"},
+        )
+        db.commit()
     return {"authorization_url": url}
 
 
@@ -134,8 +175,10 @@ def youtube_oauth_callback(
 ):
     ret = _frontend_return_url()
     if error:
+        _record_oauth_failure(db, state, "access_denied" if error == "access_denied" else "oauth_error")
         return RedirectResponse(url=f"{ret}&youtube_error={parse.quote(error)}", status_code=302)
     if not code or not state:
+        _record_oauth_failure(db, state, "missing_params")
         return RedirectResponse(url=f"{ret}&youtube_error=missing_params", status_code=302)
 
     user_id = _decode_state(state)
@@ -149,10 +192,12 @@ def youtube_oauth_callback(
     try:
         token_data = _token_exchange(code, client_id, client_secret, redirect_uri)
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        _record_oauth_failure(db, state, "token_exchange_failed")
         return RedirectResponse(url=f"{ret}&youtube_error=token_exchange_failed", status_code=302)
 
     access = token_data.get("access_token")
     if not access:
+        _record_oauth_failure(db, state, "no_access_token")
         return RedirectResponse(url=f"{ret}&youtube_error=no_access_token", status_code=302)
 
     try:
@@ -165,10 +210,22 @@ def youtube_oauth_callback(
             db.add(row)
             db.commit()
     except ValueError as e:
+        _record_oauth_failure(db, state, "credential_rejected")
         return RedirectResponse(url=f"{ret}&youtube_error={parse.quote(str(e)[:200])}", status_code=302)
     except RuntimeError:
+        _record_oauth_failure(db, state, "encryption_not_configured")
         return RedirectResponse(url=f"{ret}&youtube_error=encryption_not_configured", status_code=302)
 
+    emit_after_commit(
+        "integration_connected",
+        user_id=user.id,
+        properties={"provider": "youtube", "feature_key": "youtube_publish", "result": "success"},
+    )
+    emit_after_commit(
+        "feature_completed",
+        user_id=user.id,
+        properties={"feature_key": "youtube_publish", "completion_type": "oauth_connected", "result": "success"},
+    )
     return RedirectResponse(url=f"{ret}&youtube_success=1", status_code=302)
 
 
@@ -189,5 +246,11 @@ def youtube_disconnect(db: Session = Depends(get_db), current_user: User = Depen
     row = db.query(UserYoutubeConnection).filter(UserYoutubeConnection.user_id == current_user.id).first()
     if row:
         db.delete(row)
+        emit(
+            db,
+            "integration_disconnected",
+            user=current_user,
+            properties={"provider": "youtube", "feature_key": "youtube_publish"},
+        )
         db.commit()
     return {"ok": True}

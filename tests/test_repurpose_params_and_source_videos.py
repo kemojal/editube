@@ -31,11 +31,13 @@ from sqlalchemy.orm import sessionmaker
 from app.db.database import Base
 from app.db.models import (
     AiResult,
+    AnalyticsOutbox,
     Annotation,
     Clip,
     ClipStyle,
     ClipTemplate,
     Comment,
+    DriveImport,
     Folder,
     Project,
     RepurposeJob,
@@ -71,6 +73,9 @@ class _SqliteDbTestCase(unittest.TestCase):
         ClipStyle.__table__,
         ClipTemplate.__table__,
         AiResult.__table__,
+        # Source-video creation writes analytics in the same transaction.
+        AnalyticsOutbox.__table__,
+        DriveImport.__table__,
     ]
 
     def setUp(self) -> None:
@@ -516,6 +521,59 @@ class RegisterUploadedVideoRouteTests(_SqliteDbTestCase):
                 )
 
         self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_completed_drive_import_is_verified_and_counted_as_result_use(self):
+        from app.api.routes import videos as videos_routes
+        from app.api.models.videos import VideoFromUploadCreate
+
+        imported = DriveImport(
+            user_id=self.user.id,
+            connection_id=1,
+            drive_file_id="drive-file-1",
+            status="completed",
+            file_path="https://cdn.test/from-drive.mp4",
+        )
+        self.db.add(imported)
+        self.db.commit()
+
+        with mock.patch.object(
+            videos_routes, "can_access_project", return_value=True
+        ), mock.patch.object(
+            videos_routes, "assert_write_project_content", return_value=None
+        ), mock.patch.object(
+            videos_routes, "assert_storage_upload_allowed", return_value=None
+        ), mock.patch.object(
+            videos_routes, "log_activity", return_value=None
+        ), mock.patch.object(
+            videos_routes, "_video_detail", return_value={"ok": True}
+        ), mock.patch(
+            "app.jobs.queue.enqueue_transcription_job", return_value=True
+        ), mock.patch(
+            "app.jobs.queue.enqueue_video_thumbnail_job", return_value=True
+        ), mock.patch(
+            "app.services.proxy_service.auto_proxy_on_upload", return_value=None
+        ):
+            videos_routes.register_uploaded_video(
+                project_id=self.project.id,
+                body=VideoFromUploadCreate(
+                    file_path=imported.file_path,
+                    name="Drive source",
+                    drive_import_id=imported.id,
+                ),
+                db=self.db,
+                current_user=self.user,
+            )
+
+        created = self.db.query(Video).filter(Video.name == "Drive source").one()
+        self.assertEqual(created.ingest_source, "google_drive")
+        event = (
+            self.db.query(AnalyticsOutbox)
+            .filter(AnalyticsOutbox.event_name == "feature_result_used")
+            .one()
+        )
+        self.assertEqual(event.properties["feature_key"], "google_drive")
+        self.assertEqual(event.properties["import_id"], imported.id)
+        self.assertNotIn("file_path", event.properties)
 
     def test_missing_size_bytes_defaults_quota_check_to_zero(self):
         from app.api.routes import videos as videos_routes

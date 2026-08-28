@@ -19,8 +19,7 @@ class NotificationInDBBase(NotificationBase):
     user_id: int
     created_at: str
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 class Notification(NotificationInDBBase):
     pass

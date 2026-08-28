@@ -24,8 +24,7 @@ class DeliveryPackageResponse(BaseModel):
     completed_at: Optional[datetime] = None
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class DeliveryAssetResponse(BaseModel):
@@ -39,8 +38,7 @@ class DeliveryAssetResponse(BaseModel):
     checksum_sha256: Optional[str] = None
     created_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class DeliveryPackageDetailResponse(DeliveryPackageResponse):
@@ -60,8 +58,7 @@ class DeliveryLinkResponse(BaseModel):
     is_revoked: bool
     created_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class DeliveryPublicInfo(BaseModel):

@@ -26,7 +26,7 @@ def watch_folder_sync_job(config_id: int) -> None:
         config = db.query(WatchFolderConfig).filter(WatchFolderConfig.id == config_id).first()
         if not config:
             logger.error("WatchFolderConfig %s not found", config_id)
-            return
+            raise RuntimeError(f"WatchFolderConfig {config_id} not found")
 
         config.last_sync_at = datetime.now(timezone.utc)
         db.commit()

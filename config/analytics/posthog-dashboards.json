@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "managed_tag": "editube-analytics-v1",
+  "dashboards": [
+    {
+      "key": "acquisition-content",
+      "name": "Editube — Acquisition & Content",
+      "owner": "growth-product",
+      "review_cadence": "weekly",
+      "definition": "Consented visitor discovery through successful account creation.",
+      "freshness": "Browser events near-real-time; authoritative API events within the 5-minute outbox SLO.",
+      "limitations": "Consent suppresses some anonymous traffic; CTA behavior is intent, while account_created is authoritative.",
+      "insights": [
+        {"key": "visitor-account-funnel", "name": "Visitor to account funnel", "kind": "funnel", "series": [{"event": "page_viewed"}, {"event": "landing_cta_clicked"}, {"event": "signup_viewed"}, {"event": "signup_submitted"}, {"event": "account_created"}], "date_from": "-30d", "window_days": 7, "denominator": "Consented distinct people with a marketing page_viewed event", "definition": "Ordered marketing visit, CTA intent, signup view/submission, and authoritative account creation.", "freshness": "5 minutes", "limitations": "Cross-device journeys and visitors who reject analytics cannot be joined; pricing_plan_selected is an alternate CTA branch."},
+        {"key": "landing-routes", "name": "Landing route traffic", "kind": "trend", "series": [{"event": "page_viewed"}], "breakdown": "route_template", "date_from": "-30d", "denominator": "Consented page_viewed events", "definition": "Page views by normalized route template.", "freshness": "near-real-time", "limitations": "Not a census of all visitors because capture is consent-dependent."},
+        {"key": "cta-interest", "name": "CTA interest by placement", "kind": "trend", "series": [{"event": "landing_cta_clicked"}, {"event": "pricing_plan_selected"}, {"event": "affiliate_cta_clicked"}, {"event": "contact_clicked"}], "breakdown": "location", "date_from": "-30d", "denominator": "Consented sessions where the named CTA was available", "definition": "Named marketing CTA clicks, segmented by stable placement.", "freshness": "near-real-time", "limitations": "This measures intent, not signup or paid conversion."}
+      ]
+    },
+    {
+      "key": "onboarding-checkout",
+      "name": "Editube — Onboarding & Checkout",
+      "owner": "growth-product-and-billing-engineering",
+      "review_cadence": "weekly-and-after-funnel-releases",
+      "definition": "Account onboarding and the authoritative paid-conversion path.",
+      "freshness": "Client steps near-real-time; checkout/subscription truth within the 5-minute outbox SLO.",
+      "limitations": "checkout_completed is authoritative only when sourced by API/Stripe; open conversion windows must not be labeled abandoned.",
+      "insights": [
+        {"key": "account-onboarding-funnel", "name": "Account to onboarding completion", "kind": "funnel", "series": [{"event": "account_created"}, {"event": "onboarding_started"}, {"event": "onboarding_step_completed", "filters": [{"key": "step_key", "value": "profile"}]}, {"event": "onboarding_step_completed", "filters": [{"key": "step_key", "value": "workflow"}]}, {"event": "onboarding_plan_selected"}, {"event": "onboarding_completed"}], "date_from": "-30d", "window_days": 7, "denominator": "New accounts old enough to complete the 7-day window", "definition": "Ordered account creation, onboarding entry, authoritative profile/workflow completion, plan intent, and completion.", "freshness": "5 minutes", "limitations": "The plan selection step is client intent; onboarding_completed is authoritative."},
+        {"key": "paid-conversion-funnel", "name": "Authoritative paid conversion", "kind": "funnel", "series": [{"event": "checkout_clicked"}, {"event": "checkout_session_created"}, {"event": "checkout_completed"}, {"event": "subscription_activated"}], "date_from": "-30d", "window_days": 2, "denominator": "Distinct people who intentionally started checkout and whose 48-hour window matured", "definition": "Client checkout intent through Stripe-backed entitlement.", "freshness": "5 minutes", "limitations": "Do not use the browser return page as proof of payment or entitlement."},
+        {"key": "checkout-failures", "name": "Checkout losses and failures", "kind": "trend", "series": [{"event": "checkout_abandoned"}, {"event": "checkout_failed"}, {"event": "checkout_session_failed"}, {"event": "checkout_canceled"}, {"event": "checkout_return_failed"}], "breakdown": "error_code", "date_from": "-30d", "denominator": "Checkout attempts", "definition": "Matured abandonment, observed checkout errors, and explicit cancellation outcomes.", "freshness": "5 minutes", "limitations": "checkout_abandoned is emitted only after the first-party 24-hour maturity window; client cancellation is an observed intent, not proof of non-conversion."}
+      ]
+    },
+    {
+      "key": "activation-time-to-value",
+      "name": "Editube — Activation & Time to Value",
+      "owner": "product",
+      "review_cadence": "weekly",
+      "definition": "New workspaces reaching their first durable value outcome.",
+      "freshness": "Authoritative server/worker events within the 5-minute outbox SLO.",
+      "limitations": "Targets require 2–4 complete baseline weeks; first value is once per workspace.",
+      "insights": [
+        {"key": "activation-funnel", "name": "Account to first value", "kind": "funnel", "series": [{"event": "account_created"}, {"event": "project_created"}, {"event": "project_setup_completed"}, {"event": "first_value_achieved"}], "date_from": "-30d", "window_days": 7, "denominator": "New eligible workspaces with a fully matured 7-day window", "definition": "Ordered setup path to the first authoritative durable result.", "freshness": "5 minutes", "limitations": "Account and workspace creation are not identical for invited members."},
+        {"key": "first-value-by-feature", "name": "First value by workflow feature", "kind": "trend", "series": [{"event": "first_value_achieved"}], "breakdown": "feature_key", "date_from": "-90d", "denominator": "Workspaces with first_value_achieved", "definition": "Distribution of the feature that produced first durable value.", "freshness": "5 minutes", "limitations": "Only the first qualifying outcome per workspace is counted."},
+        {"key": "setup-reliability", "name": "Project setup outcomes", "kind": "trend", "series": [{"event": "project_setup_completed"}, {"event": "project_setup_failed"}, {"event": "transcription_completed"}, {"event": "transcription_failed"}], "breakdown": "feature_key", "date_from": "-30d", "denominator": "Authoritative setup and transcription attempts", "definition": "Successful and failed setup outcomes.", "freshness": "5 minutes", "limitations": "Durations require event-level duration_ms coverage."}
+      ]
+    },
+    {
+      "key": "feature-adoption",
+      "name": "Editube — Feature Adoption",
+      "owner": "product-and-feature-owners",
+      "review_cadence": "biweekly",
+      "definition": "Comparable feature exposure, start, completion, and result-use lifecycles.",
+      "freshness": "Client exposure near-real-time; authoritative outcomes within 5 minutes.",
+      "limitations": "Exposure requires a visible annotated control; autocapture clicks are not treated as adoption.",
+      "insights": [
+        {"key": "feature-lifecycle-funnel", "name": "Feature lifecycle conversion", "kind": "funnel", "series": [{"event": "feature_exposed"}, {"event": "feature_opened"}, {"event": "feature_started"}, {"event": "feature_completed"}, {"event": "feature_result_used"}], "breakdown": "feature_key", "date_from": "-30d", "window_days": 7, "denominator": "Eligible users who actually saw an annotated feature control", "definition": "Ordered feature exposure, open, meaningful start, successful completion, and result use.", "freshness": "5 minutes", "limitations": "Compare one feature_key at a time; eligibility is defined in the checked-in feature registry."},
+        {"key": "feature-outcomes", "name": "Feature outcomes by feature", "kind": "trend", "series": [{"event": "feature_completed"}, {"event": "feature_failed"}, {"event": "feature_canceled"}, {"event": "feature_result_used"}], "breakdown": "feature_key", "date_from": "-30d", "denominator": "Authoritative feature starts where available", "definition": "Completion, failure, cancellation, and value-use volume by feature.", "freshness": "5 minutes", "limitations": "Raw volume is not an adoption rate until divided by an eligibility/exposure denominator."},
+        {"key": "feature-retention", "name": "Activated workspace value retention", "kind": "retention", "target_event": "first_value_achieved", "returning_event": "feature_result_used", "period": "Week", "intervals": 8, "date_from": "-90d", "denominator": "Workspaces entering through first_value_achieved", "definition": "Weekly return to a durable feature result after activation.", "freshness": "5 minutes", "limitations": "Recent cohorts are incomplete; workspace grouping must be enabled in PostHog."},
+        {"key": "editor-sessions", "name": "Editor session summaries", "kind": "trend", "series": [{"event": "editor_session_ended"}], "breakdown": "surface", "date_from": "-30d", "denominator": "Consented editor sessions that reached an editing workspace", "definition": "One bounded summary per editor session with active/play time, edit/undo counts, tools used, export intent, and autosave-failure count.", "freshness": "Near real-time on route leave", "limitations": "The event contains aggregates only; background time is excluded and abrupt browser termination can lose a page-leave summary."}
+      ]
+    },
+    {
+      "key": "retention-cohorts",
+      "name": "Editube — Retention & Cohorts",
+      "owner": "product-growth",
+      "review_cadence": "monthly",
+      "definition": "Value retention after activation, not login retention.",
+      "freshness": "5 minutes with incomplete recent periods excluded during review.",
+      "limitations": "W4/W8 decisions need mature cohorts and stable instrumentation.",
+      "insights": [
+        {"key": "value-retention", "name": "W1/W4/W8 value retention", "kind": "retention", "target_event": "first_value_achieved", "returning_event": "feature_result_used", "period": "Week", "intervals": 8, "date_from": "-180d", "denominator": "Activated workspaces whose relevant week has matured", "definition": "Workspace return to a durable result-use event after activation.", "freshness": "5 minutes", "limitations": "Do not compare incomplete weeks with mature cohorts."},
+        {"key": "paid-value-activity", "name": "Paid value-active workspaces", "kind": "trend", "series": [{"event": "feature_result_used"}, {"event": "delivery_downloaded"}, {"event": "publication_completed"}, {"event": "review_approved"}], "breakdown": "plan", "date_from": "-90d", "denominator": "Eligible paid workspaces", "definition": "Weekly durable value activity segmented by plan.", "freshness": "5 minutes", "limitations": "Requires complete plan and workspace grouping context on events."},
+        {"key": "activation-cohorts", "name": "Activation volume by plan", "kind": "trend", "series": [{"event": "first_value_achieved"}], "breakdown": "plan", "date_from": "-180d", "denominator": "New eligible workspaces", "definition": "First-value outcomes by plan cohort.", "freshness": "5 minutes", "limitations": "Counts are not rates without the eligible new-workspace denominator."}
+      ]
+    },
+    {
+      "key": "revenue-subscriptions",
+      "name": "Editube — Revenue & Subscriptions",
+      "owner": "finance-product",
+      "review_cadence": "weekly-and-monthly",
+      "definition": "Stripe-backed subscription, invoice, cancellation, and churn lifecycle.",
+      "freshness": "Webhook processing plus the 5-minute analytics outbox SLO.",
+      "limitations": "PostHog is a behavioral view; PostgreSQL/Stripe remain financial truth for booked revenue.",
+      "insights": [
+        {"key": "subscription-lifecycle", "name": "Subscription lifecycle", "kind": "trend", "series": [{"event": "subscription_activated"}, {"event": "subscription_plan_changed"}, {"event": "subscription_cancel_scheduled"}, {"event": "subscription_cancel_reversed"}, {"event": "subscription_churned"}, {"event": "subscription_resubscribed"}], "breakdown": "plan", "date_from": "-90d", "denominator": "Authoritative Stripe/local lifecycle facts", "definition": "Paid subscription state transitions by plan.", "freshness": "5 minutes", "limitations": "Scheduled cancellation is not effective churn."},
+        {"key": "trial-conversion", "name": "Matured trial conversion", "kind": "funnel", "series": [{"event": "trial_started"}, {"event": "trial_converted"}, {"event": "invoice_paid"}], "date_from": "-90d", "window_days": 30, "denominator": "Trials whose full conversion opportunity has matured", "definition": "Trial start through first paid invoice.", "freshness": "5 minutes", "limitations": "Exclude still-open trials from the denominator."},
+        {"key": "billing-risk", "name": "Payment and churn risk", "kind": "trend", "series": [{"event": "payment_failed"}, {"event": "subscription_past_due"}, {"event": "subscription_churned"}], "breakdown": "voluntary", "date_from": "-90d", "denominator": "Paid subscriptions at risk or churned", "definition": "Payment failures, past-due transitions, and effective churn.", "freshness": "5 minutes", "limitations": "Use amount_minor from the lifecycle table for audited revenue calculations."}
+      ]
+    },
+    {
+      "key": "reliability-user-impact",
+      "name": "Editube — Reliability & User Impact",
+      "owner": "engineering",
+      "review_cadence": "daily-and-after-releases",
+      "definition": "Normalized user-impact events paired with Sentry exception and trace detail.",
+      "freshness": "Sentry near-real-time; outbox events within 5 minutes.",
+      "limitations": "PostHog error events intentionally omit stacks and raw messages; investigate detail in Sentry.",
+      "insights": [
+        {"key": "job-outcomes", "name": "Background job outcomes", "kind": "trend", "series": [{"event": "job_completed"}, {"event": "job_failed"}, {"event": "job_retried"}], "breakdown": "job_type", "date_from": "-14d", "denominator": "Jobs that emitted job_started", "definition": "Completion, retry, and failure outcomes by stable job type.", "freshness": "5 minutes", "limitations": "Maintenance jobs are intentionally excluded from product job analytics."},
+        {"key": "user-facing-failures", "name": "User-facing runtime failures", "kind": "trend", "series": [{"event": "api_request_failed"}, {"event": "media_playback_failed"}, {"event": "websocket_disconnected"}, {"event": "client_error_observed"}], "breakdown": "error_code", "date_from": "-14d", "denominator": "Affected requests, media sessions, sockets, or rendered routes", "definition": "Privacy-safe failure facts that can be segmented by funnel context.", "freshness": "5 minutes", "limitations": "Counts are impact signals; Sentry owns issue fingerprints and stack traces."},
+        {"key": "feature-failures", "name": "Feature failures", "kind": "trend", "series": [{"event": "feature_failed"}], "breakdown": "feature_key", "date_from": "-14d", "denominator": "Authoritative feature starts", "definition": "Failed feature operations by feature key.", "freshness": "5 minutes", "limitations": "A rate requires the matching start denominator and consistent job mappings."}
+      ]
+    },
+    {
+      "key": "review-delivery",
+      "name": "Editube — Review & Delivery",
+      "owner": "review-collaboration-product",
+      "review_cadence": "biweekly",
+      "definition": "Workspace-level review engagement and conversion to approval/delivery.",
+      "freshness": "Review/API facts within the 5-minute outbox SLO; granular heatmaps remain first-party.",
+      "limitations": "PostHog receives milestones and summaries only, never granular progress or guest content.",
+      "insights": [
+        {"key": "review-cycle-funnel", "name": "Review cycle funnel", "kind": "funnel", "series": [{"event": "review_link_created"}, {"event": "review_link_opened"}, {"event": "review_playback_milestone_reached", "filters": [{"key": "milestone_percent", "value": 25}]}, {"event": "review_comment_created"}, {"event": "review_approved"}, {"event": "delivery_downloaded"}], "date_from": "-90d", "window_days": 30, "denominator": "Authoritative review links created", "definition": "Review link creation through engagement, decision, and delivery.", "freshness": "5 minutes", "limitations": "Comment and approval are alternative valid outcomes, so inspect branching paths as well as this ordered view."},
+        {"key": "playback-milestones", "name": "Review playback milestones", "kind": "trend", "series": [{"event": "review_playback_milestone_reached"}], "breakdown": "milestone_percent", "date_from": "-30d", "denominator": "Unique review sessions with playback progress", "definition": "Deduplicated 25/50/75/100 playback milestones.", "freshness": "5 minutes", "limitations": "Per-second unique viewers and rewatch hotspots remain in PostgreSQL review analytics."},
+        {"key": "review-outcomes", "name": "Review and delivery outcomes", "kind": "trend", "series": [{"event": "review_comment_created"}, {"event": "review_change_requested"}, {"event": "review_approved"}, {"event": "review_signoff_created"}, {"event": "review_download_completed"}, {"event": "delivery_downloaded"}], "date_from": "-90d", "denominator": "Review links opened", "definition": "Authoritative feedback, decision, signoff, and download outcomes.", "freshness": "5 minutes", "limitations": "Raw guest identity and comment content are intentionally excluded."}
+      ]
+    }
+  ]
+}

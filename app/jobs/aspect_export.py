@@ -48,12 +48,12 @@ def aspect_export_job(export_id: int) -> None:
         exp = db.query(VideoAspectExport).filter(VideoAspectExport.id == export_id).first()
         if not exp:
             logger.error("aspect_export_job: export %s not found", export_id)
-            return
+            raise RuntimeError(f"Aspect export {export_id} not found")
 
         video = db.query(Video).filter(Video.id == exp.video_id).first()
         if not video or not video.file_path:
             _fail(db, exp, "Video or file_path missing.")
-            return
+            raise RuntimeError("Video or file_path missing")
 
         exp.status = "processing"
         exp.error_message = None
@@ -103,7 +103,7 @@ def aspect_export_job(export_id: int) -> None:
             if proc.returncode != 0:
                 err = (proc.stderr or proc.stdout or "")[:4000]
                 _fail(db, exp, f"ffmpeg failed: {err}")
-                return
+                raise RuntimeError("Aspect export ffmpeg failed")
 
             from app.storage import build_key, get_storage, guess_content_type
 
@@ -116,7 +116,7 @@ def aspect_export_job(export_id: int) -> None:
             url = get_storage().upload_path(dst, key=_key, content_type=_ct).url
             if not url:
                 _fail(db, exp, "Storage returned no URL.")
-                return
+                raise RuntimeError("Aspect export storage returned no URL")
 
             exp.status = "completed"
             exp.output_path = url
@@ -134,6 +134,7 @@ def aspect_export_job(export_id: int) -> None:
                 _fail(db, exp, str(e)[:4000])
         except Exception:
             pass
+        raise
     finally:
         db.close()
 

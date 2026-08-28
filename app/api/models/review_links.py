@@ -79,8 +79,7 @@ class ReviewLinkResponse(BaseModel):
     total_comments: int = 0
     approvals: int = 0
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class ReviewSessionSummary(BaseModel):
@@ -98,8 +97,7 @@ class ReviewSessionSummary(BaseModel):
     last_viewed_at: datetime
     approved_at: Optional[datetime] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class ReviewHeatmapBucket(BaseModel):
@@ -240,7 +238,7 @@ class PublicReviewCommentResponse(BaseModel):
     replies: List["PublicReviewCommentResponse"] = []
 
 
-PublicReviewCommentResponse.update_forward_refs()
+PublicReviewCommentResponse.model_rebuild()
 
 
 class PublicReviewCommentDeltaItem(BaseModel):
@@ -375,4 +373,4 @@ class ReviewSceneGroup(BaseModel):
     end_timecode: int
 
 
-ReviewAnalyticsResponse.update_forward_refs()
+ReviewAnalyticsResponse.model_rebuild()

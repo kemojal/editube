@@ -31,6 +31,7 @@ from app.api.models.editor_integrations import (
     MarkerDiffResponse,
     MarkerItem,
 )
+from app.services.product_analytics import emit, emit_after_commit
 
 router = APIRouter(
     prefix="/integrations",
@@ -66,6 +67,34 @@ def create_nle_session(
         is_active=True,
     )
     db.add(session)
+    db.flush()
+    emit(
+        db,
+        "integration_connected",
+        user=current_user,
+        workspace_id=project.workspace_id,
+        properties={
+            "provider": "nle",
+            "nle_type": data.nle_type,
+            "nle_session_id": session.id,
+            "project_id": project.id,
+            "feature_key": "nle_sync",
+            "result": "success",
+        },
+    )
+    emit(
+        db,
+        "feature_started",
+        user=current_user,
+        workspace_id=project.workspace_id,
+        properties={
+            "feature_key": "nle_sync",
+            "nle_type": data.nle_type,
+            "nle_session_id": session.id,
+            "project_id": project.id,
+            "result": "success",
+        },
+    )
     db.commit()
     db.refresh(session)
     return session
@@ -102,6 +131,21 @@ def delete_nle_session(
         raise HTTPException(status_code=404, detail="Session not found")
 
     session.is_active = False
+    project = db.query(Project).filter(Project.id == session.project_id).first()
+    emit(
+        db,
+        "integration_disconnected",
+        user=current_user,
+        workspace_id=project.workspace_id if project else None,
+        properties={
+            "provider": "nle",
+            "nle_type": session.nle_type,
+            "nle_session_id": session.id,
+            "project_id": session.project_id,
+            "feature_key": "nle_sync",
+            "result": "success",
+        },
+    )
     db.commit()
     return {"detail": "Session deregistered"}
 
@@ -124,6 +168,21 @@ def get_markers(
         raise HTTPException(status_code=403, detail="Not authorized")
 
     markers = export_markers(db, video_id)
+    emit(
+        db,
+        "feature_result_used",
+        user=current_user,
+        workspace_id=project.workspace_id,
+        properties={
+            "feature_key": "nle_sync",
+            "project_id": project.id,
+            "video_id": video.id,
+            "sync_direction": "editube_to_nle",
+            "marker_count": len(markers),
+            "result": "success",
+        },
+    )
+    db.commit()
     return {
         "video_id": video_id,
         "marker_count": len(markers),
@@ -156,6 +215,21 @@ def push_markers(
         data.source_nle,
         replace_existing=data.replace_existing,
     )
+    emit_after_commit(
+        "feature_completed",
+        user_id=current_user.id,
+        workspace_id=project.workspace_id,
+        properties={
+            "feature_key": "nle_sync",
+            "project_id": project.id,
+            "video_id": video.id,
+            "sync_direction": "nle_to_editube",
+            "marker_count": result["total"],
+            "created_count": result["created"],
+            "updated_count": result["updated"],
+            "result": "success",
+        },
+    )
     return {"video_id": video_id, **result}
 
 
@@ -176,7 +250,7 @@ def sync_markers(
 
     # Import incoming
     marker_dicts = [m.model_dump() for m in data.markers]
-    import_markers(
+    import_result = import_markers(
         db,
         video_id,
         current_user.id,
@@ -187,6 +261,21 @@ def sync_markers(
 
     # Export current state
     markers = export_markers(db, video_id)
+    emit_after_commit(
+        "feature_completed",
+        user_id=current_user.id,
+        workspace_id=project.workspace_id,
+        properties={
+            "feature_key": "nle_sync",
+            "project_id": project.id,
+            "video_id": video.id,
+            "sync_direction": "bidirectional",
+            "marker_count": len(markers),
+            "created_count": import_result["created"],
+            "updated_count": import_result["updated"],
+            "result": "success",
+        },
+    )
     return {
         "video_id": video_id,
         "marker_count": len(markers),

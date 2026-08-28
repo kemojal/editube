@@ -11,6 +11,18 @@ from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.db.models import StripePrice, StripeWebhookEvent, Subscription, User, WorkspaceMember
+from app.services.product_analytics import emit, emit_after_commit
+from app.services.checkout_analytics import (
+    cancel_latest_checkout_attempt,
+    complete_checkout_attempt,
+    create_checkout_attempt,
+)
+from app.services.subscription_analytics import (
+    record_subscription_lifecycle,
+    record_subscription_transitions,
+    snapshot_subscription,
+    sync_subscription_analytics_fields,
+)
 from app.services.entitlements import (
     ENTITLED_STATUSES,
     FOREIGN,
@@ -37,10 +49,24 @@ from app.services.pricing import (
 )
 from app.services.marketing_offers import active_marketing_offer, resolve_checkout_offer
 from app.services.referrals import (
+    finalize_referral_reward_after_lost_dispute,
     mark_pass_redeemed,
+    reinstate_referral_reward_after_dispute,
+    reverse_referral_reward_for_dispute,
+    reverse_referral_reward_for_invoice,
+    reward_referral_from_paid_invoice,
     sync_referral_from_subscription,
     trial_days_for_user,
 )
+from app.services.affiliate_program import (
+    affiliate_invoice_decision_exists,
+    record_dispute_opened,
+    record_dispute_won,
+    record_paid_invoice,
+    record_refund,
+    user_has_active_affiliate_attribution,
+)
+from app.services.affiliate_stripe import invoice_with_complete_lines, user_for_invoice
 from app.services.storage_policy import workspace_usage_payload
 from app.services.workspace_bootstrap import ensure_personal_workspace
 from app.services.stripe_catalog_sync import (
@@ -260,16 +286,76 @@ def create_checkout_session(
     else:
         checkout_options["allow_promotion_codes"] = True
 
-    session = stripe.checkout.Session.create(**checkout_options)
+    try:
+        session = stripe.checkout.Session.create(**checkout_options)
+    except Exception:
+        emit_after_commit(
+            "checkout_session_failed",
+            user_id=current_user.id,
+            properties={
+                "plan": canonical_plan,
+                "recurring_interval": body.interval,
+                "trial_offered": trial_days > 0,
+                "offer_applied": bool(offer),
+                "failure_class": "provider",
+                "error_code": "stripe_checkout_create_failed",
+                "result": "failure",
+            },
+        )
+        raise
+
+    checkout_session_id = str(_stripe_field(session, "id") or "").strip()
+    if not checkout_session_id:
+        raise HTTPException(status_code=502, detail="Stripe checkout response was incomplete")
 
     # Burn the referral pass only once Stripe has actually issued the session.
     # Marking it beforehand meant a Stripe outage silently consumed a pass the
     # user never got to use.
     if redeeming_pass:
         mark_pass_redeemed(db, current_user.id)
-        db.commit()
+
+    attempt = create_checkout_attempt(
+        db,
+        user=current_user,
+        stripe_checkout_session_id=checkout_session_id,
+        plan=canonical_plan,
+        recurring_interval=body.interval,
+        trial_days=trial_days,
+        offer_applied=bool(offer),
+        campaign_id=offer.campaign_id if offer else None,
+    )
+    emit(
+        db,
+        "checkout_session_created",
+        user=current_user,
+        properties={
+            "plan": canonical_plan,
+            "recurring_interval": body.interval,
+            "trial_offered": trial_days > 0,
+            "trial_days": trial_days,
+            "offer_applied": bool(offer),
+            "entry_point": "billing_checkout",
+            "checkout_attempt_id": attempt.id,
+            "result": "success",
+        },
+    )
+    db.commit()
 
     return {"url": session.url}
+
+
+@router.post("/checkout-canceled")
+def record_checkout_canceled(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    attempt = cancel_latest_checkout_attempt(
+        db,
+        user_id=current_user.id,
+        canceled_at=datetime.utcnow(),
+    )
+    db.commit()
+    return {"recorded": attempt is not None}
 
 
 @router.get("/checkout-session-status")
@@ -311,9 +397,31 @@ def get_checkout_session_status(
     # prefers the price the subscription is actually on. Passing
     # `current_user.plan` as a fallback used to make an already-Pro user's own
     # tier win over whatever they had just bought.
-    _sync_user_from_subscription(
-        db, current_user, subscription, _stripe_field(metadata, "plan")
+    row = _sync_user_from_subscription(
+        db,
+        current_user,
+        subscription,
+        _stripe_field(metadata, "plan"),
+        source_event_id=f"checkout-status:{session_id}",
+        occurred_at=_stripe_field(session, "created"),
     )
+    if is_entitled(row.status):
+        complete_checkout_attempt(
+            db,
+            stripe_checkout_session_id=session_id,
+            completed_at=datetime.utcnow(),
+        )
+        record_subscription_lifecycle(
+            db,
+            event_type="checkout_completed",
+            user=current_user,
+            subscription=row,
+            source_event_id=f"checkout-session:{session_id}",
+            occurred_at=datetime.utcnow(),
+            meta_info={"checkout_status": _stripe_field(session, "status")},
+            event_source="api",
+        )
+        db.commit()
 
     return {
         "synced": bool(current_user.onboarding_completed),
@@ -471,6 +579,13 @@ def create_portal_session(
         customer=current_user.stripe_customer_id,
         return_url=f"{base}/dashboard?account=billing",
     )
+    emit(
+        db,
+        "billing_portal_opened",
+        user=current_user,
+        properties={"entry_point": "account_billing", "result": "success"},
+    )
+    db.commit()
     return {"url": session.url}
 
 
@@ -554,6 +669,7 @@ def _upsert_subscription_row(
     row.current_period_start = period_start
     row.current_period_end = period_end
     row.cancel_at_period_end = bool(_stripe_field(sub, "cancel_at_period_end"))
+    sync_subscription_analytics_fields(row, sub)
     if is_terminal(status):
         row.ended_at = row.ended_at or datetime.now(timezone.utc).replace(tzinfo=None)
     elif status in ("trialing", "active"):
@@ -566,7 +682,10 @@ def _sync_user_from_subscription(
     user: User,
     subscription: stripe.Subscription,
     plan_hint: str | None,
-) -> None:
+    *,
+    source_event_id: str | None = None,
+    occurred_at=None,
+) -> Subscription:
     sub_id = _stripe_field(subscription, "id")
     status = _stripe_field(subscription, "status")
     plan = resolve_subscription_plan(db, subscription, hint=plan_hint)
@@ -586,7 +705,13 @@ def _sync_user_from_subscription(
     # The row has to exist before the entitlement is computed — the fallback
     # for a cancellation is "whatever other subscription this user still has",
     # and that query reads these rows.
-    _upsert_subscription_row(db, user, subscription, plan_hint)
+    existing_row = (
+        db.query(Subscription)
+        .filter(Subscription.stripe_subscription_id == sub_id)
+        .first()
+    )
+    previous = snapshot_subscription(existing_row)
+    row = _upsert_subscription_row(db, user, subscription, plan_hint)
     db.flush()
 
     sync_user_entitlement(
@@ -599,13 +724,24 @@ def _sync_user_from_subscription(
     if is_entitled(status):
         user.onboarding_completed = True
 
+    record_subscription_transitions(
+        db,
+        user=user,
+        subscription=row,
+        previous=previous,
+        source_event_id=source_event_id,
+        occurred_at=occurred_at,
+    )
+
     db.commit()
     db.refresh(user)
+    db.refresh(row)
 
     # If this user arrived on someone's invite link, this is where that referral
     # advances and — once the subscription is paid-active — where the referrer
     # is credited. A no-op for anyone who was not referred, and it never raises.
     sync_referral_from_subscription(db, user, user.subscription_status, user.plan)
+    return row
 
 
 def _user_id_from(value) -> int | None:
@@ -691,6 +827,23 @@ def _claim_event(db: Session, event_id: str | None, event_type: str | None) -> b
     return True
 
 
+def _release_event_claim(db: Session, event_id: str | None) -> None:
+    """Allow Stripe to retry a financial event whose processing failed.
+
+    The legacy webhook claims an event before dispatch so email side effects are
+    deduplicated. Financial handlers are stricter: if Stripe retrieval or a
+    ledger write raises after that claim, keeping the marker would turn the
+    retry into a false success and permanently lose money.
+    """
+    if not event_id:
+        return
+    db.rollback()
+    db.query(StripeWebhookEvent).filter(
+        StripeWebhookEvent.stripe_event_id == event_id
+    ).delete(synchronize_session=False)
+    db.commit()
+
+
 @router.post("/webhook")
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     if not stripe.api_key:
@@ -723,6 +876,167 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     if not _claim_event(db, _stripe_field(event, "id"), etype):
         return {"received": True, "duplicate": True}
 
+    event_id = _stripe_field(event, "id")
+    event_created = _stripe_field(event, "created")
+
+    if etype in ("invoice.paid", "invoice.payment_succeeded"):
+        invoice = data
+        invoice_id = _stripe_field(invoice, "id")
+        user = user_for_invoice(db, invoice)
+        if not user:
+            logger.warning("Paid Stripe invoice %s has no matching user", invoice_id)
+            return {"received": True}
+        try:
+            # The cash affiliate ledger and product-credit referral program are
+            # separate. Both listen to the same proof of payment; neither uses
+            # subscription status as a proxy for money.
+            accounting_invoice = (
+                invoice_with_complete_lines(invoice, stripe)
+                if user_has_active_affiliate_attribution(db, user.id)
+                else invoice
+            )
+            record_paid_invoice(
+                db,
+                user=user,
+                invoice=accounting_invoice,
+                stripe_event_id=event_id,
+            )
+            reward_referral_from_paid_invoice(db, user, str(invoice_id))
+            sub_ref = _stripe_field(invoice, "subscription")
+            sub_id = sub_ref if isinstance(sub_ref, str) else _stripe_field(sub_ref, "id")
+            subscription_row = (
+                db.query(Subscription)
+                .filter(Subscription.stripe_subscription_id == str(sub_id))
+                .first()
+                if sub_id
+                else None
+            )
+            record_subscription_lifecycle(
+                db,
+                event_type="invoice_paid",
+                user=user,
+                subscription=subscription_row,
+                source_event_id=str(event_id) if event_id else None,
+                invoice_id=str(invoice_id) if invoice_id else None,
+                amount_minor=int(_stripe_field(invoice, "amount_paid") or 0),
+                currency=str(_stripe_field(invoice, "currency") or "").lower() or None,
+                occurred_at=event_created or _stripe_field(invoice, "created"),
+                meta_info={
+                    "billing_reason": _stripe_field(invoice, "billing_reason"),
+                },
+            )
+            db.commit()
+        except Exception:
+            _release_event_claim(db, event_id)
+            logger.exception("Paid-invoice accounting failed invoice=%s", invoice_id)
+            raise
+        return {"received": True}
+
+    if etype == "charge.refunded":
+        charge = data
+        charge_id = str(_stripe_field(charge, "id") or "")
+        invoice_ref = _stripe_field(charge, "invoice")
+        invoice_id = (
+            invoice_ref
+            if isinstance(invoice_ref, str)
+            else _stripe_field(invoice_ref, "id")
+        )
+        try:
+            if not invoice_id and charge_id:
+                charge = stripe.Charge.retrieve(charge_id)
+                invoice_ref = _stripe_field(charge, "invoice")
+                invoice_id = (
+                    invoice_ref
+                    if isinstance(invoice_ref, str)
+                    else _stripe_field(invoice_ref, "id")
+                )
+            if not invoice_id:
+                return {"received": True}
+            invoice = stripe.Invoice.retrieve(str(invoice_id))
+            affiliate_user = user_for_invoice(db, invoice)
+            if (
+                affiliate_user
+                and user_has_active_affiliate_attribution(db, affiliate_user.id)
+                and not affiliate_invoice_decision_exists(db, str(invoice_id))
+            ):
+                raise RuntimeError(
+                    "Affiliate paid-invoice accounting has not completed yet."
+                )
+            amount_paid = int(_stripe_field(invoice, "amount_paid") or 0)
+            amount_refunded = int(_stripe_field(charge, "amount_refunded") or 0)
+            record_refund(
+                db,
+                invoice_id=str(invoice_id),
+                charge_id=charge_id or None,
+                amount_refunded_minor=amount_refunded,
+                invoice_amount_paid_minor=amount_paid,
+                stripe_event_id=str(event_id),
+            )
+            if amount_paid > 0 and amount_refunded >= amount_paid:
+                reverse_referral_reward_for_invoice(db, str(invoice_id))
+        except Exception:
+            _release_event_claim(db, event_id)
+            logger.exception("Refund accounting failed charge=%s invoice=%s", charge_id, invoice_id)
+            raise
+        return {"received": True}
+
+    if etype in ("charge.dispute.created", "charge.dispute.closed"):
+        dispute = data
+        charge_ref = _stripe_field(dispute, "charge")
+        charge_id = charge_ref if isinstance(charge_ref, str) else _stripe_field(charge_ref, "id")
+        try:
+            if not charge_id:
+                return {"received": True}
+            charge = stripe.Charge.retrieve(str(charge_id))
+            invoice_ref = _stripe_field(charge, "invoice")
+            invoice_id = invoice_ref if isinstance(invoice_ref, str) else _stripe_field(invoice_ref, "id")
+            if not invoice_id:
+                return {"received": True}
+            invoice = stripe.Invoice.retrieve(str(invoice_id))
+            affiliate_user = user_for_invoice(db, invoice)
+            if (
+                affiliate_user
+                and user_has_active_affiliate_attribution(db, affiliate_user.id)
+                and not affiliate_invoice_decision_exists(db, str(invoice_id))
+            ):
+                raise RuntimeError(
+                    "Affiliate paid-invoice accounting has not completed yet."
+                )
+            if etype == "charge.dispute.created":
+                record_dispute_opened(
+                    db,
+                    invoice_id=str(invoice_id),
+                    charge_id=str(charge_id),
+                    stripe_event_id=str(event_id),
+                )
+                reverse_referral_reward_for_dispute(
+                    db,
+                    stripe_invoice_id=str(invoice_id),
+                    stripe_charge_id=str(charge_id),
+                )
+            elif str(_stripe_field(dispute, "status") or "").lower() == "won":
+                record_dispute_won(
+                    db,
+                    invoice_id=str(invoice_id),
+                    charge_id=str(charge_id),
+                    stripe_event_id=str(event_id),
+                )
+                reinstate_referral_reward_after_dispute(
+                    db,
+                    stripe_invoice_id=str(invoice_id),
+                    stripe_charge_id=str(charge_id),
+                )
+            elif str(_stripe_field(dispute, "status") or "").lower() == "lost":
+                finalize_referral_reward_after_lost_dispute(
+                    db,
+                    stripe_invoice_id=str(invoice_id),
+                )
+        except Exception:
+            _release_event_claim(db, event_id)
+            logger.exception("Dispute accounting failed charge=%s", charge_id)
+            raise
+        return {"received": True}
+
     if etype == "checkout.session.completed":
         session = data
         if _stripe_field(session, "mode") != "subscription":
@@ -748,7 +1062,35 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
             expand=["items.data.price"],
         )
         plan = _stripe_field(meta, "plan")
-        _sync_user_from_subscription(db, user, subscription, plan)
+        session_id = str(_stripe_field(session, "id") or "").strip() or None
+        row = _sync_user_from_subscription(
+            db,
+            user,
+            subscription,
+            plan,
+            source_event_id=str(event_id) if event_id else None,
+            occurred_at=event_created,
+        )
+        if is_entitled(row.status):
+            complete_checkout_attempt(
+                db,
+                stripe_checkout_session_id=session_id,
+                completed_at=stripe_datetime(event_created) or datetime.utcnow(),
+            )
+            record_subscription_lifecycle(
+                db,
+                event_type="checkout_completed",
+                user=user,
+                subscription=row,
+                source_event_id=(
+                    f"checkout-session:{session_id}"
+                    if session_id
+                    else f"{event_id}:checkout" if event_id else None
+                ),
+                occurred_at=event_created,
+                meta_info={"checkout_status": _stripe_field(session, "status")},
+            )
+        db.commit()
         # A session that completed without the subscription reaching a paying
         # status (card declined on the first invoice) is not a welcome.
         if is_entitled(_stripe_field(subscription, "status")):
@@ -789,7 +1131,12 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         # Scale's. `resolve_subscription_plan` reads the price first now, and
         # the hint is only consulted when the catalog has no row for it.
         _sync_user_from_subscription(
-            db, user, subscription, _stripe_field(_stripe_field(subscription, "metadata"), "plan")
+            db,
+            user,
+            subscription,
+            _stripe_field(_stripe_field(subscription, "metadata"), "plan"),
+            source_event_id=str(event_id) if event_id else None,
+            occurred_at=event_created,
         )
 
         after_row = (
@@ -824,12 +1171,15 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
             .filter(Subscription.stripe_subscription_id == sid)
             .first()
         )
+        previous = snapshot_subscription(row)
         access_until = row.current_period_end if row else None
         if access_until is None:
             access_until = subscription_period(sub)[1]
         if row:
             row.status = "canceled"
             row.ended_at = row.ended_at or datetime.now(timezone.utc).replace(tzinfo=None)
+            row.cancel_at_period_end = False
+            sync_subscription_analytics_fields(row, sub)
 
         user = _user_for_subscription(db, sub, sid)
         cancel_to: str | None = None
@@ -849,6 +1199,21 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
             sync_user_entitlement(
                 db, user, status="canceled", plan=cancel_plan, subscription_id=sid
             )
+            if row is None:
+                row = _upsert_subscription_row(db, user, sub, cancel_plan)
+                row.status = "canceled"
+                row.ended_at = row.ended_at or datetime.now(timezone.utc).replace(tzinfo=None)
+            record_subscription_lifecycle(
+                db,
+                event_type="subscription_churned",
+                user=user,
+                subscription=row,
+                previous=previous,
+                source_event_id=str(event_id) if event_id else None,
+                voluntary=row.voluntary_churn,
+                effective_at=row.ended_at,
+                occurred_at=event_created,
+            )
         db.commit()
         if cancel_to:
             try:
@@ -867,6 +1232,22 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         sub = data
         sid = _stripe_field(sub, "id")
         user = _user_for_subscription(db, sub, sid) if sid else None
+        if user:
+            row = (
+                db.query(Subscription)
+                .filter(Subscription.stripe_subscription_id == sid)
+                .first()
+            )
+            record_subscription_lifecycle(
+                db,
+                event_type="trial_ending",
+                user=user,
+                subscription=row,
+                source_event_id=str(event_id) if event_id else None,
+                effective_at=stripe_datetime(_stripe_field(sub, "trial_end")),
+                occurred_at=event_created,
+            )
+            db.commit()
         if user and user.email:
             try:
                 send_trial_ending_email(
@@ -908,6 +1289,27 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
                 )
             except Exception:
                 logger.exception("Payment-failed email failed for sub=%s", sub_id)
+        if user:
+            subscription_row = (
+                db.query(Subscription)
+                .filter(Subscription.stripe_subscription_id == str(sub_id))
+                .first()
+                if sub_id
+                else None
+            )
+            record_subscription_lifecycle(
+                db,
+                event_type="payment_failed",
+                user=user,
+                subscription=subscription_row,
+                source_event_id=str(event_id) if event_id else None,
+                invoice_id=str(_stripe_field(invoice, "id") or "") or None,
+                amount_minor=int(_stripe_field(invoice, "amount_due") or 0),
+                currency=str(_stripe_field(invoice, "currency") or "").lower() or None,
+                reason_code="payment_failed",
+                occurred_at=event_created or _stripe_field(invoice, "created"),
+            )
+            db.commit()
         return {"received": True}
 
     if etype in ("product.created", "product.updated"):

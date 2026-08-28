@@ -16,6 +16,7 @@ from app.db.database import get_db
 from app.db.models import Project, User, WatchFolderConfig
 from app.services.project_access import can_access_project
 from app.services.ingest_service import check_watch_folder_files, ingest_upload
+from app.services.product_analytics import emit_after_commit, emit_once
 from app.utils.security import get_current_user
 from app.api.models.editor_integrations import (
     WatchFolderCreate,
@@ -55,6 +56,30 @@ def create_watch_folder(
         file_pattern=data.file_pattern,
     )
     db.add(config)
+    db.flush()
+    common = {
+        "user": current_user,
+        "workspace_id": project.workspace_id,
+        "properties": {
+            "provider": "watch_folder",
+            "feature_key": "watch_folder",
+            "project_id": project.id,
+            "config_id": config.id,
+            "result": "success",
+        },
+    }
+    emit_once(
+        db,
+        "integration_connected",
+        event_id=f"watch-folder:{config.id}:connected",
+        **common,
+    )
+    emit_once(
+        db,
+        "feature_started",
+        event_id=f"feature:watch-folder:config:{config.id}:started",
+        **common,
+    )
     db.commit()
     db.refresh(config)
     return config
@@ -174,8 +199,34 @@ def upload_watch_folder_file(
         project_id=config.project_id,
         video_file=video_file,
         name=file_name,
-        description=f"Auto-uploaded from watch folder: {config.folder_path}",
+        # A local filesystem path can contain a real name or customer name. It
+        # is configuration, not media description, so never copy it to Video.
+        description="Auto-uploaded from watch folder",
         auto_proxy=config.auto_proxy,
+        ingest_source="watch_folder",
+    )
+
+    event_properties = {
+        "provider": "watch_folder",
+        "feature_key": "watch_folder",
+        "project_id": config.project_id,
+        "config_id": config.id,
+        "video_id": video.id,
+        "result": "success",
+    }
+    emit_after_commit(
+        "integration_import_completed",
+        user_id=current_user.id,
+        workspace_id=config.project.workspace_id if config.project else None,
+        properties=event_properties,
+        event_id=f"watch-folder:{config.id}:video:{video.id}:imported",
+    )
+    emit_after_commit(
+        "feature_completed",
+        user_id=current_user.id,
+        workspace_id=config.project.workspace_id if config.project else None,
+        properties={**event_properties, "completion_type": "watched_file_imported"},
+        event_id=f"feature:watch-folder:video:{video.id}:completed",
     )
 
     return {

@@ -21,18 +21,16 @@ def chapter_synthesis_job(video_id: int) -> None:
     try:
         video = db.query(Video).filter(Video.id == video_id).first()
         if not video:
-            logger.error("chapter_synthesis_job: video %s not found", video_id)
-            return
+            raise RuntimeError(f"Video {video_id} was removed before chapter synthesis started")
 
         tr = db.query(VideoTranscription).filter(VideoTranscription.video_id == video_id).first()
         segments = tr.segments if tr and tr.segments else []
         if not segments:
-            logger.warning("chapter_synthesis_job: no transcript for video %s", video_id)
-            return
+            raise RuntimeError(f"Video {video_id} has no transcript for chapter synthesis")
 
         transcript = " ".join(str(seg.get("text", "")).strip() for seg in segments if isinstance(seg, dict))
         if not transcript.strip():
-            return
+            raise RuntimeError(f"Video {video_id} has an empty transcript")
 
         fallback: dict[str, Any] = {"chapters": []}
         prompt = (
@@ -45,7 +43,7 @@ def chapter_synthesis_job(video_id: int) -> None:
         result = generate_json(prompt, fallback=fallback)
         raw_chapters = result.get("chapters") if isinstance(result, dict) else None
         if not isinstance(raw_chapters, list):
-            return
+            raise RuntimeError("Chapter synthesis returned an invalid response")
 
         db.query(VideoChapter).filter(
             VideoChapter.video_id == video_id,
@@ -90,5 +88,6 @@ def chapter_synthesis_job(video_id: int) -> None:
             db.rollback()
         except Exception:
             pass
+        raise
     finally:
         db.close()

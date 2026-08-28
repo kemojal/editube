@@ -33,8 +33,7 @@ class ProjectScopeResponse(BaseModel):
     client_email: Optional[str] = None
     rate_card_cents: Optional[Dict[str, int]] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 # --- Revisions ---
@@ -56,8 +55,7 @@ class RevisionResponse(BaseModel):
     billable: bool
     created_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 # --- Invoices ---
@@ -76,8 +74,7 @@ class InvoiceItemResponse(BaseModel):
     unit_price_cents: int
     total_cents: int
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class InvoiceCreate(BaseModel):
@@ -125,8 +122,7 @@ class InvoiceResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 # --- Milestones ---
@@ -165,8 +161,7 @@ class MilestoneResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 # --- Contracts ---
@@ -200,8 +195,7 @@ class ContractResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class ContractSendResponse(ContractResponse):
@@ -281,8 +275,7 @@ class TimeEntryResponse(BaseModel):
     hourly_rate_cents: Optional[int] = None
     created_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 # --- Estimates ---
@@ -311,8 +304,7 @@ class EstimateResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 # --- Portfolio (public) ---

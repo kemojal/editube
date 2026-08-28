@@ -41,8 +41,7 @@ def ai_review_job(video_id: int, options: dict[str, Any] | None = None) -> None:
     try:
         video = db.query(Video).filter(Video.id == video_id).first()
         if not video:
-            logger.warning("ai_review_job: video %s is gone", video_id)
-            return
+            raise RuntimeError(f"Video {video_id} was removed before AI review started")
 
         transcription = (
             db.query(VideoTranscription)
@@ -88,5 +87,6 @@ def ai_review_job(video_id: int, options: dict[str, Any] | None = None) -> None:
             )
         except Exception:
             logger.exception("ai_review_job could not record failure for video %s", video_id)
+        raise
     finally:
         db.close()

@@ -49,8 +49,7 @@ class PublicationResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 # --- Aspect exports ---
@@ -75,8 +74,7 @@ class AspectExportResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class DeliveryExportCreate(BaseModel):
@@ -97,8 +95,7 @@ class DeliveryExportResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 # --- Chapters ---
@@ -128,8 +125,7 @@ class ChapterResponse(BaseModel):
     order_index: int
     created_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class YoutubeChapterBlockResponse(BaseModel):
@@ -153,8 +149,7 @@ class EndScreenResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 # --- Brand deals ---
@@ -198,8 +193,7 @@ class BrandDealResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 # --- Thumbnails ---
@@ -226,5 +220,4 @@ class ThumbnailVariantResponse(BaseModel):
     clicks: int
     created_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}

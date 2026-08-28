@@ -12,6 +12,7 @@ import logging
 import os
 import tempfile
 import time
+from typing import NoReturn
 
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
@@ -22,6 +23,7 @@ from app.services.google_drive_credentials import DriveReauthRequired, refresh_c
 from app.services.google_drive_files import build_drive_service, fetch_file_metadata
 from app.storage import get_storage
 from app.storage.base import build_key, guess_content_type
+from app.services.product_analytics import emit
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +38,46 @@ def _video_folder() -> str:
     return os.getenv("STORAGE_VIDEO_FOLDER", "videos").strip()
 
 
-def _fail(db, row: DriveImport, code: str, message: str) -> None:
+class DriveImportJobError(RuntimeError):
+    """A user-visible import failure that was already persisted."""
+
+
+def _record_failure(db, row: DriveImport, code: str, message: str) -> None:
     row.status = "failed"
     row.error_code = code
     row.error_message = message[:2000]
     db.add(row)
+    emit(
+        db,
+        "integration_import_failed",
+        user_id=row.user_id,
+        properties={
+            "provider": "google_drive",
+            "feature_key": "google_drive",
+            "import_id": row.id,
+            "error_code": code,
+            "result": "failure",
+        },
+        source="worker",
+    )
+    emit(
+        db,
+        "feature_failed",
+        user_id=row.user_id,
+        properties={
+            "feature_key": "google_drive",
+            "error_code": code,
+            "failure_class": "processing",
+            "result": "failure",
+        },
+        source="worker",
+    )
     db.commit()
+
+
+def _fail(db, row: DriveImport, code: str, message: str) -> NoReturn:
+    _record_failure(db, row, code, message)
+    raise DriveImportJobError(message)
 
 
 def _is_canceled(db, import_id: int) -> bool:
@@ -64,8 +100,7 @@ def drive_import_job(import_id: int) -> None:
     try:
         row = db.query(DriveImport).filter(DriveImport.id == import_id).first()
         if not row:
-            logger.warning("drive_import_job: import %s not found", import_id)
-            return
+            raise RuntimeError(f"Drive import {import_id} was removed before processing started")
         if row.status in ("completed", "canceled"):
             logger.info("drive_import_job: import %s already %s", import_id, row.status)
             return
@@ -228,6 +263,29 @@ def drive_import_job(import_id: int) -> None:
         row.error_code = None
         row.error_message = None
         db.add(row)
+        emit(
+            db,
+            "integration_import_completed",
+            user_id=row.user_id,
+            properties={
+                "provider": "google_drive",
+                "feature_key": "google_drive",
+                "import_id": row.id,
+                "result": "success",
+            },
+            source="worker",
+        )
+        emit(
+            db,
+            "feature_completed",
+            user_id=row.user_id,
+            properties={
+                "feature_key": "google_drive",
+                "completion_type": "file_import",
+                "result": "success",
+            },
+            source="worker",
+        )
         db.commit()
         logger.info("drive_import_job: import %s completed -> %s", import_id, result.url)
 
@@ -235,10 +293,11 @@ def drive_import_job(import_id: int) -> None:
         logger.exception("drive_import_job crashed for import %s: %s", import_id, e)
         try:
             row = db.query(DriveImport).filter(DriveImport.id == import_id).first()
-            if row and row.status not in ("completed", "canceled"):
-                _fail(db, row, "unexpected_error", str(e))
+            if row and row.status not in ("completed", "canceled", "failed"):
+                _record_failure(db, row, "unexpected_error", str(e))
         except Exception:
-            pass
+            logger.exception("Could not persist Drive import %s failure", import_id)
+        raise
     finally:
         # A leaked multi-gigabyte temp file per import is not acceptable.
         if tmp_path:

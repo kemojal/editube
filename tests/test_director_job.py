@@ -130,12 +130,17 @@ class DirectorJobTests(unittest.TestCase):
         self.db.refresh(row)
         return row
 
-    def _run(self, row, side_effect=None):
+    def _run(self, row, side_effect=None, expected_error: str | None = None):
         with mock.patch.object(
             director_service, "generate_plan",
             side_effect=side_effect, return_value=None if side_effect else _Run(),
         ) as generate:
-            result = job.director_job(row.id)
+            if expected_error is None:
+                result = job.director_job(row.id)
+            else:
+                with self.assertRaisesRegex(RuntimeError, expected_error) as caught:
+                    job.director_job(row.id)
+                result = caught.exception
         self.db.expire_all()
         return result, generate
 
@@ -144,21 +149,20 @@ class DirectorJobTests(unittest.TestCase):
     def test_a_video_with_no_transcript_fails_with_a_reason(self) -> None:
         """"Failed" with no reason sends people to the logs."""
         row = self._plan_row()
-        result, generate = self._run(row)
-        self.assertEqual(result["status"], "failed")
+        _, generate = self._run(row, expected_error="no transcript")
         generate.assert_not_called()
         self.assertIn("no transcript", self.db.get(DirectorPlan, row.id).error_message)
 
     def test_a_transcript_with_no_speech_fails_before_calling_the_model(self) -> None:
         self._transcribe(segments=[{"start": 0.0, "end": 4.0, "text": "   "}])
         row = self._plan_row()
-        result, generate = self._run(row)
-        self.assertEqual(result["status"], "failed")
+        _, generate = self._run(row, expected_error="no usable speech")
         generate.assert_not_called()
 
-    def test_a_missing_plan_row_is_not_an_error(self) -> None:
-        """A deleted run should not raise inside a worker."""
-        self.assertEqual(job.director_job(999_999)["status"], "missing")
+    def test_a_missing_plan_row_fails_the_rq_job_truthfully(self) -> None:
+        """A vanished input is not a successful worker result."""
+        with self.assertRaisesRegex(RuntimeError, "removed before processing"):
+            job.director_job(999_999)
 
     # -- the happy path ------------------------------------------------------
 
@@ -248,27 +252,32 @@ class DirectorJobTests(unittest.TestCase):
     def test_an_unconfigured_deployment_says_so_on_the_row(self) -> None:
         self._transcribe()
         row = self._plan_row()
-        result, _ = self._run(
-            row, side_effect=director_service.DirectorUnavailable("ANTHROPIC_API_KEY is not set")
+        _, _ = self._run(
+            row,
+            side_effect=director_service.DirectorUnavailable("ANTHROPIC_API_KEY is not set"),
+            expected_error="ANTHROPIC_API_KEY",
         )
-        self.assertEqual(result["status"], "failed")
         self.assertIn("ANTHROPIC_API_KEY", self.db.get(DirectorPlan, row.id).error_message)
 
     def test_an_unusable_plan_is_reported_as_such(self) -> None:
         self._transcribe()
         row = self._plan_row()
-        result, _ = self._run(
-            row, side_effect=director_service.PlanRejected("Unsupported plan version 99")
+        _, _ = self._run(
+            row,
+            side_effect=director_service.PlanRejected("Unsupported plan version 99"),
+            expected_error="version 99",
         )
-        self.assertEqual(result["status"], "failed")
         self.assertIn("version 99", self.db.get(DirectorPlan, row.id).error_message)
 
     def test_an_unexpected_crash_still_reaches_the_row(self) -> None:
         """A run stuck at "planning" forever is worse than one marked failed."""
         self._transcribe()
         row = self._plan_row()
-        result, _ = self._run(row, side_effect=RuntimeError("connection reset"))
-        self.assertEqual(result["status"], "failed")
+        _, _ = self._run(
+            row,
+            side_effect=RuntimeError("connection reset"),
+            expected_error="connection reset",
+        )
         stored = self.db.get(DirectorPlan, row.id)
         self.assertEqual(stored.status, "failed")
         self.assertIn("connection reset", stored.error_message)

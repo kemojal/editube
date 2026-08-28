@@ -43,6 +43,8 @@ from app.services.google_drive_files import (
     fetch_file_metadata,
 )
 from app.services.storage_policy import assert_storage_upload_allowed
+from app.services.product_analytics import emit, emit_after_commit
+from app.services.job_analytics import record_job_canceled
 from app.services.workspace_bootstrap import ensure_personal_workspace
 from app.utils.security import ALGORITHM, SECRET_KEY, get_current_user
 
@@ -237,12 +239,45 @@ def _get_connection(db: Session, user_id: int, connection_id: int) -> UserGoogle
     return row
 
 
+def _record_oauth_failure(db: Session, state: str | None, error_code: str) -> None:
+    if not state:
+        return
+    try:
+        user_id = _decode_state(state)
+    except HTTPException:
+        return
+    emit(
+        db,
+        "integration_connect_failed",
+        user_id=user_id,
+        properties={
+            "provider": "google_drive",
+            "feature_key": "google_drive",
+            "error_code": error_code,
+            "result": "failure",
+        },
+    )
+    emit(
+        db,
+        "feature_failed",
+        user_id=user_id,
+        properties={
+            "feature_key": "google_drive",
+            "error_code": error_code,
+            "failure_class": "oauth",
+            "result": "failure",
+        },
+    )
+    db.commit()
+
+
 # --- OAuth ----------------------------------------------------------------
 
 
 @router.post("/authorize-url")
 def drive_authorize_url(
     req: Request,
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     client_id, _ = _require_google_client()
@@ -260,6 +295,16 @@ def drive_authorize_url(
             "state": _encode_state(current_user.id),
         }
     )
+    # FastAPI always injects a Session. The guard preserves the route helper's
+    # long-standing direct-call use in OAuth URL unit tests.
+    if isinstance(db, Session):
+        emit(
+            db,
+            "integration_connect_started",
+            user=current_user,
+            properties={"provider": "google_drive", "feature_key": "google_drive"},
+        )
+        db.commit()
     return {"authorization_url": f"https://accounts.google.com/o/oauth2/v2/auth?{params}"}
 
 
@@ -272,9 +317,11 @@ def google_drive_oauth_callback(
     db: Session = Depends(get_db),
 ):
     if error:
+        _record_oauth_failure(db, state, "access_denied" if error == "access_denied" else "oauth_error")
         # access_denied is the user clicking "Cancel" — not an error worth shouting about.
         return _popup_response({"ok": False, "error": error})
     if not code or not state:
+        _record_oauth_failure(db, state, "missing_params")
         return _popup_response({"ok": False, "error": "missing_params"})
 
     try:
@@ -290,15 +337,18 @@ def google_drive_oauth_callback(
     try:
         token_data = _token_exchange(code, client_id, client_secret, _drive_callback_url(req))
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        _record_oauth_failure(db, state, "token_exchange_failed")
         return _popup_response({"ok": False, "error": "token_exchange_failed"})
 
     access = token_data.get("access_token")
     if not access:
+        _record_oauth_failure(db, state, "no_access_token")
         return _popup_response({"ok": False, "error": "no_access_token"})
 
     info = _fetch_userinfo(access)
     google_sub = info.get("sub")
     if not google_sub:
+        _record_oauth_failure(db, state, "no_account_identity")
         return _popup_response({"ok": False, "error": "no_account_identity"})
 
     try:
@@ -311,10 +361,22 @@ def google_drive_oauth_callback(
             picture_url=info.get("picture"),
         )
     except ValueError as e:
+        _record_oauth_failure(db, state, "credential_rejected")
         return _popup_response({"ok": False, "error": str(e)[:200]})
     except RuntimeError:
+        _record_oauth_failure(db, state, "encryption_not_configured")
         return _popup_response({"ok": False, "error": "encryption_not_configured"})
 
+    emit_after_commit(
+        "integration_connected",
+        user_id=user.id,
+        properties={"provider": "google_drive", "feature_key": "google_drive", "result": "success"},
+    )
+    emit_after_commit(
+        "feature_completed",
+        user_id=user.id,
+        properties={"feature_key": "google_drive", "completion_type": "oauth_connected", "result": "success"},
+    )
     return _popup_response({"ok": True, "connection": _connection_payload(row)})
 
 
@@ -355,6 +417,12 @@ def drive_disconnect(
         logger.info("Google token revoke skipped for connection %s: %s", connection_id, e)
 
     db.delete(row)
+    emit(
+        db,
+        "integration_disconnected",
+        user=current_user,
+        properties={"provider": "google_drive", "feature_key": "google_drive"},
+    )
     db.commit()
 
     if was_default:
@@ -534,6 +602,26 @@ def create_drive_import(
         status="queued",
     )
     db.add(record)
+    db.flush()
+    emit(
+        db,
+        "integration_import_started",
+        user=current_user,
+        workspace_id=workspace.id,
+        properties={
+            "provider": "google_drive",
+            "feature_key": "google_drive",
+            "import_id": record.id,
+            "file_count": 1,
+        },
+    )
+    emit(
+        db,
+        "feature_started",
+        user=current_user,
+        workspace_id=workspace.id,
+        properties={"feature_key": "google_drive", "entry_point": "file_import"},
+    )
     db.commit()
     db.refresh(record)
 
@@ -545,6 +633,31 @@ def create_drive_import(
             "Import could not be queued. Check REDIS_URL and that an RQ worker is running."
         )
         db.add(record)
+        emit(
+            db,
+            "integration_import_failed",
+            user=current_user,
+            workspace_id=workspace.id,
+            properties={
+                "provider": "google_drive",
+                "feature_key": "google_drive",
+                "import_id": record.id,
+                "error_code": "queue_unavailable",
+                "result": "failure",
+            },
+        )
+        emit(
+            db,
+            "feature_failed",
+            user=current_user,
+            workspace_id=workspace.id,
+            properties={
+                "feature_key": "google_drive",
+                "error_code": "queue_unavailable",
+                "failure_class": "queue",
+                "result": "failure",
+            },
+        )
         db.commit()
         db.refresh(record)
 
@@ -588,6 +701,23 @@ def cancel_drive_import(
     if row.status not in _TERMINAL_STATUSES:
         row.status = "canceled"
         db.add(row)
+        emit(
+            db,
+            "integration_import_canceled",
+            user=current_user,
+            properties={
+                "provider": "google_drive",
+                "feature_key": "google_drive",
+                "import_id": row.id,
+            },
+        )
+        record_job_canceled(
+            db,
+            job_kind="google_drive_import",
+            job_id=row.id,
+            feature_key="google_drive",
+            user=current_user,
+        )
         db.commit()
         db.refresh(row)
     return _import_payload(row)

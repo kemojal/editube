@@ -19,7 +19,17 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import ActivityFeed, AiResult, Project, User, Video, VideoTranscription
+from app.db.models import (
+    ActivityFeed,
+    AiResult,
+    AnalyticsOutbox,
+    Project,
+    User,
+    Video,
+    VideoTranscription,
+    Workspace,
+    WorkspaceMember,
+)
 from app.jobs import rough_cut_export as rce
 
 
@@ -37,11 +47,14 @@ class RoughCutExportTailTests(unittest.TestCase):
             engine,
             tables=[
                 User.__table__,
+                Workspace.__table__,
+                WorkspaceMember.__table__,
                 Project.__table__,
                 Video.__table__,
                 VideoTranscription.__table__,
                 AiResult.__table__,
                 ActivityFeed.__table__,
+                AnalyticsOutbox.__table__,
             ],
         )
         self.db = sessionmaker(bind=engine)()

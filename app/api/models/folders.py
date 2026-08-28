@@ -8,8 +8,7 @@ class ContributorInfo(BaseModel):
     name: str
     avatar_url: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class FolderCreate(BaseModel):
@@ -31,8 +30,7 @@ class FolderResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class VideoResponse(BaseModel):
@@ -54,8 +52,7 @@ class VideoResponse(BaseModel):
     task_count: int = 0
     contributors: List[ContributorInfo] = []
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class ProjectContentsResponse(BaseModel):

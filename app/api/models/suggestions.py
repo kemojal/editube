@@ -10,8 +10,7 @@ class SuggestionUserResponse(BaseModel):
     email: str
     avatar_url: str | None = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class SuggestionCreate(BaseModel):
@@ -32,8 +31,7 @@ class SuggestionCommentResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class SuggestionResponse(BaseModel):
@@ -49,5 +47,4 @@ class SuggestionResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}

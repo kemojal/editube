@@ -15,6 +15,7 @@ from app.db.database import get_db
 from app.db.models import GeneratedMedia, Project, User, Video
 from app.services.project_access import get_project_for_user
 from app.utils.security import get_current_user
+from app.services.job_analytics import record_job_canceled
 
 router = APIRouter(prefix="/projects", tags=["ai-media"])
 
@@ -304,6 +305,15 @@ def cancel_generated_media(
         return _serialize(row)
     # The worker checks this between polls; it cannot be interrupted mid-request.
     row.cancel_requested = True
+    project = db.query(Project).filter(Project.id == project_id).first()
+    record_job_canceled(
+        db,
+        job_kind=f"generated_{row.kind}",
+        job_id=row.id,
+        feature_key="broll_generation",
+        user=current_user,
+        project=project,
+    )
     db.commit()
     db.refresh(row)
     return _serialize(row)

@@ -86,6 +86,7 @@ from app.services.workspace_library import (
     asset_payload,
     category_for_mime,
     is_remote,
+    kind_for,
     library_feed,
     store_asset_file,
 )
@@ -95,6 +96,7 @@ from app.services.oidc_sso import discover_oidc_metadata
 from app.services.security_audit import log_security_audit_event
 from app.jobs.queue import enqueue_push_notification_job
 from app.websocket_manager import notifications_ws_manager
+from app.services.product_analytics import emit, emit_once
 
 router = APIRouter(prefix="/workspaces", tags=["Workspaces"])
 
@@ -496,6 +498,18 @@ async def create_invite(
         workspace_id=workspace_id,
         metadata={"role": invite_role},
     )
+    emit(
+        db,
+        "workspace_invite_sent",
+        user=current_user,
+        workspace_id=workspace_id,
+        properties={
+            "invite_role": invite_role,
+            "invitee_has_account": existing_user is not None,
+            "delivery_method": "email_and_in_app" if existing_user else "email",
+            "result": "success",
+        },
+    )
     db.commit()
     db.refresh(inv)
 
@@ -644,6 +658,17 @@ def accept_invite(
     if exists:
         inv.accepted_at = _utcnow()
         _mark_workspace_invite_notifications_read(db, current_user.id, inv)
+        emit(
+            db,
+            "workspace_invite_accepted",
+            user=current_user,
+            workspace_id=inv.workspace_id,
+            properties={
+                "invite_role": normalize_invite_role(inv.role),
+                "membership_already_existed": True,
+                "result": "success",
+            },
+        )
         db.commit()
         return {"ok": True, "workspace_id": inv.workspace_id}
     member_role = normalize_invite_role(inv.role)
@@ -667,6 +692,17 @@ def accept_invite(
     )
     inv.accepted_at = _utcnow()
     _mark_workspace_invite_notifications_read(db, current_user.id, inv)
+    emit(
+        db,
+        "workspace_invite_accepted",
+        user=current_user,
+        workspace_id=inv.workspace_id,
+        properties={
+            "invite_role": member_role,
+            "membership_already_existed": False,
+            "result": "success",
+        },
+    )
     db.commit()
     return {"ok": True, "workspace_id": inv.workspace_id}
 
@@ -953,6 +989,22 @@ async def upload_asset(
         created_by_user_id=current_user.id,
     )
     db.add(a)
+    db.flush()
+    emit_once(
+        db,
+        "feature_completed",
+        event_id=f"feature:workspace-assets:asset:{a.id}:uploaded",
+        user=current_user,
+        workspace_id=workspace_id,
+        properties={
+            "feature_key": "workspace_assets",
+            "workspace_asset_id": a.id,
+            "asset_category": a.category,
+            "media_kind": kind_for(a.mime_type, a.category, a.file_url),
+            "completion_type": "workspace_asset_stored",
+            "result": "success",
+        },
+    )
     db.commit()
     db.refresh(a)
     return asset_payload(a, workspace_id=workspace_id)

@@ -70,6 +70,7 @@ from app.services.comment_workflow import (
 from app.utils.security import get_current_user
 from app.services.activity import log_activity
 from app.utils.cloudinary import upload_file_to_cloudinary_with_meta
+from app.services.product_analytics import emit_once
 
 router = APIRouter(
     prefix="/projects/{project_id}/videos/{video_id}/comments",
@@ -366,6 +367,63 @@ async def add_comment(
     )
     sync_is_resolved_from_status(db_comment)
     db.add(db_comment)
+    db.flush()
+    comment_properties = {
+        "project_id": db_project.id,
+        "video_id": db_video.id,
+        "comment_id": db_comment.id,
+        "feature_key": "comments",
+        "comment_kind": db_comment.kind,
+        "is_reply": db_comment.parent_id is not None,
+        "has_drawing": bool(db_comment.drawing_data),
+        "has_range": db_comment.end_timecode is not None,
+        "result": "success",
+    }
+    emit_once(
+        db,
+        "review_comment_created",
+        event_id=f"review-comment:{db_comment.id}:created",
+        user=current_user,
+        workspace_id=db_project.workspace_id,
+        properties=comment_properties,
+    )
+    emit_once(
+        db,
+        "feature_completed",
+        event_id=f"feature:comments:comment:{db_comment.id}:created",
+        user=current_user,
+        workspace_id=db_project.workspace_id,
+        properties={**comment_properties, "completion_type": "comment_persisted"},
+    )
+    if db_comment.parent_id is None and db_comment.kind == COMMENT_KIND_CHANGE_REQUEST:
+        emit_once(
+            db,
+            "project_task_created",
+            event_id=f"project-task:comment:{db_comment.id}:created",
+            user=current_user,
+            workspace_id=db_project.workspace_id,
+            properties={
+                "project_id": db_project.id,
+                "video_id": db_video.id,
+                "comment_id": db_comment.id,
+                "feature_key": "tasks",
+                "result": "success",
+            },
+        )
+        emit_once(
+            db,
+            "feature_completed",
+            event_id=f"feature:tasks:comment:{db_comment.id}:created",
+            user=current_user,
+            workspace_id=db_project.workspace_id,
+            properties={
+                "project_id": db_project.id,
+                "video_id": db_video.id,
+                "comment_id": db_comment.id,
+                "feature_key": "tasks",
+                "result": "success",
+            },
+        )
     log_activity(
         db,
         user_id=current_user.id,
@@ -581,6 +639,7 @@ def update_comment(
         raise HTTPException(status_code=403, detail="Not authorized to edit this comment")
 
     update_data = comment.dict(exclude_unset=True)
+    previous_status = db_comment.status
     if "revision" in update_data and update_data["revision"] is not None:
         current_revision = int(getattr(db_comment, "revision", 1) or 1)
         if int(update_data["revision"]) != current_revision:
@@ -618,6 +677,62 @@ def update_comment(
         db_comment.is_private = nv != COMMENT_VISIBILITY_PUBLIC
 
     db_comment.revision = int(getattr(db_comment, "revision", 1) or 1) + 1
+
+    if (
+        db_comment.parent_id is None
+        and db_comment.kind == COMMENT_KIND_CHANGE_REQUEST
+        and previous_status != COMMENT_STATUS_RESOLVED
+        and db_comment.status == COMMENT_STATUS_RESOLVED
+    ):
+        emit_once(
+            db,
+            "project_task_completed",
+            event_id=f"project-task:comment:{db_comment.id}:completed",
+            user=current_user,
+            workspace_id=db_project.workspace_id,
+            properties={
+                "project_id": db_project.id,
+                "video_id": video_id,
+                "comment_id": db_comment.id,
+                "feature_key": "tasks",
+                "result": "success",
+            },
+        )
+        emit_once(
+            db,
+            "feature_result_used",
+            event_id=f"feature:tasks:comment:{db_comment.id}:completed",
+            user=current_user,
+            workspace_id=db_project.workspace_id,
+            properties={
+                "project_id": db_project.id,
+                "video_id": video_id,
+                "comment_id": db_comment.id,
+                "feature_key": "tasks",
+                "result": "success",
+                "result_type": "resolved",
+            },
+        )
+
+    if (
+        previous_status != COMMENT_STATUS_RESOLVED
+        and db_comment.status == COMMENT_STATUS_RESOLVED
+    ):
+        emit_once(
+            db,
+            "feature_result_used",
+            event_id=f"feature:comments:comment:{db_comment.id}:resolved",
+            user=current_user,
+            workspace_id=db_project.workspace_id,
+            properties={
+                "project_id": db_project.id,
+                "video_id": video_id,
+                "comment_id": db_comment.id,
+                "feature_key": "comments",
+                "result_action": "comment_resolved",
+                "result": "success",
+            },
+        )
 
     db.commit()
     db.refresh(db_comment)
@@ -764,8 +879,7 @@ def add_comment_attachment(
     if db_comment.user_id != current_user.id and not _is_team_member(db, db_project, current_user.id):
         raise HTTPException(status_code=403, detail="Not authorized to attach files to this comment")
 
-    db.add(
-        CommentAttachment(
+    attachment = CommentAttachment(
             comment_id=db_comment.id,
             attachment_type=body.attachment_type,
             file_url=body.file_url,
@@ -775,7 +889,25 @@ def add_comment_attachment(
             waveform=body.waveform,
             transcript=body.transcript,
         )
-    )
+    db.add(attachment)
+    db.flush()
+    if body.attachment_type == "voice_note":
+        emit_once(
+            db,
+            "feature_completed",
+            event_id=f"feature:voice-notes:attachment:{attachment.id}:created",
+            user=current_user,
+            workspace_id=db_project.workspace_id,
+            properties={
+                "project_id": db_project.id,
+                "video_id": video_id,
+                "comment_id": db_comment.id,
+                "attachment_id": attachment.id,
+                "feature_key": "voice_notes",
+                "duration_ms": body.duration_ms,
+                "result": "success",
+            },
+        )
     db_comment.revision = int(getattr(db_comment, "revision", 1) or 1) + 1
     db.commit()
     db.refresh(db_comment)

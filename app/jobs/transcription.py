@@ -17,7 +17,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
 from app.db.database import SessionLocal
-from app.db.models import RepurposeJob, UserSettings, Video, VideoTranscription
+from app.db.models import Project, RepurposeJob, UserSettings, Video, VideoTranscription
+from app.services.activation_analytics import record_first_value
+from app.services.product_analytics import emit
 from app.services.transcription_models import resolve_runtime
 from app.utils.language import normalize_language
 
@@ -38,6 +40,10 @@ def _ensure_worker_logging() -> None:
 
 # PCM16 mono 16kHz: below ~1s of silence is still > ~32kB; tiny files imply no usable audio.
 _MIN_WAV_BYTES_FOR_WHISPER = 8000
+
+
+class TranscriptionTerminalFailure(RuntimeError):
+    """Failure already recorded on the transcription row."""
 
 
 def _touch_transcription_timestamp(db: Session, video_id: int) -> None:
@@ -173,6 +179,49 @@ def _preferred_transcription_model_id(db: Session, video_id: int) -> str:
     return model.id
 
 
+def _transcription_analytics_context(db: Session, video_id: int):
+    video = db.query(Video).filter(Video.id == video_id).first()
+    project_id = getattr(video, "project_id", None)
+    project = (
+        db.query(Project).filter(Project.id == project_id).first()
+        if project_id is not None
+        else None
+    )
+    return video, project
+
+
+def _emit_transcription_failure(db: Session, video_id: int, error_code: str) -> None:
+    video, project = _transcription_analytics_context(db, video_id)
+    if not video:
+        return
+    project_id = getattr(video, "project_id", None)
+    uploader_id = getattr(video, "uploader_id", None)
+    properties = {
+        "feature_key": "transcript_edit",
+        "project_id": project_id,
+        "video_id": video_id,
+        "failure_class": "processing",
+        "error_code": error_code,
+        "result": "failure",
+    }
+    emit(
+        db,
+        "transcription_failed",
+        user_id=uploader_id,
+        workspace_id=project.workspace_id if project else None,
+        properties=properties,
+        source="worker",
+    )
+    emit(
+        db,
+        "feature_failed",
+        user_id=uploader_id,
+        workspace_id=project.workspace_id if project else None,
+        properties=properties,
+        source="worker",
+    )
+
+
 def transcribe_video(video_id: int, language: str | None = None) -> None:
     _ensure_worker_logging()
     logger.info("transcribe_video: starting job for video_id=%s", video_id)
@@ -181,14 +230,45 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
         vt = db.query(VideoTranscription).filter(VideoTranscription.video_id == video_id).first()
         video = db.query(Video).filter(Video.id == video_id).first()
         if not video or not vt:
-            logger.error("transcribe_video: missing video or transcription row for id %s", video_id)
-            return
+            raise RuntimeError(
+                f"Video or transcription row {video_id} was removed before processing"
+            )
 
         # Prefer the explicit job arg, fall back to whatever was persisted on the row.
         requested_language = normalize_language(language) or normalize_language(vt.language)
 
         vt.status = "processing"
         vt.error_message = None
+        project_id = getattr(video, "project_id", None)
+        uploader_id = getattr(video, "uploader_id", None)
+        project = (
+            db.query(Project).filter(Project.id == project_id).first()
+            if project_id is not None
+            else None
+        )
+        start_properties = {
+            "feature_key": "transcript_edit",
+            "project_id": project_id,
+            "video_id": video_id,
+            "requested_language": requested_language or "auto",
+            "result": "started",
+        }
+        emit(
+            db,
+            "transcription_started",
+            user_id=uploader_id,
+            workspace_id=project.workspace_id if project else None,
+            properties=start_properties,
+            source="worker",
+        )
+        emit(
+            db,
+            "feature_started",
+            user_id=uploader_id,
+            workspace_id=project.workspace_id if project else None,
+            properties=start_properties,
+            source="worker",
+        )
         db.commit()
 
         # Honour the user's Settings → AI models choice. Previously this read
@@ -294,11 +374,12 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
                     "No usable audio extracted (file may be video-only). For YouTube imports, "
                     "re-run transcription with an updated worker that uses a dedicated audio stream."
                 )
+                _emit_transcription_failure(db, video_id, "no_usable_audio")
                 db.commit()
                 from app.services.repurpose_pipeline import mark_repurpose_jobs_failed
 
                 mark_repurpose_jobs_failed(db, video_id, vt.error_message or "No usable audio extracted")
-                return
+                raise TranscriptionTerminalFailure(vt.error_message)
 
             from faster_whisper import WhisperModel
 
@@ -431,12 +512,13 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
                     "Whisper produced no speech. Common cause: video-only stream with no audio track. "
                     "Use Force new job after updating the worker, or re-import from YouTube."
                 )
+                _emit_transcription_failure(db, video_id, "no_speech_detected")
                 db.commit()
                 logger.warning("Transcription produced zero segments for video %s", video_id)
                 from app.services.repurpose_pipeline import mark_repurpose_jobs_failed
 
                 mark_repurpose_jobs_failed(db, video_id, vt.error_message or "Whisper produced no speech")
-                return
+                raise TranscriptionTerminalFailure(vt.error_message)
 
             vt.segments = nonempty
             vt.speakers = sorted(speaker_labels)
@@ -445,6 +527,54 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
             vt.status = "completed"
             vt.model_name = selected_model.id
             vt.error_message = None
+            completed_properties = {
+                "feature_key": "transcript_edit",
+                "project_id": project_id,
+                "video_id": video_id,
+                "model_id": selected_model.id,
+                "detected_language": vt.detected_language or requested_language or "unknown",
+                "segment_count": len(nonempty),
+                "duration_seconds": round(float(video_duration or 0), 2),
+                "result": "success",
+            }
+            emit(
+                db,
+                "transcription_completed",
+                user_id=uploader_id,
+                workspace_id=project.workspace_id if project else None,
+                properties=completed_properties,
+                source="worker",
+            )
+            emit(
+                db,
+                "feature_completed",
+                user_id=uploader_id,
+                workspace_id=project.workspace_id if project else None,
+                properties={**completed_properties, "completion_type": "transcript_ready"},
+                source="worker",
+            )
+            if project and project.workspace_id is not None:
+                emit(
+                    db,
+                    "project_setup_completed",
+                    user_id=uploader_id,
+                    workspace_id=project.workspace_id,
+                    properties={
+                        "project_id": project_id,
+                        "video_id": video_id,
+                        "completion_type": "transcript_ready",
+                        "result": "success",
+                    },
+                    source="worker",
+                )
+                record_first_value(
+                    db,
+                    user_id=uploader_id,
+                    workspace_id=project.workspace_id,
+                    feature_key="transcript_edit",
+                    resource_type="transcription",
+                    resource_id=vt.id,
+                )
             db.commit()
             logger.info("Transcription completed for video %s (%s segments)", video_id, len(nonempty))
 
@@ -497,6 +627,8 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
                 except Exception:
                     logger.exception("Could not mark auto clip failure for video %s", video_id)
 
+    except TranscriptionTerminalFailure:
+        raise
     except subprocess.CalledProcessError as e:
         err = (e.stderr or e.stdout or "")[:4000]
         if _ffmpeg_stderr_suggests_no_audio(err):
@@ -521,6 +653,7 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
                         "ffmpeg found no audio in this stream (often a video-only YouTube URL). "
                         "Use Force new job after updating the worker."
                     )
+                    _emit_transcription_failure(db, video_id, "ffmpeg_no_audio")
                     db.commit()
                     from app.services.repurpose_pipeline import mark_repurpose_jobs_failed
 
@@ -528,12 +661,14 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
             except Exception:
                 db.rollback()
                 logger.exception("Could not persist no-audio completion for video %s", video_id)
-            return
+            raise RuntimeError("ffmpeg found no usable audio") from e
         logger.exception("ffmpeg failed for video %s", video_id)
         _fail(db, video_id, f"Audio extraction failed: {err}")
+        raise
     except Exception as e:
         logger.exception("Transcription failed for video %s", video_id)
         _fail(db, video_id, str(e)[:4000])
+        raise
     finally:
         db.close()
 
@@ -552,6 +687,7 @@ def _fail(db: Session, video_id: int, message: str) -> None:
         if row:
             row.status = "failed"
             row.error_message = message
+            _emit_transcription_failure(db, video_id, "transcription_exception")
             db.commit()
             from app.services.repurpose_pipeline import mark_repurpose_jobs_failed
 

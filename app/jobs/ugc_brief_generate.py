@@ -32,8 +32,7 @@ def ugc_brief_generate_job(product_id: int) -> None:
     try:
         product = db.query(UgcProduct).filter(UgcProduct.id == product_id).first()
         if product is None:
-            logger.error("ugc_brief_generate_job: product %s not found", product_id)
-            return
+            raise RuntimeError(f"UGC product {product_id} was removed before brief generation")
         brief = (
             db.query(UgcBrief)
             .filter(UgcBrief.product_id == product_id)
@@ -79,5 +78,6 @@ def ugc_brief_generate_job(product_id: int) -> None:
                 brief.status = "failed"
                 brief.error_message = str(e)[:4000]
                 db.commit()
+            raise
     finally:
         db.close()

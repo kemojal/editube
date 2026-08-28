@@ -18,7 +18,8 @@ from sqlalchemy.orm import Session
 
 import app.utils.cloudinary  # noqa: F401
 from app.db.database import SessionLocal
-from app.db.models import DeliveryAsset, DeliveryExport, DeliveryPackage, Video, VideoTranscription
+from app.db.models import DeliveryAsset, DeliveryExport, DeliveryPackage, Project, Video, VideoTranscription
+from app.services.product_analytics import emit_once
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +29,11 @@ def delivery_package_job(package_id: int) -> None:
     try:
         pkg = db.query(DeliveryPackage).filter(DeliveryPackage.id == package_id).first()
         if not pkg:
-            return
+            raise RuntimeError(f"Delivery package {package_id} was removed before processing")
         video = db.query(Video).filter(Video.id == pkg.video_id).first()
         if not video or not video.file_path:
             _fail(db, pkg, "Video or file_path missing")
-            return
+            raise RuntimeError("Video or file_path missing")
 
         pkg.status = "processing"
         pkg.error_message = None
@@ -103,12 +104,44 @@ def delivery_package_job(package_id: int) -> None:
             from datetime import datetime, timezone
             pkg.completed_at = datetime.now(timezone.utc)
             db.add(pkg)
+            project = db.query(Project).filter(Project.id == pkg.project_id).first()
+            if project is not None:
+                common = {
+                    "user_id": pkg.requested_by_user_id,
+                    "workspace_id": project.workspace_id,
+                    "source": "worker",
+                }
+                emit_once(
+                    db,
+                    "delivery_package_ready",
+                    event_id=f"delivery-package:{pkg.id}:ready",
+                    properties={
+                        "project_id": project.id,
+                        "delivery_package_id": pkg.id,
+                        "asset_count": len(manifest),
+                        "result": "success",
+                    },
+                    **common,
+                )
+                emit_once(
+                    db,
+                    "feature_completed",
+                    event_id=f"feature:delivery:package:{pkg.id}:completed",
+                    properties={
+                        "project_id": project.id,
+                        "feature_key": "delivery",
+                        "delivery_package_id": pkg.id,
+                        "result": "success",
+                    },
+                    **common,
+                )
             db.commit()
     except Exception as e:
         logger.exception("delivery_package_job failed for %s", package_id)
         pkg = db.query(DeliveryPackage).filter(DeliveryPackage.id == package_id).first()
         if pkg:
             _fail(db, pkg, str(e)[:4000])
+        raise
     finally:
         db.close()
 
@@ -170,4 +203,22 @@ def _fail(db: Session, pkg: DeliveryPackage, message: str) -> None:
     pkg.status = "failed"
     pkg.error_message = message[:4000]
     db.add(pkg)
+    project = db.query(Project).filter(Project.id == pkg.project_id).first()
+    if project is not None:
+        emit_once(
+            db,
+            "feature_failed",
+            event_id=f"feature:delivery:package:{pkg.id}:failed",
+            user_id=pkg.requested_by_user_id,
+            workspace_id=project.workspace_id,
+            source="worker",
+            properties={
+                "project_id": project.id,
+                "feature_key": "delivery",
+                "delivery_package_id": pkg.id,
+                "failure_class": "worker",
+                "error_code": "delivery_package_failed",
+                "result": "failure",
+            },
+        )
     db.commit()

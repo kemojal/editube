@@ -16,8 +16,7 @@ class ActivityFeedInDBBase(ActivityFeedBase):
     id: int
     created_at: str
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 class ActivityFeed(ActivityFeedInDBBase):
     pass

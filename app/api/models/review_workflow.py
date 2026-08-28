@@ -23,8 +23,7 @@ class ReviewWorkflowStageResponse(BaseModel):
     label: str
     notify_user_ids: List[int] = Field(default_factory=list)
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class ReviewWorkflowTemplateResponse(BaseModel):
@@ -35,8 +34,7 @@ class ReviewWorkflowTemplateResponse(BaseModel):
     updated_at: datetime
     stages: List[ReviewWorkflowStageResponse] = Field(default_factory=list)
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class AttachWorkflowRunBody(BaseModel):
@@ -51,5 +49,4 @@ class ReviewWorkflowRunResponse(BaseModel):
     completed_at: Optional[datetime] = None
     total_stages: int = 0
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}

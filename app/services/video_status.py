@@ -18,8 +18,10 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Video, VideoApproval
+from app.db.models import Project, Video, VideoApproval
 from app.services.activity import log_activity
+from app.services.activation_analytics import record_first_value
+from app.services.product_analytics import emit_once
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +193,7 @@ def record_decision(
     review_session_id: int | None = None,
     review_link_id: int | None = None,
     note: str | None = None,
+    skip_transition_check: bool = True,
 ) -> VideoApproval:
     """Append a review decision and move the video's status to match.
 
@@ -218,12 +221,72 @@ def record_decision(
         _STATUS_FOR_DECISION[decision],
         actor_user_id=actor_user_id,
         note=note,
-        # A guest approving a cut that is still `in_progress` (because the
-        # editor shared a link without formally sending it for review) is a
-        # real sequence, and refusing it would strand them.
-        skip_transition_check=True,
+        skip_transition_check=skip_transition_check,
     )
     db.flush()
+    if decision == DECISION_APPROVED:
+        project = db.query(Project).filter(Project.id == video.project_id).first()
+        workspace_id = project.workspace_id if project else None
+        attributed_user_id = actor_user_id or (project.creator_id if project else None)
+        source = "review_service" if review_session_id is not None else "api"
+        properties = {
+            "feature_key": "approval",
+            "project_id": video.project_id,
+            "video_id": video.id,
+            "video_approval_id": approval.id,
+            "review_link_id": review_link_id,
+            "review_session_id": review_session_id,
+            "actor_type": "guest" if review_session_id is not None else "member",
+            "has_note": bool((note or "").strip()),
+            "result": "approved",
+        }
+        common = {
+            "user_id": attributed_user_id,
+            "workspace_id": workspace_id,
+            "anonymous_id": (
+                f"review-session:{review_session_id}"
+                if review_session_id is not None
+                else None
+            ),
+            "source": source,
+            "properties": properties,
+        }
+        emit_once(
+            db,
+            "review_approved",
+            event_id=f"video-approval:{approval.id}:approved",
+            **common,
+        )
+        emit_once(
+            db,
+            "review_cycle_completed",
+            event_id=f"video-approval:{approval.id}:cycle-completed",
+            **{**common, "properties": {**properties, "completion_type": "approval"}},
+        )
+        emit_once(
+            db,
+            "feature_completed",
+            event_id=f"feature:approval:video-approval:{approval.id}:completed",
+            **common,
+        )
+        emit_once(
+            db,
+            "feature_result_used",
+            event_id=f"feature:approval:video-approval:{approval.id}:advanced",
+            **{
+                **common,
+                "properties": {**properties, "result_action": "review_cycle_advanced"},
+            },
+        )
+        if project and project.workspace_id is not None and attributed_user_id is not None:
+            record_first_value(
+                db,
+                user_id=attributed_user_id,
+                workspace_id=project.workspace_id,
+                feature_key="approval",
+                resource_type="video_approval",
+                resource_id=video.id,
+            )
     return approval
 
 

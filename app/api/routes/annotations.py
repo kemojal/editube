@@ -4,6 +4,7 @@ from app.db.models import Annotation, Video, User
 from app.services.project_access import assert_write_project_content, can_access_project
 from app.db.database import get_db
 from app.utils.security import get_current_user
+from app.services.product_analytics import emit_once
 from app.api.models.annotations import (
     ANNOTATION_DURATION_FRAMES,
     AnnotationCreate,
@@ -73,6 +74,22 @@ def create_annotation(
     )
 
     db.add(db_annotation)
+    db.flush()
+    emit_once(
+        db,
+        "feature_completed",
+        event_id=f"feature:annotations:annotation:{db_annotation.id}:created",
+        user=current_user,
+        workspace_id=db_video.project.workspace_id if db_video.project else None,
+        properties={
+            "feature_key": "annotations",
+            "project_id": db_video.project_id,
+            "video_id": db_video.id,
+            "annotation_id": db_annotation.id,
+            "completion_type": "annotation_persisted",
+            "result": "success",
+        },
+    )
     db.commit()
     db.refresh(db_annotation)
 
@@ -133,6 +150,22 @@ def update_annotation(
     update_data = annotation.dict(exclude_unset=True)
     for field, value in update_data.items():
         setattr(db_annotation, field, value)
+
+    emit_once(
+        db,
+        "feature_result_used",
+        event_id=f"feature:annotations:annotation:{db_annotation.id}:first-update",
+        user=current_user,
+        workspace_id=db_video.project.workspace_id if db_video.project else None,
+        properties={
+            "feature_key": "annotations",
+            "project_id": db_video.project_id,
+            "video_id": db_video.id,
+            "annotation_id": db_annotation.id,
+            "result_action": "annotation_revisited",
+            "result": "success",
+        },
+    )
 
     db.commit()
     db.refresh(db_annotation)

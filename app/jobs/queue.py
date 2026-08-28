@@ -4,8 +4,105 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+
+from app.services.observability import observed_span
+from app.services.job_terminal_state import feature_key_for_job, persisted_job_context
+from app.services.product_analytics import emit_after_commit
 
 logger = logging.getLogger(__name__)
+
+
+def _record_enqueued(  # noqa: ANN001
+    job,
+    job_type: str,
+    resource_id: int | str,
+    *,
+    feature_key: str | None = None,
+) -> None:
+    """Record queue publication once, with safe resource ownership context."""
+
+    if job is None:
+        return
+    context = persisted_job_context(job_type, resource_id)
+    properties = {
+        "job_id": str(job.id),
+        "job_type": job_type,
+        "queue": str(getattr(job, "origin", "default"))[:80],
+        "resource_id": resource_id,
+        "feature_key": feature_key or feature_key_for_job(job_type, context),
+        "project_id": context.get("project_id"),
+        "video_id": context.get("video_id"),
+    }
+    emit_after_commit(
+        "job_queued",
+        user_id=context.get("user_id"),
+        workspace_id=context.get("workspace_id"),
+        properties={key: value for key, value in properties.items() if value is not None},
+        event_id=f"rq:{job.id}:queued",
+    )
+
+
+def enqueue_analytics_privacy_job(limit: int = 20) -> bool:
+    """Enqueue provider data-rights processing independently of ingestion."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url or not (os.environ.get("POSTHOG_PROJECT_ID", "").strip()):
+        return False
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        bucket = int(time.time()) // 60
+        conn = Redis.from_url(url, socket_connect_timeout=1, socket_timeout=2)
+        queue = Queue("default", connection=conn, default_timeout=300)
+        with observed_span("queue.publish", "enqueue analytics privacy", queue="default"):
+            queue.enqueue(
+                "app.jobs.analytics_privacy.process_analytics_data_requests",
+                max(1, min(int(limit), 100)),
+                job_id=f"analytics-privacy-{bucket}",
+                job_timeout=300,
+                result_ttl=60,
+                failure_ttl=300,
+            )
+        return True
+    except Exception as exc:
+        if "already exists" not in str(exc).lower():
+            logger.exception("Failed to enqueue analytics privacy processing")
+        return False
+
+
+def enqueue_analytics_delivery_job(batch_size: int = 100) -> bool:
+    """Enqueue one deduplicated outbox-delivery sweep on the default queue."""
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url or not os.environ.get("POSTHOG_PROJECT_API_KEY", "").strip():
+        return False
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        interval = max(
+            10, int(os.environ.get("ANALYTICS_DELIVERY_INTERVAL_SECONDS", "30") or "30")
+        )
+        bucket = int(time.time()) // interval
+        conn = Redis.from_url(url, socket_connect_timeout=1, socket_timeout=2)
+        queue = Queue("default", connection=conn, default_timeout=120)
+        with observed_span("queue.publish", "enqueue analytics delivery", queue="default"):
+            queue.enqueue(
+                "app.jobs.analytics_delivery.analytics_delivery_job",
+                max(1, min(int(batch_size), 500)),
+                job_id=f"analytics-delivery-{bucket}",
+                job_timeout=120,
+                result_ttl=interval,
+                failure_ttl=interval,
+            )
+        return True
+    except Exception as exc:
+        # A second API replica can win the same time-bucket job id. That is a
+        # successful dedupe, not a product error; every other failure is still
+        # visible in worker/API observability.
+        if "already exists" not in str(exc).lower():
+            logger.exception("Failed to enqueue analytics delivery")
+        return False
 
 
 def enqueue_rough_cut_export_job(ai_result_id: int, *, register_as_version: bool = False) -> str | None:
@@ -28,6 +125,7 @@ def enqueue_rough_cut_export_job(ai_result_id: int, *, register_as_version: bool
             register_as_version=register_as_version,
             job_timeout=timeout_sec,
         )
+        _record_enqueued(job, "rough_cut_export_job", ai_result_id)
         return job.id if job else None
     except Exception as e:
         logger.exception("Failed to enqueue rough-cut export ai_result=%s: %s", ai_result_id, e)
@@ -53,6 +151,7 @@ def enqueue_rough_cut_effect_job(ai_result_id: int) -> str | None:
             ai_result_id,
             job_timeout=timeout_sec,
         )
+        _record_enqueued(job, "rough_cut_effect_job", ai_result_id)
         return job.id if job else None
     except Exception as e:
         logger.exception("Failed to enqueue rough-cut effect ai_result=%s: %s", ai_result_id, e)
@@ -78,6 +177,7 @@ def enqueue_mask_track_job(ai_result_id: int) -> str | None:
             ai_result_id,
             job_timeout=timeout_sec,
         )
+        _record_enqueued(job, "mask_track_job", ai_result_id)
         return job.id if job else None
     except Exception as e:
         logger.exception("Failed to enqueue mask track ai_result=%s: %s", ai_result_id, e)
@@ -104,6 +204,7 @@ def enqueue_generated_media_job(media_id: int) -> str | None:
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=timeout_sec)
         job = q.enqueue(generate_media_job, media_id, job_timeout=timeout_sec)
+        _record_enqueued(job, "generate_media_job", media_id)
         return job.id if job else None
     except Exception as e:
         logger.exception("Failed to enqueue generated media=%s: %s", media_id, e)
@@ -132,12 +233,13 @@ def enqueue_transcription_job(video_id: int, language: str | None = None) -> boo
 
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=timeout_sec)
-        q.enqueue(
+        job = q.enqueue(
             transcribe_video,
             video_id,
             language,
             job_timeout=timeout_sec,
         )
+        _record_enqueued(job, "transcribe_video", video_id)
         return True
     except Exception as e:
         logger.exception("Failed to enqueue transcription for video %s: %s", video_id, e)
@@ -269,11 +371,12 @@ def enqueue_youtube_publish_job(publication_id: int) -> bool:
 
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=7200)
-        q.enqueue(
+        job = q.enqueue(
             "app.jobs.youtube_publish.youtube_publish_job",
             publication_id,
             job_timeout=7200,
         )
+        _record_enqueued(job, "youtube_publish_job", publication_id)
         return True
     except Exception as e:
         logger.exception("Failed to enqueue YouTube publish for publication %s: %s", publication_id, e)
@@ -291,11 +394,12 @@ def enqueue_aspect_export_job(export_id: int) -> bool:
 
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=3600)
-        q.enqueue(
+        job = q.enqueue(
             "app.jobs.aspect_export.aspect_export_job",
             export_id,
             job_timeout=3600,
         )
+        _record_enqueued(job, "aspect_export_job", export_id)
         return True
     except Exception as e:
         logger.exception("Failed to enqueue aspect export %s: %s", export_id, e)
@@ -313,11 +417,12 @@ def enqueue_chapter_synthesis_job(video_id: int) -> bool:
 
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=900)
-        q.enqueue(
+        job = q.enqueue(
             "app.jobs.chapter_synthesis.chapter_synthesis_job",
             video_id,
             job_timeout=900,
         )
+        _record_enqueued(job, "chapter_synthesis_job", video_id)
         return True
     except Exception as e:
         logger.exception("Failed to enqueue chapter synthesis for video %s: %s", video_id, e)
@@ -335,11 +440,12 @@ def enqueue_multi_format_export_job(export_id: int) -> bool:
 
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=7200)
-        q.enqueue(
+        job = q.enqueue(
             "app.jobs.multi_format_export.multi_format_export_job",
             export_id,
             job_timeout=7200,
         )
+        _record_enqueued(job, "multi_format_export_job", export_id)
         return True
     except Exception as e:
         logger.exception("Failed to enqueue multi-format export %s: %s", export_id, e)
@@ -357,11 +463,12 @@ def enqueue_delivery_package_job(package_id: int) -> bool:
 
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=7200)
-        q.enqueue(
+        job = q.enqueue(
             "app.jobs.delivery_package.delivery_package_job",
             package_id,
             job_timeout=7200,
         )
+        _record_enqueued(job, "delivery_package_job", package_id)
         return True
     except Exception as e:
         logger.exception("Failed to enqueue delivery package job %s: %s", package_id, e)
@@ -509,11 +616,12 @@ def enqueue_proxy_generation_job(proxy_id: int) -> bool:
 
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=7200)
-        q.enqueue(
+        job = q.enqueue(
             "app.jobs.proxy_generation.proxy_generation_job",
             proxy_id,
             job_timeout=7200,
         )
+        _record_enqueued(job, "proxy_generation_job", proxy_id)
         return True
     except Exception as e:
         logger.exception("Failed to enqueue proxy generation for proxy %s: %s", proxy_id, e)
@@ -534,6 +642,7 @@ def enqueue_clip_render_job(clip_id: int) -> str | None:
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=7200)
         job = q.enqueue(clip_render_job, clip_id, job_timeout=7200)
+        _record_enqueued(job, "clip_render_job", clip_id)
         return job.id
     except Exception as e:
         logger.exception("Failed to enqueue clip render for clip %s: %s", clip_id, e)
@@ -558,6 +667,7 @@ def enqueue_drive_import_job(import_id: int) -> str | None:
             import_id,
             job_timeout=timeout_sec,
         )
+        _record_enqueued(job, "drive_import_job", import_id)
         return job.id if job else None
     except Exception as e:
         logger.exception("Failed to enqueue drive import %s: %s", import_id, e)
@@ -576,11 +686,12 @@ def enqueue_watch_folder_sync_job(config_id: int) -> bool:
 
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=1800)
-        q.enqueue(
+        job = q.enqueue(
             "app.jobs.watch_folder_sync.watch_folder_sync_job",
             config_id,
             job_timeout=1800,
         )
+        _record_enqueued(job, "watch_folder_sync_job", config_id)
         return True
     except Exception as e:
         logger.exception("Failed to enqueue watch folder sync for config %s: %s", config_id, e)
@@ -603,6 +714,7 @@ def enqueue_ugc_product_import_job(product_id: int) -> str | None:
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=600)
         job = q.enqueue("app.jobs.ugc_product_import.ugc_product_import_job", product_id, job_timeout=600)
+        _record_enqueued(job, "ugc_product_import_job", product_id)
         return job.id if job else None
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to enqueue ugc product import %s: %s", product_id, e)
@@ -622,13 +734,18 @@ def enqueue_ugc_brief_generate_job(product_id: int) -> str | None:
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=900)
         job = q.enqueue("app.jobs.ugc_brief_generate.ugc_brief_generate_job", product_id, job_timeout=900)
+        _record_enqueued(job, "ugc_brief_generate_job", product_id)
         return job.id if job else None
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to enqueue ugc brief gen for product %s: %s", product_id, e)
         return None
 
 
-def enqueue_ugc_render_job(variation_id: int) -> str | None:
+def enqueue_ugc_render_job(
+    variation_id: int,
+    feature_key: str = "ugc_render",
+    operation_id: str | None = None,
+) -> str | None:
     """Enqueue UGC variation render. Returns RQ job id or None."""
     url = os.environ.get("REDIS_URL", "").strip()
     if not url:
@@ -641,7 +758,14 @@ def enqueue_ugc_render_job(variation_id: int) -> str | None:
         timeout_sec = max(600, int(os.environ.get("UGC_RENDER_JOB_TIMEOUT_SEC", "7200") or "7200"))
         conn = Redis.from_url(url)
         q = Queue("default", connection=conn, default_timeout=timeout_sec)
-        job = q.enqueue("app.jobs.ugc_render.ugc_render_job", variation_id, job_timeout=timeout_sec)
+        job = q.enqueue(
+            "app.jobs.ugc_render.ugc_render_job",
+            variation_id,
+            feature_key,
+            operation_id,
+            job_timeout=timeout_sec,
+        )
+        _record_enqueued(job, "ugc_render_job", variation_id, feature_key=feature_key)
         return job.id if job else None
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to enqueue ugc render for variation %s: %s", variation_id, e)
@@ -669,6 +793,7 @@ def enqueue_ugc_variation_generate_job(
             dimensions,
             job_timeout=1800,
         )
+        _record_enqueued(job, "ugc_variation_generate_job", campaign_id)
         return job.id if job else None
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to enqueue ugc variation gen for campaign %s: %s", campaign_id, e)
@@ -696,6 +821,7 @@ def enqueue_ai_review_job(video_id: int, options: dict | None = None) -> str | N
             options,
             job_timeout=timeout_sec,
         )
+        _record_enqueued(job, "ai_review_job", video_id)
         return job.id if job else None
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to enqueue AI review for video %s: %s", video_id, e)
@@ -724,6 +850,7 @@ def enqueue_director_job(plan_id: int) -> str | None:
             plan_id,
             job_timeout=timeout_sec,
         )
+        _record_enqueued(job, "director_job", plan_id)
         return job.id if job else None
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to enqueue director run %s: %s", plan_id, e)

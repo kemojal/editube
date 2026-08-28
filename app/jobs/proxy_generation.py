@@ -156,22 +156,21 @@ def proxy_generation_job(proxy_id: int) -> None:
     try:
         proxy = db.query(VideoProxy).filter(VideoProxy.id == proxy_id).first()
         if not proxy:
-            logger.error("VideoProxy %s not found", proxy_id)
-            return
+            raise RuntimeError(f"Video proxy {proxy_id} was removed before generation started")
 
         profile_config = PROXY_PROFILES.get(proxy.profile)
         if not profile_config:
             proxy.status = "failed"
             proxy.error_message = f"Unknown profile: {proxy.profile}"
             db.commit()
-            return
+            raise RuntimeError(proxy.error_message)
 
         video = proxy.video
         if not video or not video.file_path:
             proxy.status = "failed"
             proxy.error_message = "Video has no file_path"
             db.commit()
-            return
+            raise RuntimeError(proxy.error_message)
 
         proxy.status = "processing"
         db.commit()
@@ -214,6 +213,7 @@ def proxy_generation_job(proxy_id: int) -> None:
             proxy.error_message = str(e)[:1000]
             db.commit()
             logger.exception("Proxy generation failed for %s: %s", proxy_id, e)
+            raise
 
         finally:
             for p in (input_path, output_path):

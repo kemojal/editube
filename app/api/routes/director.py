@@ -24,6 +24,7 @@ from app.services import claude_client, director_manifest
 from app.services.director_service import BUDGET_TIERS
 from app.services.project_access import can_access_project
 from app.utils.security import get_current_user
+from app.services.job_analytics import record_job_canceled
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/videos", tags=["ai-director"])
@@ -322,7 +323,8 @@ def cancel_director(
     checks it between polls, which is the only way to abandon a Veo job that
     would otherwise hold a worker for minutes.
     """
-    _video_or_403(video_id, db, current_user)
+    video = _video_or_403(video_id, db, current_user)
+    project = db.query(Project).filter(Project.id == video.project_id).first()
     row = _latest(db, video_id)
     if row is None:
         raise HTTPException(status_code=404, detail="No director run to cancel")
@@ -334,6 +336,14 @@ def cancel_director(
         GeneratedMedia.director_plan_id == row.id,
         GeneratedMedia.status.in_(("pending", "running")),
     ).update({"cancel_requested": True}, synchronize_session=False)
+    record_job_canceled(
+        db,
+        job_kind="ai_director",
+        job_id=row.id,
+        feature_key="ai_director",
+        user=current_user,
+        project=project,
+    )
     db.commit()
     db.refresh(row)
     return _serialize(db, row)

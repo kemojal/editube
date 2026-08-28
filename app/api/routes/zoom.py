@@ -24,6 +24,7 @@ from app.db.database import get_db
 from app.db.models import User, UserZoomConnection
 from app.utils.security import ALGORITHM, SECRET_KEY, get_current_user
 from app.utils.token_crypto import decrypt_secret, encrypt_secret
+from app.services.product_analytics import emit, emit_after_commit
 
 logger = logging.getLogger(__name__)
 
@@ -186,8 +187,44 @@ def _status_payload(row: UserZoomConnection | None) -> dict:
     return {"connected": True, "email": row.email, "display_name": row.display_name}
 
 
+def _record_oauth_failure(db: Session, state: str | None, error_code: str) -> None:
+    if not state:
+        return
+    try:
+        user_id = _decode_state(state)
+    except HTTPException:
+        return
+    emit(
+        db,
+        "integration_connect_failed",
+        user_id=user_id,
+        properties={
+            "provider": "zoom",
+            "feature_key": "zoom",
+            "error_code": error_code,
+            "result": "failure",
+        },
+    )
+    emit(
+        db,
+        "feature_failed",
+        user_id=user_id,
+        properties={
+            "feature_key": "zoom",
+            "error_code": error_code,
+            "failure_class": "oauth",
+            "result": "failure",
+        },
+    )
+    db.commit()
+
+
 @router.post("/authorize-url")
-def zoom_authorize_url(req: Request, current_user: User = Depends(get_current_user)):
+def zoom_authorize_url(
+    req: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     client_id, _ = _require_zoom_client()
     from urllib.parse import urlencode
 
@@ -199,6 +236,14 @@ def zoom_authorize_url(req: Request, current_user: User = Depends(get_current_us
             "state": _encode_state(current_user.id),
         }
     )
+    if isinstance(db, Session):
+        emit(
+            db,
+            "integration_connect_started",
+            user=current_user,
+            properties={"provider": "zoom", "feature_key": "zoom"},
+        )
+        db.commit()
     return {"authorization_url": f"{ZOOM_AUTHORIZE}?{params}"}
 
 
@@ -211,8 +256,10 @@ def zoom_oauth_callback(
     db: Session = Depends(get_db),
 ):
     if error:
+        _record_oauth_failure(db, state, "access_denied" if error == "access_denied" else "oauth_error")
         return _popup_response({"ok": False, "error": error})
     if not code or not state:
+        _record_oauth_failure(db, state, "missing_params")
         return _popup_response({"ok": False, "error": "missing_params"})
     try:
         user_id = _decode_state(state)
@@ -231,10 +278,12 @@ def zoom_oauth_callback(
             }
         )
     except httpx.HTTPError:
+        _record_oauth_failure(db, state, "token_exchange_failed")
         return _popup_response({"ok": False, "error": "token_exchange_failed"})
 
     access = token_data.get("access_token")
     if not access:
+        _record_oauth_failure(db, state, "no_access_token")
         return _popup_response({"ok": False, "error": "no_access_token"})
     try:
         info = _fetch_zoom_user(access)
@@ -243,10 +292,22 @@ def zoom_oauth_callback(
     try:
         row = _persist(db, user.id, token_data, info)
     except ValueError as e:
+        _record_oauth_failure(db, state, "credential_rejected")
         return _popup_response({"ok": False, "error": str(e)[:200]})
     except RuntimeError:
+        _record_oauth_failure(db, state, "encryption_not_configured")
         return _popup_response({"ok": False, "error": "encryption_not_configured"})
 
+    emit_after_commit(
+        "integration_connected",
+        user_id=user.id,
+        properties={"provider": "zoom", "feature_key": "zoom", "result": "success"},
+    )
+    emit_after_commit(
+        "feature_completed",
+        user_id=user.id,
+        properties={"feature_key": "zoom", "completion_type": "oauth_connected", "result": "success"},
+    )
     return _popup_response({"ok": True, "connection": _status_payload(row)})
 
 
@@ -277,6 +338,12 @@ def zoom_disconnect(db: Session = Depends(get_db), current_user: User = Depends(
     except Exception as e:
         logger.info("Zoom token revoke skipped: %s", e)
     db.delete(row)
+    emit(
+        db,
+        "integration_disconnected",
+        user=current_user,
+        properties={"provider": "zoom", "feature_key": "zoom"},
+    )
     db.commit()
     return {"ok": True}
 

@@ -25,6 +25,7 @@ from sqlalchemy.orm import sessionmaker
 from app.db.database import Base
 from app.db.models import (
     ActivityFeed,
+    AnalyticsOutbox,
     Comment,
     Annotation,
     Folder,
@@ -83,6 +84,9 @@ class _SqliteDbTestCase(unittest.TestCase):
         # Uploading a new version resets the cut to in_review, and that status
         # change is logged.
         ActivityFeed.__table__,
+        # Upload completion analytics is committed transactionally with the
+        # video/transcription state, so this focused fixture needs the outbox.
+        AnalyticsOutbox.__table__,
     ]
 
     def setUp(self) -> None:

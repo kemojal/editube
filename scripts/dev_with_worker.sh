@@ -28,6 +28,15 @@ set -a
 source .env
 set +a
 
+# The local public API and worker must never inherit the privileged request-log
+# read connection. Keep the fail-closed check in app.main for every other
+# deployment, while making this public development launcher safe by default.
+if [[ -n "${LOG_READ_DATABASE_URL:-}" ]]; then
+  echo "Ignoring LOG_READ_DATABASE_URL for the public API and worker."
+  echo "Run app.internal_admin separately with an internal-admin-only environment."
+fi
+export LOG_READ_DATABASE_URL=""
+
 if [[ -z "${REDIS_URL:-}" ]]; then
   echo "REDIS_URL is empty. Set REDIS_URL in .env to run worker jobs."
   exit 1
@@ -52,7 +61,7 @@ echo "Using Python environment: $VENV_DIR"
 echo "Note: plain 'rq worker' fails unless the venv is active — this script uses $VENV_DIR/bin/rq."
 echo "To run only the worker later: ./scripts/rq_worker.sh"
 export PYTHONUNBUFFERED=1
-"$VENV_DIR/bin/rq" worker --worker-class rq.SimpleWorker --verbose -u "$REDIS_URL" default &
+"$VENV_DIR/bin/python" -m app.rq_worker default &
 WORKER_PID=$!
 
 if lsof -iTCP:"$API_PORT" -sTCP:LISTEN -n -P >/dev/null 2>&1; then

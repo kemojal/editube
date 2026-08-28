@@ -50,6 +50,7 @@ from app.services.rough_cut_workspace import latest_project_source_video
 from app.services.mentions import user_mention_handles
 from app.services.project_template_apply import apply_project_template
 from app.services.workspace_bootstrap import ensure_personal_workspace
+from app.services.product_analytics import emit, emit_once
 from app.services.activity import log_activity
 from app.utils.email import send_invitation_email
 from app.utils.security import get_current_user
@@ -276,6 +277,18 @@ def create_project(
             db_project.created_from_template_id = tpl.id
 
     log_activity(db, user_id=current_user.id, project_id=db_project.id, action="project_created")
+    emit(
+        db,
+        "project_created",
+        user=current_user,
+        workspace_id=ws_id,
+        properties={
+            "project_id": db_project.id,
+            "project_type": project.project_type,
+            "template_used": bool(project.template_key),
+            "result": "success",
+        },
+    )
     db.commit()
     db.refresh(db_project)
     return convert_project_to_response(db_project, db)
@@ -815,6 +828,21 @@ def attach_workspace_asset_to_project(
     )
     if existing:
         existing.folder_id = body.folder_id
+        emit_once(
+            db,
+            "feature_result_used",
+            event_id=f"feature:workspace-assets:link:{existing.id}:attached",
+            user=current_user,
+            workspace_id=db_project.workspace_id,
+            properties={
+                "feature_key": "workspace_assets",
+                "project_id": db_project.id,
+                "workspace_asset_id": body.workspace_asset_id,
+                "asset_link_id": existing.id,
+                "result_action": "attached_to_project",
+                "result": "success",
+            },
+        )
         db.commit()
         existing = (
             db.query(ProjectWorkspaceAssetLink)
@@ -831,6 +859,22 @@ def attach_workspace_asset_to_project(
         created_by_user_id=current_user.id,
     )
     db.add(link)
+    db.flush()
+    emit_once(
+        db,
+        "feature_result_used",
+        event_id=f"feature:workspace-assets:link:{link.id}:attached",
+        user=current_user,
+        workspace_id=db_project.workspace_id,
+        properties={
+            "feature_key": "workspace_assets",
+            "project_id": db_project.id,
+            "workspace_asset_id": body.workspace_asset_id,
+            "asset_link_id": link.id,
+            "result_action": "attached_to_project",
+            "result": "success",
+        },
+    )
     db.commit()
     db.refresh(link)
     link = (

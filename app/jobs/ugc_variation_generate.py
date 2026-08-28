@@ -21,12 +21,12 @@ def ugc_variation_generate_job(campaign_id: int, count: int, dimensions: dict[st
     try:
         campaign = db.query(UgcCampaign).filter(UgcCampaign.id == campaign_id).first()
         if campaign is None:
-            logger.error("ugc_variation_generate_job: campaign %s not found", campaign_id)
-            return
+            raise RuntimeError(f"UGC campaign {campaign_id} was removed before variation generation")
         created = build_variations(db, campaign, count, dimensions)
         logger.info("ugc_variation_generate_job: campaign %s created %d variations", campaign_id, len(created))
     except Exception:  # noqa: BLE001
         logger.exception("ugc_variation_generate_job failed for campaign %s", campaign_id)
         db.rollback()
+        raise
     finally:
         db.close()

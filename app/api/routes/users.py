@@ -2,16 +2,23 @@ from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query
 from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from pydantic import BaseModel
 from datetime import datetime
 import logging
 import os
 import secrets
+import hashlib
+import hmac
 from urllib.parse import quote as url_quote
 
-from ..models.users import User as UserSchema, UserCreate, UserUpdate, UserRegisterSchema, UserLoginSchema, OnboardingProfileUpdate, OnboardingWorkflowUpdate, OnboardingPlanUpdate, UserSettingsResponse, UserSettingsUpdate, ApiTokenResponse, ApiTokenCreateRequest, ApiTokenCreateResponse
+from ..models.users import User as UserSchema, UserCreate, UserUpdate, UserRegisterSchema, UserLoginSchema, OnboardingProfileUpdate, OnboardingWorkflowUpdate, OnboardingPlanUpdate, UserSettingsResponse, UserSettingsUpdate, ApiTokenResponse, ApiTokenCreateRequest, ApiTokenCreateResponse, PasswordResetRequest, PasswordResetComplete
 from ...db.database import get_db
 from app.db.models import (
+    AffiliateAuditEvent,
+    AffiliatePartner,
+    AnalyticsConsent,
+    AnalyticsConsentEvent,
     ApiToken,
     Subscription,
     User,
@@ -34,6 +41,7 @@ from ...utils.security import (
     create_refresh_token,
     verify_refresh_token,
     create_user_session,
+    previous_user_activity_gap_days,
     validate_refresh_session,
     decode_access_token_payload,
     revoke_user_session,
@@ -64,6 +72,10 @@ from app.services.oidc_sso import (
 )
 from app.services.entitlements import ENTITLED_STATUSES
 from app.services.pricing import PAID_PLANS, normalize_plan_key, resolve_plan_key
+from app.services.product_analytics import emit, emit_after_commit, emit_once
+from app.services.analytics_data_rights import request_analytics_deletion
+from app.services.affiliate_privacy import scrub_affiliate_data_for_deleted_user
+from app.utils.email import send_transactional_email
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +114,27 @@ ALLOWED_DATE_FORMATS = {"MMM d, yyyy", "yyyy-MM-dd", "MM/dd/yyyy"}
 #: not a session, so it should not live as long as one — long enough to fetch a
 #: code from a phone, short enough that a leaked challenge token is worthless.
 MFA_CHALLENGE_TTL_MINUTES = 10
+PASSWORD_RESET_TTL_MINUTES = 30
+
+
+def _password_version(user: User) -> str:
+    """Bind a reset token to the current password so it can only succeed once."""
+
+    value = user.hashed_password or f"password-not-set:{user.id}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+
+
+def _record_onboarding_failure(user_id: int, step_key: str, error_code: str) -> None:
+    emit_after_commit(
+        "onboarding_step_failed",
+        user_id=user_id,
+        properties={
+            "step_key": step_key,
+            "error_code": error_code,
+            "failure_class": "validation",
+            "result": "failure",
+        },
+    )
 
 
 def get_or_create_user_settings(db: Session, user_id: int) -> UserSettings:
@@ -261,6 +294,23 @@ def create_api_token(
         token_hash=token_hash,
     )
     db.add(record)
+    db.flush()
+    common = {
+        "user": current_user,
+        "properties": {"feature_key": "api_tokens", "result": "success"},
+    }
+    emit_once(
+        db,
+        "api_token_created",
+        event_id=f"api-token:{record.id}:created",
+        **common,
+    )
+    emit_once(
+        db,
+        "feature_completed",
+        event_id=f"feature:api-tokens:token:{record.id}:created",
+        **common,
+    )
     db.commit()
     db.refresh(record)
 
@@ -289,6 +339,12 @@ def revoke_api_token(
     if record is None:
         raise HTTPException(status_code=404, detail="Token not found")
     db.delete(record)
+    emit(
+        db,
+        "api_token_revoked",
+        user=current_user,
+        properties={"feature_key": "api_tokens", "result": "success"},
+    )
     db.commit()
 
 
@@ -330,6 +386,23 @@ def delete_my_account(
     )
     db.query(ApiToken).filter(ApiToken.user_id == user.id).delete(synchronize_session=False)
 
+    # Retire an affiliate link without deleting its contract or ledger. Earned
+    # balances can still be paid to a verified Connect account after closure;
+    # new clicks and future invoice accruals stop immediately.
+    partner = db.query(AffiliatePartner).filter(AffiliatePartner.user_id == user.id).first()
+    if partner and partner.status != "closed":
+        partner.status = "closed"
+        partner.closed_at = now
+        db.add(
+            AffiliateAuditEvent(
+                event_type="partner.closed_account_deleted",
+                actor_user_id=user.id,
+                partner_id=partner.id,
+                subject_user_id=user.id,
+                source_ref=f"partner:{partner.id}",
+            )
+        )
+
     # Anonymize personal data (keep the row so owned content stays intact).
     user.deleted_at = now
     user.email = f"deleted+{user.id}@deleted.local"
@@ -356,7 +429,19 @@ def delete_my_account(
         synchronize_session=False,
     )
 
+    # Account closure implies analytics deletion; it must not require a second
+    # visit to privacy settings after the credentials have been revoked.
+    scrub_affiliate_data_for_deleted_user(db, user_id=user.id, now=now)
+    request_analytics_deletion(db, user_id=user.id, distinct_id=str(user.id))
+
     db.commit()
+    try:
+        from app.jobs.queue import enqueue_analytics_delivery_job, enqueue_analytics_privacy_job
+
+        enqueue_analytics_delivery_job()
+        enqueue_analytics_privacy_job()
+    except Exception:
+        logger.exception("Analytics deletion job was not enqueued for user=%s", user.id)
 
 
 # @router.post("/register")
@@ -381,7 +466,10 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Email already registered")
 
     hashed_password = get_password_hash(user.password)
-    db_user = User(email=user.email, hashed_password=hashed_password, name=user.name, role=user.role)
+    # Public registration never gets to choose an authorization role. The old
+    # assignment trusted `user.role`, which let a request body self-register as
+    # admin and reach every affiliate review and payout endpoint.
+    db_user = User(email=user.email, hashed_password=hashed_password, name=user.name, role="user")
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
@@ -406,6 +494,36 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
                 "referral redemption failed during registration user=%s", db_user.id
             )
 
+    if user.affiliate_click_token:
+        from app.services.affiliate_program import AffiliateProgramError, claim_attribution
+
+        try:
+            claim_attribution(
+                db,
+                user=db_user,
+                click_token=user.affiliate_click_token,
+            )
+        except AffiliateProgramError:
+            # Like a guest pass, attribution is subordinate to account
+            # creation. Expired/inactive/self-referral tokens do not turn a
+            # valid signup into a failure.
+            pass
+        except Exception:
+            logger.exception(
+                "affiliate attribution failed during registration user=%s", db_user.id
+            )
+
+    emit(
+        db,
+        "account_created",
+        user=db_user,
+        properties={
+            "auth_method": "password",
+            "referral_present": bool(user.referral_code),
+            "affiliate_attribution_present": bool(user.affiliate_click_token),
+            "result": "success",
+        },
+    )
     session_id = create_user_session(db, db_user.id)
     access_token = create_access_token(
         data={"user_id": db_user.id, "onboarding_completed": False, "sid": session_id}
@@ -422,15 +540,44 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
 def login_user(user_credentials: UserLoginSchema, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == user_credentials.email).first()
     if not user:
+        emit_after_commit(
+            "login_failed",
+            properties={
+                "auth_method": "password",
+                "failure_class": "credentials",
+                "error_code": "invalid_credentials",
+                "result": "failure",
+            },
+        )
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
     if not user.hashed_password:
+        emit_after_commit(
+            "login_failed",
+            user_id=user.id,
+            properties={
+                "auth_method": "password",
+                "failure_class": "auth_method",
+                "error_code": "password_not_available",
+                "result": "failure",
+            },
+        )
         raise HTTPException(
             status_code=401,
             detail="This account uses Google sign-in. Continue with Google.",
         )
 
     if not verify_password(user_credentials.password, user.hashed_password):
+        emit_after_commit(
+            "login_failed",
+            user_id=user.id,
+            properties={
+                "auth_method": "password",
+                "failure_class": "credentials",
+                "error_code": "invalid_credentials",
+                "result": "failure",
+            },
+        )
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
     mfa_method = _mfa_method(db, user.id, verified_only=True)
@@ -456,6 +603,12 @@ def login_user(user_credentials: UserLoginSchema, db: Session = Depends(get_db))
             actor_user_id=user.id,
             actor_type="user",
         )
+        emit(
+            db,
+            "mfa_challenge_required",
+            user=user,
+            properties={"auth_method": "password", "mfa_method": "totp"},
+        )
         db.commit()
         return {"mfa_required": True, "challenge_token": challenge_token}
 
@@ -467,6 +620,13 @@ def login_user(user_credentials: UserLoginSchema, db: Session = Depends(get_db))
         settings.two_factor = False
         db.commit()
 
+    emit(
+        db,
+        "login_succeeded",
+        user=user,
+        properties={"auth_method": "password", "mfa_used": False, "result": "success"},
+    )
+    returning_after_days = previous_user_activity_gap_days(db, user.id)
     session_id = create_user_session(db, user.id)
     access_token = create_access_token(
         data={
@@ -481,7 +641,100 @@ def login_user(user_credentials: UserLoginSchema, db: Session = Depends(get_db))
         "token_type": "bearer",
         "refresh_token": refresh_token,
         "onboarding_completed": user.onboarding_completed,
+        "returning_after_days": returning_after_days,
     }
+
+
+@router.post("/password/forgot")
+def request_password_reset(body: PasswordResetRequest, db: Session = Depends(get_db)):
+    """Send a short-lived reset link without revealing whether the account exists."""
+
+    generic = {"ok": True, "message": "If that account exists, a reset link has been sent."}
+    user = (
+        db.query(User)
+        .filter(func.lower(User.email) == body.email.strip().lower(), User.deleted_at.is_(None))
+        .first()
+    )
+    if user is None:
+        return generic
+
+    token = create_access_token(
+        {
+            "user_id": user.id,
+            "purpose": "password_reset",
+            "password_version": _password_version(user),
+        },
+        expires_minutes=PASSWORD_RESET_TTL_MINUTES,
+    )
+    reset_url = (
+        f"{os.getenv('FRONTEND_BASE_URL', 'http://localhost:3000').rstrip('/')}"
+        f"/reset-password?token={url_quote(token, safe='')}"
+    )
+    delivered = send_transactional_email(
+        user.email,
+        "Reset your Editube password",
+        (
+            "Use this link to reset your Editube password. "
+            f"It expires in {PASSWORD_RESET_TTL_MINUTES} minutes and can be used once.\n\n"
+            f"{reset_url}\n\nIf you did not request this, you can ignore this email."
+        ),
+    )
+    emit(
+        db,
+        "password_reset_requested",
+        user=user,
+        properties={
+            "delivery_result": "sent" if delivered else "unavailable",
+            "result": "success" if delivered else "failure",
+        },
+    )
+    db.commit()
+    return generic
+
+
+@router.post("/password/reset")
+def complete_password_reset(body: PasswordResetComplete, db: Session = Depends(get_db)):
+    """Consume a reset token, replace the password, and revoke every old session."""
+
+    try:
+        payload = decode_access_token_payload(body.token)
+    except HTTPException as exc:
+        raise HTTPException(status_code=400, detail="This reset link is invalid or expired") from exc
+    if payload.get("purpose") != "password_reset" or payload.get("user_id") is None:
+        raise HTTPException(status_code=400, detail="This reset link is invalid or expired")
+
+    user = (
+        db.query(User)
+        .filter(User.id == int(payload["user_id"]), User.deleted_at.is_(None))
+        .with_for_update()
+        .first()
+    )
+    presented_version = str(payload.get("password_version") or "")
+    if user is None or not hmac.compare_digest(presented_version, _password_version(user)):
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has already been used")
+
+    user.hashed_password = get_password_hash(body.password)
+    now = datetime.utcnow()
+    db.query(UserSession).filter(
+        UserSession.user_id == user.id,
+        UserSession.revoked.is_(False),
+    ).update({"revoked": True, "revoked_at": now}, synchronize_session=False)
+    log_security_audit_event(
+        db,
+        action="auth.password.reset_completed",
+        resource_type="user",
+        resource_id=str(user.id),
+        actor_user_id=user.id,
+        actor_type="user",
+    )
+    emit(
+        db,
+        "password_reset_completed",
+        user=user,
+        properties={"result": "success", "sessions_revoked": True},
+    )
+    db.commit()
+    return {"ok": True}
 
 
 RECOVERY_CODE_COUNT = 10
@@ -861,10 +1114,22 @@ def complete_mfa_challenge(body: dict, db: Session = Depends(get_db)):
             outcome="failure",
             metadata={"attempts_remaining": remaining},
         )
+        emit(
+            db,
+            "login_failed",
+            user=user,
+            properties={
+                "auth_method": "password_mfa",
+                "failure_class": "mfa",
+                "error_code": "invalid_mfa_code",
+                "result": "failure",
+            },
+        )
         db.commit()
         raise HTTPException(status_code=401, detail="Invalid MFA code")
 
     clear_mfa_attempts(f"challenge:{user.id}")
+    returning_after_days = previous_user_activity_gap_days(db, user.id)
     session_id = create_user_session(db, user.id)
     access_token = create_access_token(
         data={"user_id": user.id, "onboarding_completed": user.onboarding_completed, "sid": session_id}
@@ -878,12 +1143,29 @@ def complete_mfa_challenge(body: dict, db: Session = Depends(get_db)):
         actor_user_id=user.id,
         actor_type="user",
     )
+    emit(
+        db,
+        "mfa_challenge_completed",
+        user=user,
+        properties={
+            "auth_method": "password_mfa",
+            "mfa_method": "recovery_code" if recovery_code else "totp",
+            "result": "success",
+        },
+    )
+    emit(
+        db,
+        "login_succeeded",
+        user=user,
+        properties={"auth_method": "password_mfa", "mfa_used": True, "result": "success"},
+    )
     db.commit()
     return {
         "access_token": access_token,
         "token_type": "bearer",
         "refresh_token": refresh_token,
         "onboarding_completed": user.onboarding_completed,
+        "returning_after_days": returning_after_days,
         # Surfaced as a warning banner once the list runs low.
         "recovery_codes_remaining": _unused_recovery_code_count(db, user.id),
     }
@@ -941,6 +1223,12 @@ def logout_user(
     session_id = payload.get("sid")
     if not session_id:
         raise HTTPException(status_code=401, detail="Session missing. Please sign in again.")
+    emit(
+        db,
+        "logout_completed",
+        user=current_user,
+        properties={"auth_method": "session", "result": "success"},
+    )
     revoke_user_session(db, current_user.id, session_id)
     return {"ok": True}
 
@@ -1028,6 +1316,29 @@ def update_current_user_settings(
         owned = _owned_workspace(db, current_user.id)
         if owned:
             owned.name = update_data["workspace_name"]
+
+    if "share_data" in update_data:
+        product_data_enabled = bool(update_data["share_data"])
+        consent_rows = (
+            db.query(AnalyticsConsent)
+            .filter(AnalyticsConsent.user_id == current_user.id)
+            .all()
+        )
+        for consent in consent_rows:
+            consent.product_data_improvement_enabled = product_data_enabled
+            db.add(
+                AnalyticsConsentEvent(
+                    user_id=current_user.id,
+                    anonymous_consent_id=consent.anonymous_consent_id,
+                    consent_state=consent.consent_state,
+                    analytics_enabled=consent.analytics_enabled,
+                    replay_enabled=consent.replay_enabled,
+                    product_data_improvement_enabled=product_data_enabled,
+                    consent_version=consent.consent_version,
+                    region_policy=consent.region_policy,
+                    global_privacy_control=consent.global_privacy_control,
+                )
+            )
 
     db.commit()
     db.refresh(settings)
@@ -1138,6 +1449,12 @@ def onboarding_update_profile(
         current_user.phone = data.phone
     if data.avatar_url is not None:
         current_user.avatar_url = data.avatar_url
+    emit(
+        db,
+        "onboarding_step_completed",
+        user=current_user,
+        properties={"step_key": "profile", "step_number": 1, "result": "success"},
+    )
     db.commit()
     db.refresh(current_user)
     return current_user
@@ -1149,7 +1466,20 @@ def onboarding_upload_avatar(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    file_url = upload_file_to_cloudinary(file, resource_type="image")
+    try:
+        file_url = upload_file_to_cloudinary(file, resource_type="image")
+    except Exception:
+        emit_after_commit(
+            "onboarding_step_failed",
+            user_id=current_user.id,
+            properties={
+                "step_key": "profile",
+                "error_code": "avatar_upload_failed",
+                "failure_class": "media_upload",
+                "result": "failure",
+            },
+        )
+        raise
     current_user.avatar_url = file_url
     db.commit()
     db.refresh(current_user)
@@ -1173,14 +1503,28 @@ def onboarding_update_workflow(
     selected: list[str] = []
     for value in data.workflow_types:
         if value not in allowed:
+            _record_onboarding_failure(current_user.id, "workflow", "invalid_workflow")
             raise HTTPException(status_code=400, detail="Invalid workflow type")
         if value not in selected:
             selected.append(value)
 
     if not selected:
+        _record_onboarding_failure(current_user.id, "workflow", "workflow_required")
         raise HTTPException(status_code=400, detail="Select at least one workflow")
 
     current_user.workflow_types = selected
+    emit(
+        db,
+        "onboarding_step_completed",
+        user=current_user,
+        properties={
+            "step_key": "workflow",
+            "step_number": 2,
+            "workflow_count": len(selected),
+            "primary_workflow": selected[0],
+            "result": "success",
+        },
+    )
     db.commit()
     db.refresh(current_user)
     return current_user
@@ -1206,6 +1550,7 @@ def onboarding_update_plan(
     """
     normalized = resolve_plan_key(data.plan)
     if normalized is None:
+        _record_onboarding_failure(current_user.id, "plan", "invalid_plan")
         raise HTTPException(status_code=400, detail="Invalid plan")
 
     if normalized in PAID_PLANS:
@@ -1222,12 +1567,36 @@ def onboarding_update_plan(
             # Not an error: picking Pro in onboarding and then going to
             # Checkout is the normal path. It just does not grant anything.
             current_user.selected_plan = normalized
+            emit(
+                db,
+                "onboarding_step_completed",
+                user=current_user,
+                properties={
+                    "step_key": "plan",
+                    "step_number": 3,
+                    "selected_plan": normalized,
+                    "checkout_required": True,
+                    "result": "success",
+                },
+            )
             db.commit()
             db.refresh(current_user)
             return current_user
 
     current_user.selected_plan = normalized
     current_user.plan = normalized
+    emit(
+        db,
+        "onboarding_step_completed",
+        user=current_user,
+        properties={
+            "step_key": "plan",
+            "step_number": 3,
+            "selected_plan": normalized,
+            "checkout_required": False,
+            "result": "success",
+        },
+    )
     db.commit()
     db.refresh(current_user)
     return current_user
@@ -1260,6 +1629,18 @@ def onboarding_complete_free(
     current_user.selected_plan = "free"
     current_user.plan = "free"
     current_user.onboarding_completed = True
+    emit(
+        db,
+        "onboarding_free_completed",
+        user=current_user,
+        properties={"selected_plan": "free", "result": "success"},
+    )
+    emit(
+        db,
+        "onboarding_completed",
+        user=current_user,
+        properties={"selected_plan": "free", "completion_path": "free", "result": "success"},
+    )
     db.commit()
     db.refresh(current_user)
     return current_user
@@ -1377,6 +1758,7 @@ def sso_callback(
     if not email:
         return RedirectResponse(url=f"{frontend_base}/login?sso_error=missing_email", status_code=302)
     user = db.query(User).filter(User.email == email).first()
+    created_new = user is None
     if not user:
         user = User(
             email=email,
@@ -1413,6 +1795,21 @@ def sso_callback(
             workspace_id=provider.workspace_id,
             metadata={"email": email},
         )
+        if created_new:
+            emit(
+                db,
+                "account_created",
+                user=user,
+                workspace_id=provider.workspace_id,
+                properties={"auth_method": "sso", "result": "success"},
+            )
+        emit(
+            db,
+            "mfa_challenge_required",
+            user=user,
+            workspace_id=provider.workspace_id,
+            properties={"auth_method": "sso", "mfa_method": "totp"},
+        )
         db.commit()
         return RedirectResponse(
             url=(
@@ -1422,6 +1819,22 @@ def sso_callback(
             status_code=302,
         )
 
+    if created_new:
+        emit(
+            db,
+            "account_created",
+            user=user,
+            workspace_id=provider.workspace_id,
+            properties={"auth_method": "sso", "result": "success"},
+        )
+    emit(
+        db,
+        "login_succeeded",
+        user=user,
+        workspace_id=provider.workspace_id,
+        properties={"auth_method": "sso", "mfa_used": False, "result": "success"},
+    )
+    returning_after_days = previous_user_activity_gap_days(db, user.id)
     session_id = create_user_session(db, user.id)
     app_access_token = create_access_token(
         data={"user_id": user.id, "onboarding_completed": user.onboarding_completed, "sid": session_id}
@@ -1443,6 +1856,7 @@ def sso_callback(
             f"{frontend_base}/google/callback?access_token={app_access_token}"
             f"&refresh_token={app_refresh_token}"
             f"&onboarding_completed={'true' if user.onboarding_completed else 'false'}"
+            f"&returning_after_days={returning_after_days if returning_after_days is not None else ''}"
             f"&next={url_quote(return_path, safe='')}"
         ),
         status_code=302,
@@ -1538,9 +1952,41 @@ def sso_google_mobile(payload: GoogleMobileTokenRequest, db: Session = Depends(g
             actor_type="user",
             metadata={"email": email},
         )
+        if created_new:
+            emit(
+                db,
+                "account_created",
+                user=user,
+                properties={"auth_method": "google_mobile", "result": "success"},
+            )
+        emit(
+            db,
+            "mfa_challenge_required",
+            user=user,
+            properties={"auth_method": "google_mobile", "mfa_method": "totp"},
+        )
         db.commit()
         return {"mfa_required": True, "challenge_token": challenge_token}
 
+    if created_new:
+        emit(
+            db,
+            "account_created",
+            user=user,
+            properties={"auth_method": "google_mobile", "result": "success"},
+        )
+    emit(
+        db,
+        "login_succeeded",
+        user=user,
+        properties={
+            "auth_method": "google_mobile",
+            "mfa_used": False,
+            "created_new": created_new,
+            "result": "success",
+        },
+    )
+    returning_after_days = previous_user_activity_gap_days(db, user.id)
     session_id = create_user_session(db, user.id)
     access_token = create_access_token(
         data={
@@ -1564,6 +2010,7 @@ def sso_google_mobile(payload: GoogleMobileTokenRequest, db: Session = Depends(g
         "access_token": access_token,
         "refresh_token": refresh_token,
         "onboarding_completed": bool(user.onboarding_completed),
+        "returning_after_days": returning_after_days,
     }
 
 

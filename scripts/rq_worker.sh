@@ -38,8 +38,8 @@ export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
 export PYTHONUNBUFFERED=1
 
 QUEUE="${1:-default}"
-echo "Starting RQ worker (queue=$QUEUE) with $VENV_DIR/bin/rq …"
+echo "Starting instrumented RQ worker (queue=$QUEUE) with $VENV_DIR/bin/python …"
 # SAM 2 / Metal cannot safely run in RQ's default forked work horse on macOS.
 # SimpleWorker executes inside this clean process and also avoids duplicating
 # multi-gigabyte model memory on Linux workers.
-exec "$VENV_DIR/bin/rq" worker --worker-class rq.SimpleWorker --verbose -u "$REDIS_URL" "$QUEUE"
+exec "$VENV_DIR/bin/python" -m app.rq_worker "$QUEUE"

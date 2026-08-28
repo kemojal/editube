@@ -16,8 +16,7 @@ def ugc_product_import_job(product_id: int) -> None:
     try:
         product = db.query(UgcProduct).filter(UgcProduct.id == product_id).first()
         if product is None:
-            logger.error("ugc_product_import_job: product %s not found", product_id)
-            return
+            raise RuntimeError(f"UGC product {product_id} was removed before import started")
         try:
             data = import_product(product.source_url)
             product.source_type = data.get("source_type") or product.source_type
@@ -45,5 +44,6 @@ def ugc_product_import_job(product_id: int) -> None:
                 product.status = "failed"
                 product.error_message = str(e)[:4000]
                 db.commit()
+            raise
     finally:
         db.close()

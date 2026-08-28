@@ -21,6 +21,8 @@ audience: this one is for a user handing the product to a friend.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -31,7 +33,19 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db.models import AccountCreditLedger, Referral, ReferralCode, User
+from app.db.models import (
+    AccountCreditLedger,
+    AffiliateAttribution,
+    Referral,
+    ReferralAdminAuditEvent,
+    ReferralCode,
+    ReferralEmailEvent,
+    ReferralEmailSuppression,
+    ReferralInviteDelivery,
+    UgcCreditLedger,
+    User,
+    Workspace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +79,8 @@ MAX_INVITE_SENDS = 2
 #: Ceiling on invite mails per referrer per day, independent of passes. Passes
 #: alone don't bound this — revoke-and-resend would otherwise loop forever.
 MAX_INVITE_SENDS_PER_DAY = 5
+MAX_DELIVERY_RETRIES = 2
+DELIVERY_RETRY_MINUTES = 15
 
 #: Alphabet without O/0/I/1/L — codes get read down a phone line.
 _CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
@@ -175,6 +191,10 @@ def passes_used(db: Session, referral_code: ReferralCode) -> int:
             Referral.status.in_(_PASS_CONSUMING_STATUSES),
             or_(
                 Referral.status != "invited",
+                Referral.capacity_released_at.is_(None),
+            ),
+            or_(
+                Referral.status != "invited",
                 Referral.invite_expires_at.is_(None),
                 Referral.invite_expires_at > now,
             ),
@@ -198,6 +218,7 @@ def expire_stale_invites(db: Session, referrer_user_id: int) -> int:
         .filter(
             Referral.referrer_user_id == referrer_user_id,
             Referral.status == "invited",
+            Referral.capacity_released_at.is_(None),
             Referral.invite_expires_at.isnot(None),
             Referral.invite_expires_at <= now,
         )
@@ -308,12 +329,117 @@ def grant_credits(
     try:
         with db.begin_nested():
             db.add(entry)
+            # Flush while the SAVEPOINT is active. Relying on the outer commit
+            # allowed an unreferenced pending ledger object to disappear from
+            # the session in SQLAlchemy 2/Python 3.14, while the referral state
+            # still committed. Financial state must never advance without its
+            # append-only ledger fact.
+            db.flush()
     except IntegrityError:
         logger.info(
             "credit grant already applied user=%s reason=%s ref=%s", user_id, reason, source_ref
         )
         return None
     return entry
+
+
+def transfer_credits_to_workspace(
+    db: Session,
+    *,
+    user: User,
+    workspace_id: int,
+    amount: int,
+    idempotency_key: str,
+) -> tuple[int, int]:
+    """Atomically move account credits into an owned workspace's UGC balance.
+
+    Referral rewards were previously a decorative number: no production
+    workflow ever debited the account ledger. This explicit transfer makes them
+    spendable by the existing UGC variation engine without allowing that engine
+    to silently drain a user's personal balance.
+    """
+    if amount < 1 or amount > 1_000_000:
+        raise ReferralInviteError("invalid_amount", "Transfer amount must be between 1 and 1,000,000 credits.")
+    key = (idempotency_key or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{12,120}", key):
+        raise ReferralInviteError("invalid_key", "A valid transfer idempotency key is required.")
+
+    workspace = (
+        db.query(Workspace)
+        .filter(Workspace.id == workspace_id)
+        .with_for_update()
+        .first()
+    )
+    if not workspace or workspace.owner_user_id != user.id:
+        raise ReferralInviteError("workspace_forbidden", "Only the workspace owner can transfer account credits.")
+
+    source_ref = f"workspace:{workspace_id}:transfer:{key}"
+    existing = (
+        db.query(AccountCreditLedger)
+        .filter(
+            AccountCreditLedger.user_id == user.id,
+            AccountCreditLedger.reason == "workspace_transfer",
+            AccountCreditLedger.source_ref == source_ref,
+        )
+        .first()
+    )
+    if existing:
+        return credit_balance(db, user.id), (
+            db.query(func.coalesce(func.sum(UgcCreditLedger.delta), 0))
+            .filter(UgcCreditLedger.workspace_id == workspace_id)
+            .scalar()
+            or 0
+        )
+
+    # Serialize transfers from the same account before reading its derived
+    # balance. Without the row lock, two requests can both spend the last 100.
+    db.query(User).filter(User.id == user.id).with_for_update().first()
+    available = credit_balance(db, user.id)
+    if available < amount:
+        raise ReferralInviteError("insufficient_credits", "Your account credit balance is too low.")
+    workspace_balance = (
+        db.query(func.coalesce(func.sum(UgcCreditLedger.delta), 0))
+        .filter(UgcCreditLedger.workspace_id == workspace_id)
+        .scalar()
+        or 0
+    )
+    debit = AccountCreditLedger(
+        user_id=user.id,
+        delta=-amount,
+        reason="workspace_transfer",
+        source_ref=source_ref,
+        description=f"Transferred to workspace {workspace.name}",
+    )
+    grant = UgcCreditLedger(
+        workspace_id=workspace_id,
+        delta=amount,
+        reason="account_credit_transfer",
+        period=f"account:{key}",
+        balance_after=workspace_balance + amount,
+    )
+    db.add_all([debit, grant])
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        # A concurrent retry may have won the account-ledger uniqueness key.
+        existing = (
+            db.query(AccountCreditLedger)
+            .filter(
+                AccountCreditLedger.user_id == user.id,
+                AccountCreditLedger.reason == "workspace_transfer",
+                AccountCreditLedger.source_ref == source_ref,
+            )
+            .first()
+        )
+        if not existing:
+            raise
+    return credit_balance(db, user.id), (
+        db.query(func.coalesce(func.sum(UgcCreditLedger.delta), 0))
+        .filter(UgcCreditLedger.workspace_id == workspace_id)
+        .scalar()
+        or 0
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -384,9 +510,23 @@ def redeem_referral_code(db: Session, invitee: User, code: str) -> Referral | No
     action) or merely worth ignoring (registration, which must not fail because
     a stale link was in the URL).
     """
+    locked_user = (
+        db.query(User).filter(User.id == invitee.id).with_for_update().first()
+    )
+    if not locked_user:
+        raise ReferralRedemptionError("not_found", "Account not found.")
     already = db.query(Referral).filter(Referral.invitee_user_id == invitee.id).first()
     if already:
         return already
+    if (
+        db.query(AffiliateAttribution.id)
+        .filter(AffiliateAttribution.invitee_user_id == invitee.id)
+        .first()
+    ):
+        raise ReferralRedemptionError(
+            "acquisition_conflict",
+            "This account is already attributed to an affiliate partner.",
+        )
 
     referral_code = find_code(db, code)
     if not referral_code or referral_code.revoked_at is not None:
@@ -459,21 +599,83 @@ def _normalize_email(value: str) -> str:
     return (value or "").strip().lower()
 
 
+def referral_email_hash(value: str) -> str | None:
+    """Create a stable suppression key isolated from click-correlation data."""
+    normalized = _normalize_email(value)
+    if not normalized:
+        return None
+    secret = (
+        os.getenv("REFERRAL_EMAIL_HASH_SECRET")
+        or os.getenv("AFFILIATE_HASH_SECRET")
+        or os.getenv("SECRET_KEY")
+        or os.getenv("JWT_SECRET_KEY")
+        or "local-referral-email-hash-secret"
+    )
+    return hmac.new(
+        secret.encode("utf-8"),
+        normalized.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _invites_sent_last_24h(db: Session, referrer_user_id: int) -> int:
     since = datetime.utcnow() - timedelta(hours=24)
     return (
-        db.query(func.count(Referral.id))
+        db.query(func.count(ReferralInviteDelivery.id))
         .filter(
-            Referral.referrer_user_id == referrer_user_id,
-            Referral.invite_last_sent_at.isnot(None),
-            Referral.invite_last_sent_at > since,
+            ReferralInviteDelivery.referrer_user_id == referrer_user_id,
+            ReferralInviteDelivery.created_at > since,
         )
         .scalar()
         or 0
     )
 
 
-def _deliver_invite(db: Session, referrer: User, referral: Referral) -> None:
+def active_email_suppression(
+    db: Session,
+    email: str,
+) -> ReferralEmailSuppression | None:
+    digest = referral_email_hash(email)
+    if not digest:
+        return None
+    now = datetime.utcnow()
+    suppression = (
+        db.query(ReferralEmailSuppression)
+        .filter(
+            ReferralEmailSuppression.email_hash == digest,
+            ReferralEmailSuppression.cleared_at.is_(None),
+            or_(
+                ReferralEmailSuppression.expires_at.is_(None),
+                ReferralEmailSuppression.expires_at > now,
+            ),
+        )
+        .first()
+    )
+    return suppression
+
+
+def _next_delivery_attempt(db: Session, referral_id: int) -> int:
+    return int(
+        db.query(func.coalesce(func.max(ReferralInviteDelivery.attempt_number), 0))
+        .filter(ReferralInviteDelivery.referral_id == referral_id)
+        .scalar()
+        or 0
+    ) + 1
+
+
+def _release_invite_capacity(referral: Referral, reason: str) -> None:
+    if referral.status == "invited" and referral.capacity_released_at is None:
+        referral.capacity_released_at = datetime.utcnow()
+        referral.capacity_release_reason = reason[:120]
+
+
+def _deliver_invite(
+    db: Session,
+    referrer: User,
+    referral: Referral,
+    *,
+    retry_count: int = 0,
+) -> None:
     """
     Put the mail on the wire, choosing which one by whether the address is
     already a customer.
@@ -488,6 +690,7 @@ def _deliver_invite(db: Session, referrer: User, referral: Referral) -> None:
         send_referral_invite_existing_account_email,
     )
 
+    referral_id = referral.id
     referrer_name = (referrer.full_name or referrer.name or "").strip()
     to_email = referral.invitee_email or ""
 
@@ -497,15 +700,46 @@ def _deliver_invite(db: Session, referrer: User, referral: Referral) -> None:
         .first()
     )
 
+    delivery = ReferralInviteDelivery(
+        referral_id=referral.id,
+        referrer_user_id=referrer.id,
+        attempt_number=_next_delivery_attempt(db, referral.id),
+        status="queued",
+        retry_count=retry_count,
+    )
+    db.add(delivery)
     try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        # The same resend request was already delivered by a concurrent worker.
+        return
+
+    suppression = active_email_suppression(db, to_email)
+    if suppression:
+        delivery.status = "suppressed"
+        delivery.suppression_reason = suppression.reason
+        delivery.last_attempt_at = datetime.utcnow()
+        _release_invite_capacity(referral, "email_suppressed")
+        db.commit()
+        return
+
+    if existing:
+        # Eligibility is known before the provider call. Release the finite
+        # guest-pass reservation even if the informational email later fails.
+        _release_invite_capacity(referral, "existing_account")
+        db.commit()
+
+    try:
+        delivery.last_attempt_at = datetime.utcnow()
         if existing:
-            send_referral_invite_existing_account_email(
+            sent = send_referral_invite_existing_account_email(
                 to_email=to_email,
                 referrer_name=referrer_name,
                 referrer_email=referrer.email or "",
             )
         else:
-            send_referral_invite_email(
+            sent = send_referral_invite_email(
                 to_email=to_email,
                 referrer_name=referrer_name,
                 referrer_email=referrer.email or "",
@@ -514,8 +748,257 @@ def _deliver_invite(db: Session, referrer: User, referral: Referral) -> None:
                 signup_credits=INVITEE_SIGNUP_CREDITS,
                 expires_days=INVITE_EXPIRY_DAYS,
             )
-    except Exception:
-        logger.exception("referral invite email failed referral=%s", referral.id)
+        delivery.status = "sent" if sent else "failed"
+        delivery.sent_at = datetime.utcnow() if sent else None
+        delivery.error_code = None if sent else "provider_rejected"
+        delivery.next_retry_at = (
+            datetime.utcnow() + timedelta(minutes=DELIVERY_RETRY_MINUTES * (2**retry_count))
+            if not sent and retry_count < MAX_DELIVERY_RETRIES
+            else None
+        )
+        if not existing and not sent and retry_count >= MAX_DELIVERY_RETRIES:
+            _release_invite_capacity(referral, "delivery_failed")
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        delivery = db.query(ReferralInviteDelivery).filter(ReferralInviteDelivery.id == delivery.id).first()
+        if delivery:
+            delivery.status = "failed"
+            delivery.error_code = type(exc).__name__[:120]
+            delivery.last_attempt_at = datetime.utcnow()
+            delivery.next_retry_at = (
+                datetime.utcnow() + timedelta(minutes=DELIVERY_RETRY_MINUTES * (2**retry_count))
+                if retry_count < MAX_DELIVERY_RETRIES
+                else None
+            )
+            if retry_count >= MAX_DELIVERY_RETRIES:
+                referral = db.query(Referral).filter(Referral.id == referral_id).first()
+                if referral:
+                    _release_invite_capacity(referral, "delivery_failed")
+            db.commit()
+        logger.exception("referral invite email failed referral=%s", referral_id)
+
+
+def retry_failed_invite_deliveries(db: Session, *, limit: int = 50) -> dict:
+    """Retry due provider failures with bounded exponential backoff."""
+    now = datetime.utcnow()
+    due = (
+        db.query(ReferralInviteDelivery)
+        .filter(
+            ReferralInviteDelivery.status == "failed",
+            ReferralInviteDelivery.next_retry_at.isnot(None),
+            ReferralInviteDelivery.next_retry_at <= now,
+            ReferralInviteDelivery.retry_count < MAX_DELIVERY_RETRIES,
+        )
+        .order_by(ReferralInviteDelivery.next_retry_at, ReferralInviteDelivery.id)
+        .with_for_update(skip_locked=True)
+        .limit(max(1, min(limit, 200)))
+        .all()
+    )
+    attempted = 0
+    for failed in due:
+        failed.next_retry_at = None
+        referral = db.query(Referral).filter(Referral.id == failed.referral_id).first()
+        referrer = db.query(User).filter(User.id == failed.referrer_user_id).first()
+        db.commit()
+        if not referral or not referrer or referral.status != "invited":
+            continue
+        _deliver_invite(
+            db,
+            referrer,
+            referral,
+            retry_count=failed.retry_count + 1,
+        )
+        attempted += 1
+    return {"attempted": attempted, "due": len(due)}
+
+
+def record_referral_email_event(
+    db: Session,
+    *,
+    provider_event_id: str,
+    email: str,
+    event_type: str,
+    occurred_at: datetime,
+) -> dict:
+    event_id = (provider_event_id or "").strip()
+    normalized_email = _normalize_email(email)
+    normalized_type = (event_type or "").strip().lower()
+    if not event_id or len(event_id) > 255 or not _EMAIL_RE.match(normalized_email):
+        raise ReferralInviteError("invalid_event", "Delivery event is invalid.")
+    if normalized_type not in {"delivered", "bounce", "complaint", "unsubscribe"}:
+        raise ReferralInviteError("invalid_event", "Delivery event type is unsupported.")
+    existing = (
+        db.query(ReferralEmailEvent)
+        .filter(ReferralEmailEvent.provider_event_id == event_id)
+        .first()
+    )
+    if existing:
+        return {"recorded": False, "suppressed": existing.event_type != "delivered"}
+    digest = referral_email_hash(normalized_email)
+    event = ReferralEmailEvent(
+        provider_event_id=event_id,
+        email_hash=digest,
+        event_type=normalized_type,
+        occurred_at=occurred_at,
+    )
+    db.add(event)
+    suppressed = normalized_type in {"bounce", "complaint", "unsubscribe"}
+    if suppressed:
+        suppression = (
+            db.query(ReferralEmailSuppression)
+            .filter(ReferralEmailSuppression.email_hash == digest)
+            .first()
+        )
+        if not suppression:
+            suppression = ReferralEmailSuppression(
+                email_hash=digest,
+                reason=normalized_type,
+                source="provider_webhook",
+                provider_event_id=event_id,
+            )
+            db.add(suppression)
+        else:
+            suppression.reason = normalized_type
+            suppression.source = "provider_webhook"
+            suppression.provider_event_id = suppression.provider_event_id or event_id
+            suppression.cleared_at = None
+            suppression.cleared_by_user_id = None
+            suppression.suppressed_at = datetime.utcnow()
+        affected = (
+            db.query(Referral)
+            .filter(
+                func.lower(Referral.invitee_email) == normalized_email,
+                Referral.status == "invited",
+            )
+            .all()
+        )
+        for referral in affected:
+            _release_invite_capacity(referral, f"email_{normalized_type}")
+            latest = (
+                db.query(ReferralInviteDelivery)
+                .filter(ReferralInviteDelivery.referral_id == referral.id)
+                .order_by(ReferralInviteDelivery.attempt_number.desc())
+                .first()
+            )
+            if latest and latest.status != "sent":
+                latest.status = "suppressed"
+                latest.suppression_reason = normalized_type
+                latest.next_retry_at = None
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"recorded": False, "suppressed": suppressed}
+    return {"recorded": True, "suppressed": suppressed}
+
+
+def referral_admin_audit(
+    db: Session,
+    event_type: str,
+    *,
+    actor_user_id: int,
+    subject_user_id: int | None = None,
+    source_ref: str | None = None,
+    payload: dict | None = None,
+) -> ReferralAdminAuditEvent:
+    event = ReferralAdminAuditEvent(
+        event_type=event_type,
+        actor_user_id=actor_user_id,
+        subject_user_id=subject_user_id,
+        source_ref=source_ref,
+        payload=payload,
+    )
+    db.add(event)
+    return event
+
+
+def set_referral_email_suppression(
+    db: Session,
+    *,
+    email: str,
+    reason: str,
+    admin: User,
+) -> ReferralEmailSuppression:
+    normalized = _normalize_email(email)
+    if not _EMAIL_RE.match(normalized):
+        raise ReferralInviteError("invalid_email", "Email address is invalid.")
+    clean_reason = (reason or "").strip()
+    if len(clean_reason) < 20:
+        raise ReferralInviteError("reason_required", "Record at least 20 characters explaining the suppression.")
+    digest = referral_email_hash(normalized)
+    suppression = (
+        db.query(ReferralEmailSuppression)
+        .filter(ReferralEmailSuppression.email_hash == digest)
+        .with_for_update()
+        .first()
+    )
+    if not suppression:
+        suppression = ReferralEmailSuppression(
+            email_hash=digest,
+            reason=clean_reason[:500],
+            source="admin",
+        )
+        db.add(suppression)
+    else:
+        suppression.reason = clean_reason[:500]
+        suppression.source = "admin"
+        suppression.cleared_at = None
+        suppression.cleared_by_user_id = None
+        suppression.expires_at = None
+        suppression.suppressed_at = datetime.utcnow()
+    affected = (
+        db.query(Referral)
+        .filter(
+            func.lower(Referral.invitee_email) == normalized,
+            Referral.status == "invited",
+        )
+        .all()
+    )
+    for referral in affected:
+        _release_invite_capacity(referral, "email_suppressed")
+    referral_admin_audit(
+        db,
+        "email.suppressed",
+        actor_user_id=admin.id,
+        source_ref=f"email-hash:{digest}",
+        payload={"affected_invites": len(affected)},
+    )
+    db.commit()
+    db.refresh(suppression)
+    return suppression
+
+
+def clear_referral_email_suppression(
+    db: Session,
+    *,
+    suppression: ReferralEmailSuppression,
+    admin: User,
+    reason: str,
+) -> ReferralEmailSuppression:
+    clean_reason = (reason or "").strip()
+    if len(clean_reason) < 20:
+        raise ReferralInviteError("reason_required", "Record at least 20 characters explaining the clearance.")
+    suppression = (
+        db.query(ReferralEmailSuppression)
+        .filter(ReferralEmailSuppression.id == suppression.id)
+        .with_for_update()
+        .first()
+    )
+    if not suppression:
+        raise ReferralInviteError("not_found", "Suppression not found.")
+    suppression.cleared_at = datetime.utcnow()
+    suppression.cleared_by_user_id = admin.id
+    referral_admin_audit(
+        db,
+        "email.suppression_cleared",
+        actor_user_id=admin.id,
+        source_ref=f"suppression:{suppression.id}",
+        payload={"reason": clean_reason[:500]},
+    )
+    db.commit()
+    db.refresh(suppression)
+    return suppression
 
 
 def send_email_invite(db: Session, referrer: User, email: str) -> Referral:
@@ -596,12 +1079,18 @@ def send_email_invite(db: Session, referrer: User, email: str) -> Referral:
     return referral
 
 
-def _owned_invite(db: Session, referrer_user_id: int, referral_id: int) -> Referral:
-    referral = (
+def _owned_invite(
+    db: Session,
+    referrer_user_id: int,
+    referral_id: int,
+    *,
+    lock: bool = False,
+) -> Referral:
+    query = (
         db.query(Referral)
         .filter(Referral.id == referral_id, Referral.referrer_user_id == referrer_user_id)
-        .first()
     )
+    referral = (query.with_for_update() if lock else query).first()
     if not referral:
         raise ReferralInviteError("not_found", "That invite no longer exists.")
     if referral.status != "invited":
@@ -612,7 +1101,16 @@ def _owned_invite(db: Session, referrer_user_id: int, referral_id: int) -> Refer
 def resend_email_invite(db: Session, referrer: User, referral_id: int) -> Referral:
     """One nudge, and only one. The cap is the difference between a reminder and a campaign."""
     expire_stale_invites(db, referrer.id)
-    referral = _owned_invite(db, referrer.id, referral_id)
+    candidate = _owned_invite(db, referrer.id, referral_id)
+    code = (
+        db.query(ReferralCode)
+        .filter(ReferralCode.id == candidate.referral_code_id)
+        .with_for_update()
+        .first()
+    )
+    if not code or code.revoked_at is not None:
+        raise ReferralInviteError("revoked", "Your invite link is no longer active.")
+    referral = _owned_invite(db, referrer.id, referral_id, lock=True)
 
     if referral.invite_sends >= MAX_INVITE_SENDS:
         raise ReferralInviteError(
@@ -643,7 +1141,7 @@ def revoke_email_invite(db: Session, referrer: User, referral_id: int) -> None:
     The link itself is the shared referral code, so this cannot un-send the
     email — what it does is stop holding a pass for someone who is not coming.
     """
-    referral = _owned_invite(db, referrer.id, referral_id)
+    referral = _owned_invite(db, referrer.id, referral_id, lock=True)
     referral.status = "expired"
     referral.invite_expires_at = datetime.utcnow()
     db.commit()
@@ -683,6 +1181,15 @@ def _claim_pending_invite(db: Session, referral_code: ReferralCode, invitee: Use
     )
     if not referral:
         return None
+
+    if referral.capacity_released_at is not None:
+        if passes_left(db, referral_code) <= 0:
+            return None
+        # The email reservation was released because delivery or eligibility
+        # failed, but the intended recipient has now arrived while capacity is
+        # still available. Re-reserve atomically under the code lock.
+        referral.capacity_released_at = None
+        referral.capacity_release_reason = None
 
     referral.invitee_user_id = invitee.id
     referral.status = "signed_up"
@@ -725,7 +1232,7 @@ def mark_pass_redeemed(db: Session, user_id: int) -> None:
 
 def sync_referral_from_subscription(db: Session, user: User, status: str | None, plan: str | None) -> None:
     """
-    Move a referral along as the friend's subscription changes, and pay out.
+    Move a referral into trialing as the friend's subscription changes.
 
     Called from the Stripe webhook path for whoever the subscription belongs to;
     a no-op for the overwhelming majority of users, who were never referred.
@@ -734,43 +1241,226 @@ def sync_referral_from_subscription(db: Session, user: User, status: str | None,
     """
     try:
         referral = active_referral_for_invitee(db, user.id)
-        if not referral or referral.status == "rewarded":
+        if not referral or referral.status in ("rewarded", "void"):
             return
-
-        paid_plan = (plan or user.plan or "").lower() in ("pro", "scale", "enterprise")
 
         if status == "trialing" and referral.status == "signed_up":
             referral.status = "trialing"
             db.commit()
             return
 
-        if status != "active" or not paid_plan:
-            return
+        # `active` is an entitlement state, not proof of payment. The reward is
+        # settled by `reward_referral_from_paid_invoice` from invoice.paid.
+        return
+    except Exception:  # pragma: no cover - defensive; webhook must still 200
+        db.rollback()
+        logger.exception("referral sync failed for user=%s", getattr(user, "id", None))
 
-        if referral.converted_at is None:
-            referral.converted_at = datetime.utcnow()
 
-        entry = grant_credits(
+def reward_referral_from_paid_invoice(
+    db: Session,
+    user: User,
+    stripe_invoice_id: str,
+) -> Referral | None:
+    """Pay a referral once Stripe confirms collected cash.
+
+    This deliberately includes every paid self-serve tier. The previous
+    subscription-status path excluded Basic even though pricing sells it as a
+    paid plan, and could reward an account before the first invoice cleared.
+    """
+    try:
+        referral = active_referral_for_invitee(db, user.id)
+        if not referral or referral.status == "void":
+            return None
+        if referral.status == "rewarded":
+            return referral
+        invoice_id = (stripe_invoice_id or "").strip()
+        if not invoice_id:
+            return None
+        now = datetime.utcnow()
+        referral.converted_at = referral.converted_at or now
+        referral.reward_source_invoice_id = invoice_id
+        grant_credits(
             db,
             user_id=referral.referrer_user_id,
             delta=REFERRER_REWARD_CREDITS,
             reason="referral_reward",
             source_ref=f"referral:{referral.id}",
-            description="A friend you invited subscribed",
+            description="A friend you invited made their first payment",
         )
-        # `None` means the grant already exists from an earlier delivery of this
-        # event; the referral should still settle into its final state.
         referral.status = "rewarded"
-        referral.rewarded_at = referral.rewarded_at or datetime.utcnow()
+        referral.rewarded_at = referral.rewarded_at or now
         referral.reward_credits = REFERRER_REWARD_CREDITS
         db.commit()
-        if entry is not None:
-            logger.info(
-                "referral rewarded referral=%s referrer=%s credits=%s",
-                referral.id,
-                referral.referrer_user_id,
-                REFERRER_REWARD_CREDITS,
-            )
-    except Exception:  # pragma: no cover - defensive; webhook must still 200
+        return referral
+    except Exception:  # pragma: no cover - webhook delivery must continue
         db.rollback()
-        logger.exception("referral sync failed for user=%s", getattr(user, "id", None))
+        logger.exception("referral invoice reward failed user=%s", getattr(user, "id", None))
+        return None
+
+
+def reverse_referral_reward_for_invoice(
+    db: Session,
+    stripe_invoice_id: str,
+) -> Referral | None:
+    """Reverse the fixed referral reward when its qualifying invoice is refunded."""
+    try:
+        invoice_id = (stripe_invoice_id or "").strip()
+        referral = (
+            db.query(Referral)
+            .filter(
+                Referral.reward_source_invoice_id == invoice_id,
+                Referral.reward_reversed_at.is_(None),
+            )
+            .with_for_update()
+            .first()
+        )
+        if not referral:
+            return None
+        credits = referral.reward_credits or REFERRER_REWARD_CREDITS
+        # Rows created before the dispute field existed may still be NULL until
+        # their migration backfill runs. Only an explicit True means a dispute
+        # has already removed the reward.
+        dispute_active = referral.reward_dispute_active is True
+        if not dispute_active and referral.status == "rewarded":
+            grant_credits(
+                db,
+                user_id=referral.referrer_user_id,
+                delta=-credits,
+                reason="reversal",
+                source_ref=f"referral:{referral.id}:invoice:{invoice_id}",
+                description="Referral reward reversed after the qualifying payment was refunded",
+            )
+        elif not dispute_active:
+            return None
+        referral.status = "void"
+        referral.void_reason = "refunded"
+        referral.reward_dispute_active = False
+        referral.reward_reversed_at = datetime.utcnow()
+        db.commit()
+        return referral
+    except Exception:  # pragma: no cover - webhook delivery must continue
+        db.rollback()
+        logger.exception("referral refund reversal failed invoice=%s", stripe_invoice_id)
+        return None
+
+
+def reverse_referral_reward_for_dispute(
+    db: Session,
+    *,
+    stripe_invoice_id: str,
+    stripe_charge_id: str,
+) -> Referral | None:
+    """Temporarily reverse a fixed referral reward while a charge is disputed."""
+    try:
+        invoice_id = (stripe_invoice_id or "").strip()
+        charge_id = (stripe_charge_id or "").strip()
+        referral = (
+            db.query(Referral)
+            .filter(
+                Referral.reward_source_invoice_id == invoice_id,
+                Referral.status == "rewarded",
+                Referral.reward_reversed_at.is_(None),
+                Referral.reward_dispute_active.is_(False),
+            )
+            .with_for_update()
+            .first()
+        )
+        if not referral:
+            return None
+        credits = referral.reward_credits or REFERRER_REWARD_CREDITS
+        grant_credits(
+            db,
+            user_id=referral.referrer_user_id,
+            delta=-credits,
+            reason="dispute_reversal",
+            source_ref=f"referral:{referral.id}:dispute:{charge_id}",
+            description="Referral reward held while the qualifying payment is disputed",
+        )
+        referral.status = "void"
+        referral.void_reason = "disputed"
+        referral.reward_dispute_active = True
+        db.commit()
+        return referral
+    except Exception:  # pragma: no cover - webhook delivery must continue
+        db.rollback()
+        logger.exception("referral dispute reversal failed invoice=%s", stripe_invoice_id)
+        return None
+
+
+def reinstate_referral_reward_after_dispute(
+    db: Session,
+    *,
+    stripe_invoice_id: str,
+    stripe_charge_id: str,
+) -> Referral | None:
+    """Restore a held reward only when Stripe closes the dispute as won."""
+    try:
+        invoice_id = (stripe_invoice_id or "").strip()
+        charge_id = (stripe_charge_id or "").strip()
+        referral = (
+            db.query(Referral)
+            .filter(
+                Referral.reward_source_invoice_id == invoice_id,
+                Referral.reward_dispute_active.is_(True),
+                Referral.reward_reversed_at.is_(None),
+            )
+            .with_for_update()
+            .first()
+        )
+        if not referral:
+            return None
+        credits = referral.reward_credits or REFERRER_REWARD_CREDITS
+        grant_credits(
+            db,
+            user_id=referral.referrer_user_id,
+            delta=credits,
+            reason="dispute_reinstatement",
+            source_ref=f"referral:{referral.id}:dispute:{charge_id}:won",
+            description="Referral reward restored after the payment dispute was won",
+        )
+        referral.status = "rewarded"
+        referral.void_reason = None
+        referral.reward_dispute_active = False
+        referral.reward_reinstated_at = datetime.utcnow()
+        db.commit()
+        return referral
+    except Exception:  # pragma: no cover - webhook delivery must continue
+        db.rollback()
+        logger.exception("referral dispute reinstatement failed invoice=%s", stripe_invoice_id)
+        return None
+
+
+def finalize_referral_reward_after_lost_dispute(
+    db: Session,
+    *,
+    stripe_invoice_id: str,
+) -> Referral | None:
+    """Make the temporary reward reversal permanent after a lost dispute."""
+    try:
+        invoice_id = (stripe_invoice_id or "").strip()
+        referral = (
+            db.query(Referral)
+            .filter(
+                Referral.reward_source_invoice_id == invoice_id,
+                Referral.reward_dispute_active.is_(True),
+                Referral.reward_reversed_at.is_(None),
+            )
+            .with_for_update()
+            .first()
+        )
+        if not referral:
+            return None
+        referral.status = "void"
+        referral.void_reason = "dispute_lost"
+        referral.reward_dispute_active = False
+        referral.reward_reversed_at = datetime.utcnow()
+        db.commit()
+        return referral
+    except Exception:  # pragma: no cover - webhook delivery must continue
+        db.rollback()
+        logger.exception(
+            "referral lost-dispute finalization failed invoice=%s",
+            stripe_invoice_id,
+        )
+        return None

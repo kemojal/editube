@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.db.database import SessionLocal
 from app.db.models import UgcCampaign, UgcVariation
 from app.services import ugc_credits
+from app.services.product_analytics import emit_once
 from app.services.ugc_render import render_variation
 
 logger = logging.getLogger(__name__)
@@ -29,13 +30,21 @@ def _set_progress(db: Session, variation_id: int, progress: int, status: str | N
     db.commit()
 
 
-def ugc_render_job(variation_id: int) -> None:
+def ugc_render_job(
+    variation_id: int,
+    feature_key: str = "ugc_render",
+    operation_id: str | None = None,
+) -> None:
+    lifecycle_feature = (
+        feature_key if feature_key in {"ugc_render", "ugc_regenerate"} else "ugc_render"
+    )
+    lifecycle_operation = operation_id or f"initial-{variation_id}"
     db: Session = SessionLocal()
     try:
         var = db.query(UgcVariation).filter(UgcVariation.id == variation_id).first()
         if var is None:
             logger.error("ugc_render_job: variation %s not found", variation_id)
-            return
+            raise RuntimeError(f"UGC variation {variation_id} not found")
 
         var.status = "rendering"
         var.render_progress = 0
@@ -49,10 +58,30 @@ def ugc_render_job(variation_id: int) -> None:
 
         var = db.query(UgcVariation).filter(UgcVariation.id == variation_id).first()
         if var is not None:
+            campaign = db.query(UgcCampaign).filter(UgcCampaign.id == var.campaign_id).first()
             var.status = "ready"
             var.render_progress = 100
             var.render_error = None
             var.completed_at = datetime.utcnow()
+            emit_once(
+                db,
+                "feature_completed",
+                event_id=(
+                    f"feature:{lifecycle_feature}:variation:{variation_id}:"
+                    f"operation:{lifecycle_operation}:completed"
+                ),
+                user_id=campaign.user_id if campaign else None,
+                workspace_id=campaign.workspace_id if campaign else None,
+                source="worker",
+                properties={
+                    "feature_key": lifecycle_feature,
+                    "campaign_id": var.campaign_id,
+                    "variation_id": var.id,
+                    "operation_id": lifecycle_operation,
+                    "completion_type": "variation_rendered",
+                    "result": "success",
+                },
+            )
             db.commit()
             _maybe_complete_campaign(db, var.campaign_id)
         logger.info("ugc_render_job: variation %s rendered", variation_id)
@@ -76,6 +105,28 @@ def ugc_render_job(variation_id: int) -> None:
                     ugc_credits.credit_cost_per_variation(),
                     variation_id=variation_id,
                 )
+                emit_once(
+                    db,
+                    "feature_failed",
+                    event_id=(
+                        f"feature:{lifecycle_feature}:variation:{variation_id}:"
+                        f"operation:{lifecycle_operation}:failed"
+                    ),
+                    user_id=campaign.user_id,
+                    workspace_id=campaign.workspace_id,
+                    source="worker",
+                    properties={
+                        "feature_key": lifecycle_feature,
+                        "campaign_id": campaign.id,
+                        "variation_id": variation_id,
+                        "operation_id": lifecycle_operation,
+                        "failure_class": "processing",
+                        "error_code": "render_failed",
+                        "result": "failure",
+                    },
+                )
+                db.commit()
+        raise
     finally:
         db.close()
 

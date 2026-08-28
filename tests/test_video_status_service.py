@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.db.models import ActivityFeed, VideoApproval
+from app.db.models import ActivityFeed, AnalyticsOutbox, VideoApproval
 from app.services.video_status import (
     DECISION_APPROVED,
     DECISION_CHANGES_REQUESTED,
@@ -157,6 +157,36 @@ class RecordDecisionTests:
         assert video.status == STATUS_APPROVED
         assert approval.decision == DECISION_APPROVED
         assert approval.video_id == video.id
+
+    def test_approval_emits_one_authoritative_review_and_feature_lifecycle(
+        self, db_session, make_video, make_user
+    ) -> None:
+        actor = make_user()
+        video = make_video(status=STATUS_IN_REVIEW)
+
+        approval = record_decision(
+            db_session,
+            video,
+            DECISION_APPROVED,
+            actor_user_id=actor.id,
+            note="Ready to publish.",
+        )
+        db_session.commit()
+
+        events = (
+            db_session.query(AnalyticsOutbox)
+            .filter(AnalyticsOutbox.properties["video_approval_id"].as_integer() == approval.id)
+            .all()
+        )
+        assert {event.event_name for event in events} == {
+            "review_approved",
+            "review_cycle_completed",
+            "feature_completed",
+            "feature_result_used",
+        }
+        assert all(event.user_id == actor.id for event in events)
+        assert all(event.properties["has_note"] is True for event in events)
+        assert all("note" not in event.properties for event in events)
 
     def test_changes_requested_moves_the_video_to_needs_changes(
         self, db_session, make_video, make_user

@@ -33,8 +33,7 @@ def clip_render_job(clip_id: int) -> None:
     try:
         clip = db.query(Clip).filter(Clip.id == clip_id).first()
         if clip is None:
-            logger.error("clip_render_job: clip %s not found", clip_id)
-            return
+            raise RuntimeError(f"Clip {clip_id} was removed before rendering started")
 
         clip.status = "rendering"
         clip.render_progress = 0
@@ -65,5 +64,6 @@ def clip_render_job(clip_id: int) -> None:
             clip.status = "failed"
             clip.render_error = str(e)[:4000]
             db.commit()
+        raise
     finally:
         db.close()

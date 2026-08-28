@@ -165,6 +165,23 @@ def never_touch_real_infrastructure(monkeypatch: pytest.MonkeyPatch) -> None:
     # the connection out from under them.
     monkeypatch.delenv("REDIS_URL", raising=False)
 
+    # A developer may have production request-log credentials in `.env`.
+    # Request logging is deliberately exercised only by focused tests with a
+    # fake writer; the general API suite must never enqueue into that database.
+    # Pin the explicit kill switch instead of deleting it: app.main calls
+    # load_dotenv() during import, and a deleted variable would be repopulated
+    # from a developer's local .env before TestClient starts the lifespan.
+    monkeypatch.setenv("LOG_REQUESTS_ENABLED", "0")
+    monkeypatch.setenv("LOG_WRITE_DATABASE_URL", "")
+    monkeypatch.setenv("LOG_READ_DATABASE_URL", "")
+    for name in (
+        "LOG_PAYLOAD_ENCRYPTION_KEY",
+        "LOG_PAYLOAD_ENCRYPTION_KEY_ID",
+        "LOG_PAYLOAD_DECRYPTION_KEYS",
+        "LOG_HMAC_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
     # Direct sends never touch the queue, so they need their own block.
     try:
         import app.utils.email as email_module

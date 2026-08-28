@@ -4,7 +4,7 @@ from typing import List, Optional
 import logging
 
 from app.db.database import get_db
-from app.db.models import Comment, Project, Video, VideoTranscription, User, Folder
+from app.db.models import Comment, DriveImport, Project, Video, VideoTranscription, User, Folder
 from app.services.project_access import assert_write_project_content, can_access_project
 from app.services.storage_policy import assert_storage_upload_allowed
 from app.api.video_payload import video_detail_dict, video_versions_payload
@@ -30,10 +30,13 @@ from app.services.notifications import (
     emit_notifications_sync,
 )
 from app.services.video_status import (
+    DECISION_APPROVED,
+    STATUS_APPROVED,
     STATUS_IN_REVIEW,
     IllegalStatusTransition,
     InvalidVideoStatus,
     apply_video_status,
+    record_decision,
     supersede_open_decisions,
 )
 from app.services.comment_carry_forward import (
@@ -48,6 +51,8 @@ from app.services.activity import log_activity
 from app.services.youtube_source_video import create_youtube_source_video
 from app.services.youtube_stream_resolve import YoutubeStreamResolveError
 from app.utils.language import normalize_language
+from app.services.product_analytics import emit, emit_once
+from app.services.ingest_service import record_ingested_video_result_use
 
 router = APIRouter(
     prefix="/projects/{project_id}/videos",
@@ -94,6 +99,8 @@ def _finalize_project_video(
     version_group_id: str,
     language: Optional[str],
     activity_action: str,
+    source_type: str = "upload",
+    integration_import_id: int | None = None,
     version_notes: Optional[str] = None,
     base_video: Optional[Video] = None,
 ) -> Video:
@@ -117,6 +124,7 @@ def _finalize_project_video(
         file_path=file_path,
         size_bytes=size_bytes,
         uploader_id=current_user.id,
+        ingest_source=source_type,
         version_notes=(version_notes or None),
     )
     db.add(db_video)
@@ -200,12 +208,69 @@ def _finalize_project_video(
         action=activity_action,
         meta={"video_name": name, "video_id": db_video.id},
     )
+    project_row = db.query(Project).filter(Project.id == project_id).first()
+    workspace_id = project_row.workspace_id if project_row else None
+    project_video_count = db.query(Video.id).filter(Video.project_id == project_id).count()
+    event_properties = {
+        "feature_key": "media_import",
+        "project_id": project_id,
+        "video_id": db_video.id,
+        "source_type": source_type,
+        "is_new_version": base_video is not None,
+        "version_number": version,
+        "size_bytes": max(0, int(size_bytes or 0)),
+        "result": "success",
+    }
+    emit(
+        db,
+        "upload_completed",
+        user=current_user,
+        workspace_id=workspace_id,
+        properties=event_properties,
+    )
+    emit(
+        db,
+        "feature_completed",
+        user=current_user,
+        workspace_id=workspace_id,
+        properties={**event_properties, "completion_type": "media_registered"},
+    )
+    if source_type == "google_drive" and integration_import_id is not None:
+        emit_once(
+            db,
+            "feature_result_used",
+            event_id=f"feature:google-drive:import:{integration_import_id}:attached",
+            user=current_user,
+            workspace_id=workspace_id,
+            properties={
+                "feature_key": "google_drive",
+                "project_id": project_id,
+                "video_id": db_video.id,
+                "import_id": integration_import_id,
+                "result_action": "imported_media_attached",
+                "result": "success",
+            },
+        )
+    if project_video_count == 1:
+        emit(
+            db,
+            "project_setup_started",
+            user=current_user,
+            workspace_id=workspace_id,
+            properties={
+                "project_id": project_id,
+                "video_id": db_video.id,
+                "source_type": source_type,
+                "result": "success",
+            },
+        )
     db.commit()
 
     try:
         from app.jobs.queue import enqueue_transcription_job
 
-        if enqueue_transcription_job(db_video.id, language=normalized_language):
+        queued_job_id = enqueue_transcription_job(db_video.id, language=normalized_language)
+        if queued_job_id:
             row = (
                 db.query(VideoTranscription)
                 .filter(VideoTranscription.video_id == db_video.id)
@@ -322,6 +387,7 @@ def upload_video(
         version_group_id=version_group_id,
         language=language,
         activity_action="video_uploaded",
+        source_type="direct_upload",
         version_notes=version_notes,
         base_video=base_video,
     )
@@ -383,6 +449,34 @@ def create_video_from_youtube(
         action="video_uploaded",
         meta={"video_name": db_video.name, "video_id": db_video.id, "source": "youtube_url"},
     )
+    emit(
+        db,
+        "upload_completed",
+        user=current_user,
+        workspace_id=db_project.workspace_id,
+        properties={
+            "feature_key": "media_import",
+            "project_id": project_id,
+            "video_id": db_video.id,
+            "source_type": "youtube",
+            "is_new_version": False,
+            "result": "success",
+        },
+    )
+    emit(
+        db,
+        "feature_completed",
+        user=current_user,
+        workspace_id=db_project.workspace_id,
+        properties={
+            "feature_key": "media_import",
+            "project_id": project_id,
+            "video_id": db_video.id,
+            "source_type": "youtube",
+            "completion_type": "media_registered",
+            "result": "success",
+        },
+    )
     db.commit()
 
     db_video = (
@@ -422,6 +516,26 @@ def register_uploaded_video(
     file_path = (body.file_path or "").strip()
     if not file_path:
         raise HTTPException(status_code=400, detail="file_path is required")
+
+    source_type = "presigned_upload"
+    integration_import_id = None
+    if body.drive_import_id is not None:
+        drive_import = (
+            db.query(DriveImport)
+            .filter(
+                DriveImport.id == body.drive_import_id,
+                DriveImport.user_id == current_user.id,
+            )
+            .first()
+        )
+        if drive_import is None:
+            raise HTTPException(status_code=404, detail="Drive import not found")
+        if drive_import.status != "completed" or not drive_import.file_path:
+            raise HTTPException(status_code=409, detail="Drive import is not complete")
+        if drive_import.file_path != file_path:
+            raise HTTPException(status_code=400, detail="Drive import does not match file_path")
+        source_type = "google_drive"
+        integration_import_id = drive_import.id
 
     if body.folder_id is not None:
         folder = db.query(Folder).filter(Folder.id == body.folder_id, Folder.project_id == project_id).first()
@@ -483,6 +597,8 @@ def register_uploaded_video(
         version_group_id=version_group_id,
         language=body.language,
         activity_action="video_uploaded",
+        source_type=source_type,
+        integration_import_id=integration_import_id,
         version_notes=body.version_notes,
         base_video=base_video,
     )
@@ -533,6 +649,11 @@ def get_video(
     detail["project"] = db_project
     # All versions in this video's chain (same version_group_id), newest first.
     detail["versions"] = video_versions_payload(db, db_video)
+    record_ingested_video_result_use(
+        video=db_video,
+        user_id=current_user.id,
+        workspace_id=db_project.workspace_id if db_project else None,
+    )
     return detail
 
 
@@ -654,7 +775,16 @@ def update_video_status(
     # service — this handler and its twin in video_detail.py used to carry
     # their own copies of the status tuple and silently allowed any move.
     try:
-        apply_video_status(db, db_video, data.status, actor_user_id=current_user.id)
+        if data.status == STATUS_APPROVED:
+            record_decision(
+                db,
+                db_video,
+                DECISION_APPROVED,
+                actor_user_id=current_user.id,
+                skip_transition_check=False,
+            )
+        else:
+            apply_video_status(db, db_video, data.status, actor_user_id=current_user.id)
     except (InvalidVideoStatus, IllegalStatusTransition) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

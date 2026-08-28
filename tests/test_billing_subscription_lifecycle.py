@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from app.db.models import (
+    CheckoutAttempt,
     StripePrice,
     StripeProduct,
     Subscription,
@@ -404,11 +405,35 @@ class TestCheckout:
         assert resp.status_code == 200
         assert "/dashboard?account=billing" in fake_stripe.checkout_calls[-1]["cancel_url"]
 
+    def test_cancel_return_closes_latest_open_checkout_attempt(
+        self, api_client, subscriber, catalog, fake_stripe, db_session
+    ):
+        client = api_client.login(subscriber)
+        created = client.post(
+            "/billing/checkout", json={"plan": "pro", "interval": "month"}
+        )
+        assert created.status_code == 200
+        attempt = db_session.query(CheckoutAttempt).filter_by(user_id=subscriber.id).one()
+        assert attempt.status == "created"
+
+        canceled = client.post("/billing/checkout-canceled", json={})
+
+        assert canceled.status_code == 200
+        assert canceled.json() == {"recorded": True}
+        db_session.refresh(attempt)
+        assert attempt.status == "canceled"
+        assert attempt.canceled_at is not None
+
+        repeated = client.post("/billing/checkout-canceled", json={})
+        assert repeated.status_code == 200
+        assert repeated.json() == {"recorded": False}
+
     def test_checkout_requires_authentication(self, api_client, catalog, fake_stripe):
         resp = api_client.logout().post(
             "/billing/checkout", json={"plan": "pro", "interval": "month"}
         )
         assert resp.status_code == 401
+        assert api_client.post("/billing/checkout-canceled", json={}).status_code == 401
 
 
 # --- Provisioning: what a completed checkout grants ---------------------------

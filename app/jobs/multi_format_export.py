@@ -31,16 +31,16 @@ def multi_format_export_job(export_id: int) -> None:
         exp = db.query(DeliveryExport).filter(DeliveryExport.id == export_id).first()
         if not exp:
             logger.error("multi_format_export_job: export %s not found", export_id)
-            return
+            raise RuntimeError(f"Delivery export {export_id} not found")
         profile = _PROFILES.get(exp.profile_key)
         if not profile:
             _fail(db, exp, f"Unknown profile key: {exp.profile_key}")
-            return
+            raise RuntimeError("Unknown delivery export profile")
 
         video = db.query(Video).filter(Video.id == exp.video_id).first()
         if not video or not video.file_path:
             _fail(db, exp, "Video or file_path missing.")
-            return
+            raise RuntimeError("Video or file_path missing")
 
         exp.status = "processing"
         exp.error_message = None
@@ -88,7 +88,7 @@ def multi_format_export_job(export_id: int) -> None:
             if proc.returncode != 0:
                 err = (proc.stderr or proc.stdout or "")[:4000]
                 _fail(db, exp, f"ffmpeg failed: {err}")
-                return
+                raise RuntimeError("Multi-format export ffmpeg failed")
 
             from app.storage import build_key, get_storage, guess_content_type
 
@@ -101,7 +101,7 @@ def multi_format_export_job(export_id: int) -> None:
             url = get_storage().upload_path(dst, key=_key, content_type=_ct).url
             if not url:
                 _fail(db, exp, "Storage returned no URL.")
-                return
+                raise RuntimeError("Multi-format export storage returned no URL")
 
             exp.status = "completed"
             exp.output_path = url
@@ -120,6 +120,7 @@ def multi_format_export_job(export_id: int) -> None:
                 _fail(db, exp, str(e)[:4000])
         except Exception:
             pass
+        raise
     finally:
         db.close()
 

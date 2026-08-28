@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "environment": "production",
+  "owner": "engineering",
+  "monitors": [
+    {
+      "key": "frontend-unresolved-errors",
+      "name": "Editube — Frontend unresolved errors",
+      "project_env": "SENTRY_FRONTEND_PROJECT",
+      "description": "Browser and Next.js errors affecting the production frontend.",
+      "aggregate": "count()",
+      "dataset": "events",
+      "event_types": ["default", "error"],
+      "query": "is:unresolved",
+      "time_window_seconds": 300,
+      "critical_above": 10,
+      "resolve_at_or_below": 2
+    },
+    {
+      "key": "frontend-affected-users",
+      "name": "Editube — Frontend affected users",
+      "project_env": "SENTRY_FRONTEND_PROJECT",
+      "description": "Distinct production users affected by unresolved frontend errors.",
+      "aggregate": "count_unique(tags[sentry:user])",
+      "dataset": "events",
+      "event_types": ["default", "error"],
+      "query": "is:unresolved",
+      "time_window_seconds": 3600,
+      "critical_above": 5,
+      "resolve_at_or_below": 1
+    },
+    {
+      "key": "api-unresolved-errors",
+      "name": "Editube — API unresolved errors",
+      "project_env": "SENTRY_API_PROJECT",
+      "description": "FastAPI errors affecting production requests.",
+      "aggregate": "count()",
+      "dataset": "events",
+      "event_types": ["default", "error"],
+      "query": "is:unresolved",
+      "time_window_seconds": 300,
+      "critical_above": 10,
+      "resolve_at_or_below": 2
+    },
+    {
+      "key": "api-affected-users",
+      "name": "Editube — API affected users",
+      "project_env": "SENTRY_API_PROJECT",
+      "description": "Distinct production users affected by unresolved API errors.",
+      "aggregate": "count_unique(tags[sentry:user])",
+      "dataset": "events",
+      "event_types": ["default", "error"],
+      "query": "is:unresolved",
+      "time_window_seconds": 3600,
+      "critical_above": 5,
+      "resolve_at_or_below": 1
+    },
+    {
+      "key": "worker-unresolved-errors",
+      "name": "Editube — Worker unresolved errors",
+      "project_env": "SENTRY_WORKER_PROJECT",
+      "description": "RQ and media-processing errors in production workers.",
+      "aggregate": "count()",
+      "dataset": "events",
+      "event_types": ["default", "error"],
+      "query": "is:unresolved",
+      "time_window_seconds": 300,
+      "critical_above": 5,
+      "resolve_at_or_below": 1
+    }
+  ],
+  "workflow": {
+    "name": "Editube — Notify engineering of reliability regressions",
+    "frequency_minutes": 30,
+    "trigger_types": ["first_seen_event", "reappeared_event", "regression_event", "new_high_priority_issue", "existing_high_priority_issue"],
+    "action": "notify_issue_owners_with_active_member_fallback"
+  }
+}
