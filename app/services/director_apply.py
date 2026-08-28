@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db.models import AiResult, DirectorPlan, GeneratedMedia
+from app.db.models import DirectorPlan, GeneratedMedia
 from app.services.director_compile import compile_plan, revert_plan
 from app.services.director_context import build_context
 
@@ -43,31 +43,23 @@ class Applied:
     warnings: list[str]
 
 
-def _draft_row(db: Any, video_id: int) -> AiResult:
-    row = (
-        db.query(AiResult)
-        .filter(AiResult.video_id == video_id, AiResult.result_type == "rough_cut_draft")
-        .first()
-    )
-    if row is None:
-        row = AiResult(video_id=video_id, result_type="rough_cut_draft", status="completed")
-        db.add(row)
-        db.flush()
-    return row
-
-
 def apply_plan(db: Any, plan_row: DirectorPlan) -> Applied:
-    """Compile the plan into the video's rough-cut draft."""
+    """Compile the plan into the project's rough-cut draft.
+
+    Writes through `draft_store` under its optimistic-concurrency loop: the
+    old path read the blob and wrote it back with no revision check, which
+    could lose a concurrent autosave (the exact lost-update the spec's §9.2
+    "never clobber" rule existed to prevent). Because the plan row and the
+    draft share one session, the store's commit lands both atomically.
+    """
     if plan_row.status not in APPLICABLE:
         raise NotApplicable(f"A {plan_row.status} run cannot be applied")
     plan = plan_row.plan if isinstance(plan_row.plan, dict) else None
     if not plan:
         raise NotApplicable("This run has no plan to apply")
 
-    draft_row = _draft_row(db, plan_row.video_id)
-    draft = dict(draft_row.result_data or {}) if isinstance(draft_row.result_data, dict) else {}
-
     from app.db.models import Video, VideoTranscription
+    from app.services import draft_store
 
     video = db.query(Video).filter(Video.id == plan_row.video_id).first()
     transcription = (
@@ -77,18 +69,6 @@ def apply_plan(db: Any, plan_row: DirectorPlan) -> Applied:
     )
     segments = transcription.segments if transcription and transcription.segments else []
 
-    # Rebuilt from the draft *as it is now*, not as it was when the plan was
-    # written. If the user has re-cut since, the anchors resolve against the
-    # current cut — which is the whole reason shots are anchored to words
-    # rather than to timestamps.
-    context = build_context(
-        segments=segments,
-        keep_ranges=draft.get("keepRanges") or [],
-        source_duration=float(getattr(video, "duration", 0) or 0)
-        or float(draft.get("sourceDuration") or 0),
-        aspect=str((draft.get("layoutStyle") or {}).get("aspect") or "16:9"),
-    )
-
     assets = {
         str(asset.director_directive_id): asset
         for asset in db.query(GeneratedMedia)
@@ -97,23 +77,50 @@ def apply_plan(db: Any, plan_row: DirectorPlan) -> Applied:
         if asset.director_directive_id
     }
 
-    compiled = compile_plan(
-        draft,
-        plan,
-        context=context,
-        assets_by_directive=assets,
-        plan_id=plan_row.id,
-        applied_at=datetime.now(timezone.utc).isoformat(),
-    )
+    box: dict[str, Any] = {}
+    # Captured once: the store's conflict-retry loop may run the mutator more
+    # than once, and appending to the row's own list each time would duplicate.
+    base_warnings = list(plan_row.warnings or [])
 
-    draft_row.result_data = compiled.draft
-    draft_row.status = "completed"
-    plan_row.applied_manifest = compiled.manifest
-    plan_row.applied_at = datetime.now(timezone.utc)
-    plan_row.status = "applied"
-    plan_row.stage = f"Applied — {compiled.placed} shot(s) on the timeline"
-    plan_row.warnings = list(plan_row.warnings or []) + compiled.warnings
-    db.commit()
+    def _mutator(draft: dict[str, Any]) -> dict[str, Any]:
+        # Rebuilt from the draft *as it is now*, not as it was when the plan
+        # was written. If the user has re-cut since, the anchors resolve
+        # against the current cut — which is the whole reason shots are
+        # anchored to words rather than to timestamps.
+        context = build_context(
+            segments=segments,
+            keep_ranges=draft.get("keepRanges") or [],
+            source_duration=float(getattr(video, "duration", 0) or 0)
+            or float(draft.get("sourceDuration") or 0),
+            aspect=str((draft.get("layoutStyle") or {}).get("aspect") or "16:9"),
+        )
+        compiled = compile_plan(
+            draft,
+            plan,
+            context=context,
+            assets_by_directive=assets,
+            plan_id=plan_row.id,
+            applied_at=datetime.now(timezone.utc).isoformat(),
+        )
+        box["compiled"] = compiled
+        # Same session: these land in the store's commit, atomically with the
+        # draft write — a crash cannot leave an applied draft with no manifest.
+        plan_row.applied_manifest = compiled.manifest
+        plan_row.applied_at = datetime.now(timezone.utc)
+        plan_row.status = "applied"
+        plan_row.stage = f"Applied — {compiled.placed} shot(s) on the timeline"
+        plan_row.warnings = base_warnings + compiled.warnings
+        return compiled.draft
+
+    draft_store.mutate_draft(
+        db,
+        plan_row.project_id,
+        _mutator,
+        writer="director",
+        video_id=plan_row.video_id,
+        source_id=f"director:{plan_row.id}",
+    )
+    compiled = box["compiled"]
 
     logger.info(
         "Applied director plan %s to video %s: %s shot(s)",
@@ -134,17 +141,25 @@ def revert(db: Any, plan_row: DirectorPlan) -> bool:
     if plan_row.status != "applied" or not manifest:
         return False
 
-    draft_row = _draft_row(db, plan_row.video_id)
-    draft = dict(draft_row.result_data or {}) if isinstance(draft_row.result_data, dict) else {}
+    from app.services import draft_store
 
-    draft_row.result_data = revert_plan(draft, manifest)
-    # Back to the state it was in before applying, so it can be applied again
-    # without re-planning or re-generating anything.
-    plan_row.status = "ready"
-    plan_row.stage = "Reverted"
-    plan_row.applied_manifest = None
-    plan_row.applied_at = None
-    db.commit()
+    def _mutator(draft: dict[str, Any]) -> dict[str, Any]:
+        # Back to the state it was in before applying, so it can be applied
+        # again without re-planning or re-generating anything.
+        plan_row.status = "ready"
+        plan_row.stage = "Reverted"
+        plan_row.applied_manifest = None
+        plan_row.applied_at = None
+        return revert_plan(draft, manifest)
+
+    draft_store.mutate_draft(
+        db,
+        plan_row.project_id,
+        _mutator,
+        writer="director",
+        video_id=plan_row.video_id,
+        source_id=f"director:{plan_row.id}:revert",
+    )
 
     logger.info("Reverted director plan %s from video %s", plan_row.id, plan_row.video_id)
     return True

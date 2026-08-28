@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from .routes import users, projects, videos, video_detail, comments, notifications, activity_feeds, upload, annotations, google_account_integration, youtube_oauth, google_drive, folders, billing, referrals, affiliates, analytics, review_links, review_workflows, ai, creator, freelancer, suggestions, community_forum, workspaces, public_workspace, project_tasks, review_inbox, delivery, security_audit, editor_integrations, proxy, watch_folder, ingest, clips, ugc, ai_media, director, mcp, zoom, caption_templates
+from .routes import users, projects, videos, video_detail, comments, notifications, activity_feeds, upload, annotations, google_account_integration, youtube_oauth, google_drive, folders, billing, referrals, affiliates, analytics, review_links, review_workflows, ai, creator, freelancer, suggestions, community_forum, workspaces, public_workspace, project_tasks, review_inbox, delivery, security_audit, editor_integrations, proxy, watch_folder, ingest, clips, ugc, ai_media, director, harness, mcp, zoom, caption_templates
 # google_account_integration
 
 api_router = APIRouter()
@@ -35,6 +35,8 @@ api_router.include_router(review_links.public_router)
 api_router.include_router(ai.router)
 api_router.include_router(ai_media.router)
 api_router.include_router(director.router)
+api_router.include_router(harness.router)
+api_router.include_router(harness.runs_router)
 api_router.include_router(creator.router)
 api_router.include_router(freelancer.router)
 api_router.include_router(freelancer.public_router)

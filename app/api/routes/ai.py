@@ -4,6 +4,7 @@ import json
 import os
 import re
 import uuid
+from copy import deepcopy
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -27,10 +28,11 @@ from app.services.auto_edit import (
 from app.services.video_review import build_review, empty_review
 from app.utils.cloudinary import upload_image_bytes
 from app.utils.security import get_current_user
-from app.services.project_access import can_access_project
+from app.services.project_access import assert_write_project_content, can_access_project
+from app.services import draft_store
 from app.services.rough_cut_workspace import (
-    get_workspace_draft,
-    prepare_workspace_save,
+    WORKSPACE_PERSISTENCE_KEY,
+    WORKSPACE_SCHEMA_VERSION,
 )
 from app.services.job_analytics import record_job_canceled
 from app.services.product_analytics import emit
@@ -570,21 +572,29 @@ def get_rough_cut_draft(
     current_user: User = Depends(get_current_user),
 ):
     requested_video = _check_video_access(video_id, db, current_user)
-    workspace_video, row = get_workspace_draft(db, requested_video)
-    if row is None:
+    # Reads never write. The legacy asset-draft merge that used to commit from
+    # inside this handler happens in memory in the store and is persisted only
+    # by the next save.
+    view = draft_store.get_draft_for_video(db, requested_video)
+    if view.row is None and not view.payload:
         return {
-            "video_id": workspace_video.id,
+            "video_id": view.video_id or requested_video.id,
             "result_type": "rough_cut_draft",
             "status": "pending",
             "result_data": None,
+            "updated_at": None,
+            "revision": 0,
+            "checksum": None,
         }
     return {
-        "video_id": row.video_id,
-        "result_type": row.result_type,
-        "status": row.status,
-        "result_data": row.result_data,
-        "error_message": row.error_message,
-        "updated_at": row.updated_at,
+        "video_id": view.video_id or requested_video.id,
+        "result_type": "rough_cut_draft",
+        "status": "completed",
+        "result_data": view.payload,
+        "error_message": None,
+        "updated_at": view.row.updated_at if view.row is not None else None,
+        "revision": view.revision,
+        "checksum": view.checksum,
     }
 
 
@@ -624,6 +634,22 @@ class RoughCutDraftBody(BaseModel):
     inspectorOpen: bool | None = None
     updatedAt: str | None = None
     magneticTimeline: bool | None = None
+    #: Optimistic concurrency. When supplied, a stale save returns 409 with the
+    #: current revision instead of silently clobbering another writer.
+    expected_revision: int | None = None
+
+
+#: Draft keys that hold the actual edit. A PUT that omits one of these keeps
+#: the stored value instead of resetting it to the model default — the
+#: create-project wizard's 7-key seed body used to wipe the whole timeline
+#: this way (plan §5.2 G2).
+_DRAFT_STRUCTURAL_KEYS = (
+    "keepRanges", "audioKeepRanges", "mutedRanges", "markers", "segments",
+    "clipAttributes", "timelineMediaItems", "timelineTracks", "trackState",
+    "transitions", "lowerThirds", "elementOverlays", "gridClips",
+    "textOverlay", "textOverlays", "transcriptComments", "speakerIdentities",
+    "wordHighlights", "wordFormats", "wordTextOverrides", "captionStyle",
+)
 
 
 @router.put("/{video_id}/ai/rough-cut-draft")
@@ -634,18 +660,62 @@ def save_rough_cut_draft(
     current_user: User = Depends(get_current_user),
 ):
     requested_video = _check_video_access(video_id, db, current_user)
-    _, existing_row = get_workspace_draft(db, requested_video)
-    previous_payload = (
-        dict(existing_row.result_data)
-        if existing_row is not None and isinstance(existing_row.result_data, dict)
-        else {}
+    # Writing a timeline is content mutation. The old read-level check let a
+    # guest workspace member PUT the whole draft.
+    project = db.query(Project).filter(Project.id == requested_video.project_id).first()
+    assert_write_project_content(db, current_user, project)
+
+    view = draft_store.get_draft_for_video(db, requested_video)
+    previous_payload = dict(view.payload)
+
+    sent_keys = set(body.model_fields_set) | set((body.model_extra or {}).keys())
+    payload = body.model_dump(mode="json", exclude_none=False)
+    payload.pop("expected_revision", None)
+    # Declared fields the client did not send are not writes: keep the stored
+    # value when one exists, and never inject a bare default (`effectJobs: []`
+    # used to appear on every save without any client ever sending it).
+    for key in list(payload.keys()):
+        if key in sent_keys:
+            continue
+        if key in previous_payload:
+            payload[key] = deepcopy(previous_payload[key])
+        elif key in _DRAFT_STRUCTURAL_KEYS or key == "effectJobs":
+            payload.pop(key, None)
+    # Structural keys that are undeclared extras (`timelineMediaItems`,
+    # `transitions`, …) are simply absent from the dump when unsent — carry
+    # the stored value over so a partial body cannot wipe them either.
+    for key in _DRAFT_STRUCTURAL_KEYS:
+        if key not in sent_keys and key not in payload and key in previous_payload:
+            payload[key] = deepcopy(previous_payload[key])
+
+    metadata = previous_payload.get(WORKSPACE_PERSISTENCE_KEY)
+    payload[WORKSPACE_PERSISTENCE_KEY] = (
+        dict(metadata)
+        if isinstance(metadata, dict)
+        else {"schemaVersion": WORKSPACE_SCHEMA_VERSION, "legacyDraftVideoIds": []}
     )
-    workspace_video, payload = prepare_workspace_save(
-        db,
-        requested_video,
-        body.model_dump(mode="json", exclude_none=False),
-    )
-    project = db.query(Project).filter(Project.id == workspace_video.project_id).first()
+
+    try:
+        saved = draft_store.save_draft(
+            db,
+            requested_video.project_id,
+            payload,
+            writer="editor",
+            expected_revision=body.expected_revision,
+            video_id=view.video_id or requested_video.id,
+            user_id=current_user.id,
+        )
+    except draft_store.DraftConflict as conflict:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "draft_conflict",
+                "message": str(conflict),
+                "current_revision": conflict.current_revision,
+                "checksum": conflict.current_checksum,
+            },
+        ) from conflict
+
     for feature_key in changed_active_editor_features(previous_payload, payload):
         emit(
             db,
@@ -654,19 +724,20 @@ def save_rough_cut_draft(
             workspace_id=project.workspace_id if project else None,
             properties={
                 "feature_key": feature_key,
-                "project_id": workspace_video.project_id,
-                "video_id": workspace_video.id,
+                "project_id": requested_video.project_id,
+                "video_id": saved.video_id or requested_video.id,
                 "completion_type": "draft_saved",
                 "result": "success",
             },
         )
-    return _upsert_result(
-        db,
-        workspace_video.id,
-        "rough_cut_draft",
-        payload,
-        status="completed",
-    )
+    return {
+        "video_id": saved.video_id or requested_video.id,
+        "result_type": "rough_cut_draft",
+        "status": "completed",
+        "result_data": saved.payload,
+        "revision": saved.revision,
+        "checksum": saved.checksum,
+    }
 
 
 class RoughCutEffectBody(BaseModel):
@@ -1460,6 +1531,9 @@ class RoughCutExportBody(BaseModel):
     # completes. Back-compat default off — existing callers keep getting
     # only a downloadUrl.
     register_as_version: bool = False
+    #: Fail closed on matte failure: a redaction or harness composite whose
+    #: unmasked form is wrong must stop the export, not ship without the mask.
+    masksRequired: bool = False
 
 
 @router.post("/{video_id}/ai/rough-cut-export")
@@ -1504,6 +1578,7 @@ def start_rough_cut_export(
         "keepRanges": body.keepRanges,
         "exportSettings": body.exportSettings,
         "masks": body.masks,
+        "masksRequired": body.masksRequired,
         "processedRanges": body.processedRanges,
         "colorRanges": body.colorRanges,
         "videoRanges": body.videoRanges,

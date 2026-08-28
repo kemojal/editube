@@ -498,7 +498,9 @@ def _normalize_ranges(raw: object, max_end: float | None = None) -> list[tuple[f
             end = min(end, max_end)
         if end - start > 0.05:
             out.append((start, end))
-    out.sort(key=lambda x: x[0])
+    # Deliberately NOT sorted: the client sends keep ranges in play order, and
+    # a reordered timeline must render reordered. Sorting by source start here
+    # silently destroyed every reorder the editor made (plan §5.3).
     return out
 
 
@@ -1194,11 +1196,11 @@ def _match_audio_range(
     that overlaps but lines up with neither edge is a different clip and is
     left unmatched rather than guessed at.
 
-    NOTE: `colorRanges`, `videoRanges` and `processedRanges` are looked up the
-    same exact way against the same clamped values and share this hazard. That
-    is pre-existing and deliberately untouched here -- fixing it means the same
-    treatment for `_range_settings`/`_approved_processed_ranges`, where the
-    processed one also has an authorization key to keep honest.
+    `colorRanges`, `videoRanges` and `processedRanges` now go through this
+    same matcher (the last clip of an edit used to silently lose its grade,
+    canvas, or cutout to the identical drift). The processed table is safe to
+    match tolerantly because authorization happened when the table was built —
+    only completed, owned effect rows ever enter it.
     """
     exact = table.get((round(start, 3), round(end, 3)))
     if exact is not None:
@@ -3145,8 +3147,6 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
         processed_ranges = _approved_processed_ranges(
             db, video_id, payload.get("processedRanges")
         )
-        # These three are still looked up by exact key below and so carry the
-        # clamping hazard `_match_audio_range` documents; left as-is on purpose.
         color_ranges = _range_settings(payload.get("colorRanges"))
         video_ranges = _range_settings(payload.get("videoRanges"))
         # LUT references become rendered cube paths before any chain is built.
@@ -3179,6 +3179,25 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
             media_src=media_src,
             source_duration=source_duration,
         )
+        # LUTs on timeline layers resolve through the same authorised path as
+        # the A-roll's. They used to be skipped entirely: the layer kept its
+        # unresolved `{assetId, workspaceId}` reference, `build_*_adjust_*`
+        # found no `path`, and a B-roll LUT that previewed in the browser was
+        # silently absent from the MP4 (plan §5.3 #6). In place on purpose —
+        # the export chunks `{**layer}`-spread these same nested dicts.
+        layer_lut_refs = [
+            layer["settings"]["adjust"]
+            for layer in timeline_layers
+            if isinstance(layer.get("settings"), dict)
+            and isinstance(layer["settings"].get("adjust"), dict)
+            and layer["settings"]["adjust"].get("lut")
+        ]
+        if layer_lut_refs:
+            from app.services.lut import resolve_adjust_lut, video_workspace_ids
+
+            allowed_layer_ws = video_workspace_ids(db, video)
+            for ref in layer_lut_refs:
+                resolve_adjust_lut(db, ref, allowed_workspace_ids=allowed_layer_ws)
         if not want_mp4_video:
             timeline_layers = [
                 layer for layer in timeline_layers if str(layer.get("kind")) == "audio"
@@ -3254,9 +3273,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
 
             for index, (start, end) in enumerate(normalized):
                 dur = max(0.04, end - start)
-                processed_source = processed_ranges.get(
-                    (round(start, 3), round(end, 3))
-                )
+                processed_source = _match_audio_range(processed_ranges, start, end)
                 w_out = tmp_path / f"w{index:03d}.wav"
                 enhanced_audio = _match_audio_range(enhanced_audio_ranges, start, end)
                 enhanced_audio_source = (
@@ -3307,10 +3324,10 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 if want_mp4_video:
                     v_out = tmp_path / f"v{index:03d}.mp4"
                     adjust_filters = build_keyframed_adjust_filter_chain(
-                        color_ranges.get((round(start, 3), round(end, 3))),
+                        _match_audio_range(color_ranges, start, end),
                         dur,
                     )
-                    video_settings = video_ranges.get((round(start, 3), round(end, 3)))
+                    video_settings = _match_audio_range(video_ranges, start, end)
                     canvas_color = _canvas_background_color(video_settings)
                     use_clip_compositor = _needs_clip_compositor(video_settings)
                     vf_parts = [
@@ -3334,7 +3351,17 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                                 font_warnings=mask_font_fallbacks,
                             )
                         except Exception:
-                            # A masking bug must never fail the whole export —
+                            if bool(payload.get("masksRequired")):
+                                # Fail closed: the caller declared these masks
+                                # load-bearing (a redaction, or a harness
+                                # composite whose unmasked form is wrong), so
+                                # shipping an unmasked export is worse than
+                                # shipping none (plan §3.1).
+                                raise RuntimeError(
+                                    "A required mask failed to render; the export "
+                                    "was stopped rather than shipped unmasked."
+                                )
+                            # A masking bug must never fail a decorative export —
                             # fall back to the unmasked segment. Record the
                             # failure (I11) so the UI can warn the user this
                             # export is unmasked -- masks are sometimes a

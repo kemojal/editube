@@ -34,6 +34,8 @@ from app.db.models import (
     Folder,
     Project,
     RepurposeJob,
+    RoughCutDraft,
+    RoughCutDraftRevision,
     User,
     Video,
     VideoTranscription,
@@ -63,6 +65,9 @@ class _SqliteDbTestCase(unittest.TestCase):
         ClipStyle.__table__,
         ClipTemplate.__table__,
         AiResult.__table__,
+        # The auto-edit hook writes through the draft store now.
+        RoughCutDraft.__table__,
+        RoughCutDraftRevision.__table__,
     ]
 
     def setUp(self) -> None:

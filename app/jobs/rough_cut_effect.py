@@ -389,28 +389,43 @@ def _update_row(db, row: AiResult, *, status: str, progress: int, output_url: st
 
 
 def _attach_to_draft(db, video_id: int, clip_key: str, effect_type: str, processing: dict[str, Any]) -> None:
-    draft = (
-        db.query(AiResult)
-        .filter(AiResult.video_id == video_id, AiResult.result_type == "rough_cut_draft")
-        .first()
-    )
-    if draft is None:
+    """Mirror an effect job's status onto the draft's clip attributes.
+
+    Goes through the draft store — a read-modify-write under the store's
+    optimistic-concurrency loop — instead of the old direct row write, which
+    raced the editor's autosave and could even target a different row than the
+    one the editor was reading (the store resolves by project, not by whichever
+    video id this job happens to carry).
+    """
+    from app.services import draft_store
+
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if video is None:
         return
-    data = dict(draft.result_data or {})
-    clip_attrs = dict(data.get("clipAttributes") or {})
-    attrs = dict(clip_attrs.get(clip_key) or {})
-    current_processing = dict(attrs.get("processing") or {})
-    if effect_type == "retouch":
-        # Remove BG consumes the retouched visual. Its old matte cannot remain
-        # authoritative after a new beauty pass finishes or fails.
-        current_processing.pop("remove_bg", None)
-    current_processing[effect_type] = processing
-    attrs["processing"] = current_processing
-    clip_attrs[clip_key] = attrs
-    data["clipAttributes"] = clip_attrs
-    draft.result_data = data
-    draft.status = "completed"
-    db.commit()
+
+    def _mutator(data: dict[str, Any]) -> dict[str, Any]:
+        clip_attrs = dict(data.get("clipAttributes") or {})
+        attrs = dict(clip_attrs.get(clip_key) or {})
+        current_processing = dict(attrs.get("processing") or {})
+        if effect_type == "retouch":
+            # Remove BG consumes the retouched visual. Its old matte cannot remain
+            # authoritative after a new beauty pass finishes or fails.
+            current_processing.pop("remove_bg", None)
+        current_processing[effect_type] = processing
+        attrs["processing"] = current_processing
+        clip_attrs[clip_key] = attrs
+        data["clipAttributes"] = clip_attrs
+        return data
+
+    # `create=False` preserves the old contract: no draft anywhere, no-op.
+    draft_store.mutate_draft(
+        db,
+        video.project_id,
+        _mutator,
+        writer="effect_job",
+        video_id=video_id,
+        create=False,
+    )
 
 
 def _publish_output(path: Path, video_id: int, result_id: int) -> str:

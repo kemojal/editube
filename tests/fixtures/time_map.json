@@ -1,0 +1,63 @@
+{
+  "description": "Contract cases for the canonical source<->program time map. The TypeScript port must pass these byte-for-byte; see app/services/time_map.py.",
+  "cases": [
+    {
+      "name": "two ranges, forward order",
+      "keepRanges": [{"start": 2.0, "end": 5.0}, {"start": 8.0, "end": 10.0}],
+      "sourceDuration": 12.0,
+      "programDuration": 5.0,
+      "toProgram": [
+        {"source": 2.0, "program": 0.0},
+        {"source": 4.5, "program": 2.5},
+        {"source": 5.0, "program": 3.0},
+        {"source": 8.0, "program": 3.0},
+        {"source": 9.0, "program": 4.0},
+        {"source": 6.0, "program": null},
+        {"source": 12.0, "program": 5.0},
+        {"source": 13.5, "program": 6.5}
+      ],
+      "toSource": [
+        {"program": 0.0, "source": 2.0},
+        {"program": 2.999, "source": 4.999},
+        {"program": 3.0, "source": 8.0},
+        {"program": 4.999, "source": 9.999},
+        {"program": 5.0, "source": 10.0},
+        {"program": 6.5, "source": 13.5}
+      ]
+    },
+    {
+      "name": "reordered ranges play in listed order",
+      "keepRanges": [{"start": 8.0, "end": 10.0}, {"start": 2.0, "end": 5.0}],
+      "sourceDuration": 12.0,
+      "programDuration": 5.0,
+      "toProgram": [
+        {"source": 8.0, "program": 0.0},
+        {"source": 9.5, "program": 1.5},
+        {"source": 2.0, "program": 2.0},
+        {"source": 4.0, "program": 4.0}
+      ],
+      "toSource": [
+        {"program": 0.0, "source": 8.0},
+        {"program": 1.999, "source": 9.999},
+        {"program": 2.0, "source": 2.0},
+        {"program": 4.5, "source": 4.5}
+      ]
+    },
+    {
+      "name": "degenerate and unordered input ranges are dropped",
+      "keepRanges": [
+        {"start": 1.0, "end": 1.0},
+        {"start": 3.0, "end": 2.0},
+        {"start": 4.0, "end": 6.0}
+      ],
+      "sourceDuration": 8.0,
+      "programDuration": 2.0,
+      "toProgram": [
+        {"source": 4.0, "program": 0.0},
+        {"source": 5.999, "program": 1.999},
+        {"source": 1.0, "program": null}
+      ],
+      "toSource": [{"program": 1.0, "source": 5.0}]
+    }
+  ]
+}

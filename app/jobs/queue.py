@@ -855,3 +855,45 @@ def enqueue_director_job(plan_id: int) -> str | None:
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to enqueue director run %s: %s", plan_id, e)
         return None
+
+
+def enqueue_harness_apply_job(run_id: int, plan_checksum: str | None = None) -> str | None:
+    """Enqueue an editing-harness apply. Returns RQ job id, or None when Redis
+    is unset — the caller then runs the apply inline (the AI-review pattern).
+
+    Unlike every older enqueue here, the job id is deterministic:
+    `harness-apply-{run_id}-{checksum prefix}`. A double-click or a client
+    retry therefore collides with the existing job instead of applying twice —
+    the dedupe pattern the two analytics sweeps established, promoted to a
+    user-facing mutation where it matters most.
+    """
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        logger.warning("REDIS_URL not set; harness run %s will apply inline", run_id)
+        return None
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        timeout_sec = max(900, int(os.environ.get("HARNESS_APPLY_TIMEOUT_SEC", "3600") or "3600"))
+        conn = Redis.from_url(url)
+        q = Queue("default", connection=conn, default_timeout=timeout_sec)
+        suffix = (plan_checksum or "").removeprefix("sha256:")[:8] or "plan"
+        job_id = f"harness-apply-{run_id}-{suffix}"
+        try:
+            job = q.enqueue(
+                "app.jobs.harness.harness_apply_job",
+                run_id,
+                job_timeout=timeout_sec,
+                job_id=job_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if "already exists" in str(exc).lower():
+                logger.info("Harness apply %s already enqueued; dedupe", job_id)
+                return job_id
+            raise
+        _record_enqueued(job, "harness_apply_job", run_id)
+        return job.id if job else None
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to enqueue harness apply for run %s: %s", run_id, e)
+        return None

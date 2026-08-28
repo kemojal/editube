@@ -113,14 +113,13 @@ class _ApplyFixture(unittest.TestCase):
     """Shared setup only — subclassed so neither suite re-runs the other's."""
 
     def setUp(self) -> None:
+        from tests.conftest import all_public_tables
+
         engine = create_engine("sqlite://")
-        Base.metadata.create_all(
-            engine,
-            tables=[
-                User.__table__, Project.__table__, Video.__table__, AiResult.__table__,
-                VideoTranscription.__table__, DirectorPlan.__table__, GeneratedMedia.__table__,
-            ],
-        )
+        # The whole public schema: director apply now writes through the draft
+        # store, which reads `rough_cut_drafts` — the exact breakage the
+        # conftest predicted for hand-rolled table subsets.
+        Base.metadata.create_all(engine, tables=all_public_tables())
         self.db = sessionmaker(bind=engine)()
 
         self.user = User(email="e@example.com", name="Edna", role="creator")

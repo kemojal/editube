@@ -770,33 +770,39 @@ def run_post_transcription_auto_edit(
             analysis["keepRanges"] = scoped_keep_ranges
         counts, _removable = _summarize_analysis(analysis)
 
-        draft_row = (
-            db.query(AiResult)
-            .filter(AiResult.video_id == video_id, AiResult.result_type == "rough_cut_draft")
-            .first()
-        )
-        existing_data = (
-            dict(draft_row.result_data) if draft_row and isinstance(draft_row.result_data, dict) else {}
-        )
-        has_user_range_edits = "rangeEditVersion" in existing_data
+        from app.db.models import Video
+        from app.services import draft_store
 
-        new_data = dict(existing_data)
-        new_data["aiAnalysis"] = {
-            "suggestions": analysis.get("suggestions", []),
-            "counts": counts,
-            "options": options.model_dump(mode="json"),
-            "analyzedAt": f"transcription:{transcription_id}",
-        }
-        if auto_apply and not has_user_range_edits:
-            new_data["keepRanges"] = analysis.get("keepRanges", [])
+        video_row = db.query(Video).filter(Video.id == video_id).first()
+        if video_row is None:
+            logger.warning("Auto-edit: video %s vanished before the draft seed", video_id)
+            return
+        view = draft_store.get_draft(db, video_row.project_id)
+        # The do-not-clobber signal: explicit editor provenance from the store,
+        # plus the legacy sentinel key for drafts written before revisions.
+        has_user_range_edits = (
+            view.user_edited_at is not None or "rangeEditVersion" in view.payload
+        )
 
-        if draft_row is None:
-            draft_row = AiResult(video_id=video_id, result_type="rough_cut_draft")
-            db.add(draft_row)
-        draft_row.status = "completed"
-        draft_row.error_message = None
-        draft_row.result_data = new_data
-        db.commit()
+        def _seed(payload: dict) -> dict:
+            payload["aiAnalysis"] = {
+                "suggestions": analysis.get("suggestions", []),
+                "counts": counts,
+                "options": options.model_dump(mode="json"),
+                "analyzedAt": f"transcription:{transcription_id}",
+            }
+            if auto_apply and not has_user_range_edits:
+                payload["keepRanges"] = analysis.get("keepRanges", [])
+            return payload
+
+        draft_store.mutate_draft(
+            db,
+            video_row.project_id,
+            _seed,
+            writer="auto_edit",
+            video_id=video_id,
+            source_id=f"transcription:{transcription_id}",
+        )
         logger.info(
             "Post-transcription auto-edit seeded rough_cut_draft for video %s (auto_apply=%s, applied_keep_ranges=%s)",
             video_id,

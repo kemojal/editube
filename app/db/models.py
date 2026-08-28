@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, BigInteger, Float, String, ForeignKey, Text, Boolean, ARRAY, UniqueConstraint, Index, text
+from sqlalchemy import Column, Integer, BigInteger, Float, String, ForeignKey, Text, Boolean, ARRAY, LargeBinary, UniqueConstraint, Index, text
 from sqlalchemy.dialects.postgresql import JSONB, NUMRANGE
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql.sqltypes import TIMESTAMP
@@ -301,7 +301,7 @@ class AnalyticsOutbox(Base):
 
     event_id = Column(String, primary_key=True)
     event_name = Column(String, nullable=False, index=True)
-    schema_version = Column(Integer, nullable=False, server_default="1")
+    schema_version = Column(Integer, nullable=False, default=1, server_default="1")
     occurred_at = Column(TIMESTAMP, nullable=False, index=True)
     source = Column(String, nullable=False)
     environment = Column(String, nullable=False)
@@ -315,7 +315,7 @@ class AnalyticsOutbox(Base):
     anonymous_id = Column(String, nullable=True)
     properties = Column(JSONB, nullable=False)
     delivery_status = Column(String, nullable=False, server_default="pending", index=True)
-    attempt_count = Column(Integer, nullable=False, server_default="0")
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     next_attempt_at = Column(TIMESTAMP, nullable=True, index=True)
     delivery_started_at = Column(TIMESTAMP, nullable=True)
     last_error_code = Column(String, nullable=True)
@@ -2628,6 +2628,221 @@ class DirectorPlan(Base):
     cancel_requested = Column(Boolean, nullable=False, server_default="false")
 
     applied_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class RoughCutDraft(Base):
+    """The canonical rough-cut draft — one revisioned row per project.
+
+    Replaces the untyped `ai_results` row (`result_type="rough_cut_draft"`) as
+    the source of truth. That row had no revision, no checksum, no unique
+    constraint, and five uncoordinated writers doing whole-document replaces
+    (docs/editing-harness-implementation-plan.md §5.2 G1). This table pins the
+    draft to the *project* — the workspace was already per-project in practice,
+    but ownership was resolved through "newest source video by updated_at",
+    which could silently move the draft to a different row mid-session.
+
+    Every write goes through `app.services.draft_store`, which enforces
+    optimistic concurrency (`expected_revision`) under a row lock and mirrors
+    the payload back into the legacy `ai_results` row so existing readers keep
+    working during the migration window.
+    """
+
+    __tablename__ = "rough_cut_drafts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(
+        Integer,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    #: The canonical source video the editor addresses this draft through. Set
+    #: explicitly on save — never inferred from `Video.updated_at` ordering.
+    video_id = Column(
+        Integer, ForeignKey("videos.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
+    revision = Column(Integer, nullable=False, default=0, server_default="0")
+    #: sha256 of the canonical JSON serialization of `payload`.
+    checksum = Column(String, nullable=True)
+    payload = Column(JSONB, nullable=False, server_default="{}")
+
+    #: When a human last wrote through the editor path. Replaces the fragile
+    #: `"rangeEditVersion" in payload` heuristic as the do-not-clobber signal.
+    user_edited_at = Column(TIMESTAMP, nullable=True)
+    #: Which writer produced the current revision: "editor", "auto_edit",
+    #: "effect_job", "director", "harness:<run_id>", "seed", "migration".
+    last_writer = Column(String, nullable=True)
+
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class RoughCutDraftRevision(Base):
+    """Durable history: one compressed snapshot per draft revision.
+
+    Full snapshots rather than deltas — correctness and recovery first; deltas
+    only if storage pressure is ever measured. `snapshot_zlib` is
+    zlib-compressed canonical JSON. Retention pruning keeps the recent window
+    plus anything a harness run's manifest still references.
+    """
+
+    __tablename__ = "rough_cut_draft_revisions"
+    __table_args__ = (
+        UniqueConstraint("draft_id", "revision", name="uq_rough_cut_draft_revision"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    draft_id = Column(
+        Integer,
+        ForeignKey("rough_cut_drafts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    revision = Column(Integer, nullable=False)
+    parent_revision = Column(Integer, nullable=True)
+    checksum = Column(String, nullable=True)
+    snapshot_zlib = Column(LargeBinary, nullable=True)
+
+    writer = Column(String, nullable=True)
+    #: Free-form provenance id: a harness run id, an RQ job id, a request id.
+    source_id = Column(String, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+class HarnessRun(Base):
+    """One run of the editing harness: intent → plan → approve → apply → verify.
+
+    The Director's `director_plans` proved the shape (pure compiler behind a
+    thin applier, manifest-based revert, reconcile-on-poll); this generalizes
+    it beyond additive edits. Two deliberate differences from the Director:
+    runs are addressed by id — never by "latest" — and `inverse_manifest`
+    survives revert as an audit trail instead of being nulled.
+    """
+
+    __tablename__ = "editing_harness_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(
+        Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    video_id = Column(
+        Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    workspace_id = Column(
+        Integer, ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    # draft | planning | needs_input | planned | approved | staging | applying |
+    # verifying | ready | partially_applied | failed | cancelled | conflicted |
+    # reverted | superseded
+    state = Column(String, nullable=False, default="draft", server_default="draft", index=True)
+    #: Human-readable stage sentence, surfaced verbatim (the Director pattern).
+    stage = Column(String, nullable=True)
+
+    intent = Column(Text, nullable=True)
+    recipe_id = Column(String, nullable=True, index=True)
+    recipe_version = Column(Integer, nullable=False, default=1, server_default="1")
+    params = Column(JSONB, nullable=True)
+
+    base_draft_revision = Column(Integer, nullable=True)
+    applied_draft_revision = Column(Integer, nullable=True)
+    base_checksum = Column(String, nullable=True)
+    result_checksum = Column(String, nullable=True)
+
+    capability_snapshot = Column(JSONB, nullable=True)
+    selection_snapshot = Column(JSONB, nullable=True)
+    plan = Column(JSONB, nullable=True)
+    plan_checksum = Column(String, nullable=True)
+    diff = Column(JSONB, nullable=True)
+    estimates = Column(JSONB, nullable=True)
+
+    applied_manifest = Column(JSONB, nullable=True)
+    #: Inverse entries recorded at commit; retained after revert (audit trail).
+    inverse_manifest = Column(JSONB, nullable=True)
+    verification_report = Column(JSONB, nullable=True)
+    warnings = Column(JSONB, nullable=True)
+
+    model_provider = Column(String, nullable=True)
+    model_name = Column(String, nullable=True)
+    prompt_version = Column(String, nullable=True)
+    token_usage = Column(JSONB, nullable=True)
+    cost_usd = Column(Float, nullable=True)
+
+    error_code = Column(String, nullable=True)
+    error_detail = Column(Text, nullable=True)
+    request_id = Column(String, nullable=True)
+    cancel_requested = Column(Boolean, nullable=False, default=False, server_default="false")
+
+    planned_at = Column(TIMESTAMP, nullable=True)
+    approved_at = Column(TIMESTAMP, nullable=True)
+    applied_at = Column(TIMESTAMP, nullable=True)
+    verified_at = Column(TIMESTAMP, nullable=True)
+    reverted_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class HarnessOperation(Base):
+    """One primitive operation inside a harness run.
+
+    Entity ids are derived from `(run_id, operation_key)` — the Director's
+    derived-id idempotency, generalized — so re-applying a run is a structural
+    no-op and staging jobs can be deduplicated by deterministic job id.
+    """
+
+    __tablename__ = "editing_harness_operations"
+    __table_args__ = (
+        UniqueConstraint("run_id", "operation_key", name="uq_harness_operation_key"),
+        UniqueConstraint("idempotency_key", name="uq_harness_operation_idem"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(
+        Integer,
+        ForeignKey("editing_harness_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    operation_key = Column(String, nullable=False)
+    type = Column(String, nullable=False, index=True)
+    schema_version = Column(Integer, nullable=False, server_default="1")
+
+    sequence = Column(Integer, nullable=False, default=0, server_default="0")
+    depends_on = Column(JSONB, nullable=True)
+
+    # pending | disabled | staging | staged | applying | applied | skipped |
+    # failed | cancelled | rolled_back
+    state = Column(String, nullable=False, default="pending", server_default="pending", index=True)
+    risk = Column(String, nullable=False, default="reversible", server_default="reversible")
+    approval_group = Column(String, nullable=True)
+
+    target = Column(JSONB, nullable=True)
+    preconditions = Column(JSONB, nullable=True)
+    params = Column(JSONB, nullable=True)
+    evidence = Column(JSONB, nullable=True)
+    confidence = Column(Float, nullable=True)
+
+    result = Column(JSONB, nullable=True)
+    #: Staged asset produced by Phase A, e.g. an effect row id + output URL.
+    staged_asset = Column(JSONB, nullable=True)
+    rollback = Column(JSONB, nullable=True)
+
+    job_id = Column(String, nullable=True)
+    idempotency_key = Column(String, nullable=True)
+    attempt_count = Column(Integer, nullable=False, server_default="0")
+
+    error_code = Column(String, nullable=True)
+    error_detail = Column(Text, nullable=True)
+
+    started_at = Column(TIMESTAMP, nullable=True)
+    completed_at = Column(TIMESTAMP, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 
