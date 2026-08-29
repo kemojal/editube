@@ -222,6 +222,69 @@ class AudioClipOp(_ExistingClipOp):
         return self
 
 
+class NormalizedBox(BaseModel):
+    """A box in the mask-transform space: centre offsets as percent-of-frame
+    (x/y, 0 = frame centre) plus percent width/height — the exact coordinate
+    system the tracking backends emit, so no conversion can drift."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    x: float = Field(ge=-50, le=50)
+    y: float = Field(ge=-50, le=50)
+    width: float = Field(gt=0, le=100)
+    height: float = Field(gt=0, le=100)
+
+
+class TrackObjectOp(_OperationBase):
+    """Stage object tracking over a range, seeded from a user-drawn box.
+
+    Phase A work: the propagation backend follows the subject and the staged
+    result is `{keyframes: [{t, x, y, width, height}], lostAtSeconds?}` in the
+    same transform space the box came in."""
+
+    type: Literal["analysis.track_object"] = "analysis.track_object"
+    range: SourceRange
+    box: NormalizedBox
+    quality: Literal["faster", "better"] = "faster"
+    required: bool = True
+
+
+class StageLabelOp(_OperationBase):
+    """Stage a server-rendered label card as a generated image asset."""
+
+    type: Literal["media.stage_label"] = "media.stage_label"
+    text: str = Field(min_length=1, max_length=48)
+    side: Literal["left", "right"] = "left"
+    accent: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+
+
+class PlaceLabelOp(_OperationBase):
+    """Put a staged label on the timeline as a first-class image layer.
+
+    A layer rather than a burn-in because burn-ins are static PNGs — a
+    tracked callout has to MOVE, and only timeline layers have keyframed
+    transforms in both the viewer and the export."""
+
+    type: Literal["timeline.place_label"] = "timeline.place_label"
+    labelOp: str = Field(min_length=1, max_length=64)
+    range: SourceRange
+    widthPct: float = Field(default=18.0, ge=5, le=40)
+    trackLabel: str = Field(default="FX", min_length=1, max_length=8)
+
+
+class TrackKeyframesOp(_OperationBase):
+    """Bind a placed layer's position to a staged track, plus an offset.
+
+    Resolved at COMMIT time from the staged tracking result — the keyframes
+    cannot be known when the plan is written, only where they come from."""
+
+    type: Literal["motion.track_keyframes"] = "motion.track_keyframes"
+    targetOp: str = Field(min_length=1, max_length=64)
+    trackOp: str = Field(min_length=1, max_length=64)
+    offsetX: float = Field(default=0.0, ge=-60, le=60)
+    offsetY: float = Field(default=0.0, ge=-60, le=60)
+
+
 Operation = Annotated[
     Union[
         DuplicateLinkedOp,
@@ -231,6 +294,10 @@ Operation = Annotated[
         SetKeyframesOp,
         AdjustClipOp,
         AudioClipOp,
+        TrackObjectOp,
+        StageLabelOp,
+        PlaceLabelOp,
+        TrackKeyframesOp,
     ],
     Field(discriminator="type"),
 ]
@@ -260,9 +327,12 @@ class HarnessPlan(BaseModel):
                     raise ValueError(f"operation {op.id!r} depends on unknown {dep!r}")
                 if dep == op.id:
                     raise ValueError(f"operation {op.id!r} depends on itself")
-            target = getattr(op, "targetOp", None)
-            if target is not None and target not in known:
-                raise ValueError(f"operation {op.id!r} targets unknown operation {target!r}")
+            for reference in ("targetOp", "labelOp", "trackOp"):
+                target = getattr(op, reference, None)
+                if target is not None and target not in known:
+                    raise ValueError(
+                        f"operation {op.id!r} references unknown operation {target!r}"
+                    )
         # Cycle check over dependsOn (Kahn).
         remaining = {op.id: set(op.dependsOn) for op in ops}
         while remaining:

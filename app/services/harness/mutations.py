@@ -32,8 +32,10 @@ from app.services.harness.schemas import (
     CreateTextOp,
     DuplicateLinkedOp,
     HarnessPlan,
+    PlaceLabelOp,
     SetKeyframesOp,
     SubjectMaskOp,
+    TrackKeyframesOp,
     entity_id,
     group_id,
 )
@@ -93,7 +95,8 @@ def _ensure_top_video_track(
     which follows track order.
     """
     tracks = [dict(t) for t in (draft.get("timelineTracks") or []) if isinstance(t, dict)]
-    if not tracks:
+    created_scaffold = not tracks
+    if created_scaffold:
         tracks = [
             {"id": "track-text-1", "kind": "text", "label": "TX1", "enabled": True,
              "locked": False, "height": 22, "order": 0},
@@ -102,6 +105,10 @@ def _ensure_top_video_track(
             {"id": "track-audio-1", "kind": "audio", "label": "A1", "enabled": True,
              "muted": False, "locked": False, "height": 34, "order": 2},
         ]
+        # The scaffold is ours too: revert removes it (if still unused) so
+        # apply∘revert stays an identity on a draft that had no tracks yet.
+        for track in tracks:
+            result.inverse.append({"op": "remove_track_if_unused", "id": track["id"]})
 
     for track in tracks:
         if track.get("kind") == "video" and track.get("label") == label:
@@ -354,6 +361,93 @@ def _apply_audio_clip(
     _set_attribute(draft, op.clipKey, "audio", {**existing, **changes}, result)
 
 
+def _apply_place_label(
+    draft: dict[str, Any], op: PlaceLabelOp, ctx: MutationContext, result: MutationResult
+) -> None:
+    staged = ctx.staged_assets.get(op.labelOp) or {}
+    url = str(staged.get("url") or "")
+    if not url:
+        result.warnings.append(
+            f"Skipped placing the label: its card was not staged ({op.labelOp})."
+        )
+        return
+    item_id = entity_id(ctx.run_id, op.id)
+    items = [dict(i) for i in (draft.get("timelineMediaItems") or []) if isinstance(i, dict)]
+    if any(str(i.get("id")) == item_id for i in items):
+        draft["timelineMediaItems"] = items
+        return
+    track_id = _ensure_top_video_track(draft, op.trackLabel, ctx.run_id, result)
+    span = op.range.duration
+    item = {
+        "id": item_id,
+        "trackId": track_id,
+        "track": "video",
+        "mediaKey": f"generated-{staged.get('generatedMediaId')}",
+        "sourceKind": "generated",
+        "sourceId": int(staged.get("generatedMediaId") or 0),
+        "name": "Callout label",
+        "kind": "image",
+        "sourceUrl": url,
+        "duration": round(span, 3),
+        "start": round(op.range.start, 3),
+        "end": round(op.range.end, 3),
+        "sourceStart": 0.0,
+        "playDuration": round(span, 3),
+        "audioEnabled": False,
+        "groupId": group_id(ctx.run_id),
+        "linkId": f"link-ehr{ctx.run_id}-{op.id}",
+        "semanticRole": "overlay",
+        "createdByRunId": ctx.run_id,
+    }
+    items.append(item)
+    draft["timelineMediaItems"] = items
+    result.created_item_ids.append(item_id)
+    result.inverse.append({"op": "remove_timeline_item", "id": item_id})
+    # The label renders at a fraction of the frame; the layer's own scale
+    # carries it (the viewer sizes generated layers by their scale attr).
+    _set_attribute(
+        draft, f"media:{item_id}", "video",
+        {"scale": round(op.widthPct / 22.0 * 100.0, 1)},
+        result,
+    )
+
+
+def _apply_track_keyframes(
+    draft: dict[str, Any], op: TrackKeyframesOp, ctx: MutationContext, result: MutationResult
+) -> None:
+    staged = ctx.staged_assets.get(op.trackOp) or {}
+    tracked = staged.get("keyframes")
+    if not isinstance(tracked, list) or not tracked:
+        result.warnings.append(
+            "Skipped the follow motion: tracking produced no keyframes."
+        )
+        return
+    target_id = entity_id(ctx.run_id, op.targetOp)
+    clip_key = f"media:{target_id}"
+    xs: list[dict[str, Any]] = []
+    ys: list[dict[str, Any]] = []
+    for keyframe in tracked[:200]:
+        try:
+            t = round(float(keyframe["t"]), 3)
+            x = float(keyframe["x"]) + op.offsetX
+            y = float(keyframe["y"]) + op.offsetY
+        except (KeyError, TypeError, ValueError):
+            continue
+        # Clamp inside the frame with a margin — a label that tracks off
+        # screen is worse than one that stops at the edge.
+        xs.append({"t": t, "v": round(max(-46.0, min(46.0, x)), 2)})
+        ys.append({"t": t, "v": round(max(-44.0, min(44.0, y)), 2)})
+    if not xs:
+        result.warnings.append("Skipped the follow motion: no usable track keyframes.")
+        return
+    attrs_map = dict(draft.get("clipAttributes") or {})
+    attrs = dict(attrs_map.get(clip_key) or {})
+    keyframes = dict(attrs.get("keyframes") or {})
+    keyframes["video.x"] = xs
+    keyframes["video.y"] = ys
+    _set_attribute(draft, clip_key, "keyframes", keyframes, result)
+
+
 _APPLIERS = {
     "timeline.duplicate_linked": _apply_duplicate,
     "visual.apply_subject_mask": _apply_subject_mask,
@@ -362,6 +456,11 @@ _APPLIERS = {
     "motion.set_keyframes": _apply_keyframes,
     "visual.adjust": _apply_adjust_clip,
     "audio.adjust": _apply_audio_clip,
+    "timeline.place_label": _apply_place_label,
+    "motion.track_keyframes": _apply_track_keyframes,
+    # Staged-only op: its work happens in Phase A; nothing mutates the draft.
+    "analysis.track_object": lambda draft, op, ctx, result: None,
+    "media.stage_label": lambda draft, op, ctx, result: None,
 }
 
 
@@ -408,9 +507,11 @@ def revert_manifest(
         op = entry.get("op")
         if op == "remove_timeline_item":
             items = [i for i in (result.get("timelineMediaItems") or []) if isinstance(i, dict)]
-            result["timelineMediaItems"] = [
-                i for i in items if str(i.get("id")) != str(entry.get("id"))
-            ]
+            remaining_items = [i for i in items if str(i.get("id")) != str(entry.get("id"))]
+            if remaining_items:
+                result["timelineMediaItems"] = remaining_items
+            else:
+                result.pop("timelineMediaItems", None)
         elif op == "remove_text_overlay":
             overlays = [o for o in (result.get("textOverlays") or []) if isinstance(o, dict)]
             remaining = [o for o in overlays if str(o.get("id")) != str(entry.get("id"))]
@@ -423,7 +524,10 @@ def revert_manifest(
         elif op == "remove_clip_attribute_key":
             attrs = dict(result.get("clipAttributes") or {})
             attrs.pop(str(entry.get("key")), None)
-            result["clipAttributes"] = attrs
+            if attrs:
+                result["clipAttributes"] = attrs
+            else:
+                result.pop("clipAttributes", None)
         elif op == "remove_track_if_unused":
             track_id = str(entry.get("id"))
             occupied = {
@@ -441,9 +545,13 @@ def revert_manifest(
                     for t in (result.get("timelineTracks") or [])
                     if isinstance(t, dict) and str(t.get("id")) != track_id
                 ]
-                # Re-normalise orders: creating the track renumbered the whole
-                # stack, so removing it must too, or revert is not an identity.
-                result["timelineTracks"] = _track_stack(remaining_tracks)
+                if remaining_tracks:
+                    # Re-normalise orders: creating the track renumbered the
+                    # whole stack, so removing it must too, or revert is not
+                    # an identity.
+                    result["timelineTracks"] = _track_stack(remaining_tracks)
+                else:
+                    result.pop("timelineTracks", None)
         elif op == "restore_value":
             path = entry.get("path") or []
             if not path:

@@ -18,8 +18,13 @@ from app.services.harness.schemas import (
     CreateTextOp,
     DuplicateLinkedOp,
     HarnessPlan,
+    NormalizedBox,
+    PlaceLabelOp,
     SourceRange,
+    StageLabelOp,
     SubjectMaskOp,
+    TrackKeyframesOp,
+    TrackObjectOp,
 )
 from app.services.harness.capabilities import capability
 
@@ -35,6 +40,12 @@ RECIPES: dict[str, dict[str, Any]] = {
         "title": "Apply a review fix",
         "description": "A bounded correction from an AI-review finding, on the clip it flagged.",
         "requires": [],
+    },
+    "tracked_callout": {
+        "version": 1,
+        "title": "Tracked callout",
+        "description": "A label that follows an object: track it, render a card, keyframe the follow.",
+        "requires": ["tracking", "storage"],
     },
 }
 
@@ -277,9 +288,104 @@ def compile_review_fix(
     )
 
 
+class TrackedCalloutParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    range: SourceRange
+    #: The object, as the user drew it: centre-offset percents + size.
+    box: NormalizedBox
+    label: str = Field(min_length=1, max_length=48)
+    side: str | None = Field(default=None, pattern="^(left|right)$")
+    accent: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    quality: str = Field(default="faster", pattern="^(faster|better)$")
+    widthPct: float = Field(default=18.0, ge=5, le=40)
+
+
+def compile_tracked_callout(
+    params: dict[str, Any],
+    *,
+    capability_snapshot: dict[str, Any],
+    video_duration: float,
+    draft: dict[str, Any] | None = None,
+) -> HarnessPlan:
+    parsed = TrackedCalloutParams.model_validate(params)
+
+    tracking = capability(capability_snapshot, "tracking")
+    if not tracking.get("available"):
+        raise CompileError(
+            "capability_unavailable",
+            tracking.get("reason") or "Object tracking is not available on this server.",
+        )
+    storage = capability(capability_snapshot, "storage")
+    if not storage.get("available"):
+        raise CompileError(
+            "capability_unavailable",
+            storage.get("reason") or "No storage backend for the label asset.",
+        )
+    # Tracking extracts the clip's frames, like segmentation — the same
+    # duration cap keeps a worker from chewing through minutes of video.
+    seg = capability(capability_snapshot, "segmentation")
+    max_clip = float((seg.get("limits") or {}).get("maxClipSeconds") or 120)
+    if parsed.range.duration > max_clip:
+        raise CompileError(
+            "range_too_long",
+            f"The selection is {parsed.range.duration:.1f}s; tracking here is capped "
+            f"at {max_clip:.0f}s. Select a shorter range.",
+        )
+    if video_duration and parsed.range.end > video_duration + 0.5:
+        raise CompileError("range_outside_media", "The selection ends after the video does.")
+
+    # Which side the card sits on: away from the frame edge the object is
+    # nearest, unless the user chose.
+    side = parsed.side or ("left" if parsed.box.x > 0 else "right")
+    direction = -1.0 if side == "left" else 1.0
+    offset_x = max(-45.0, min(45.0, direction * (parsed.box.width / 2 + 14.0)))
+
+    operations = [
+        TrackObjectOp(
+            id="track",
+            range=parsed.range,
+            box=parsed.box,
+            quality=parsed.quality,  # type: ignore[arg-type]
+            explanationKey="harness.op.track_object",
+        ),
+        StageLabelOp(
+            id="label",
+            text=parsed.label,
+            side=side,  # type: ignore[arg-type]
+            accent=parsed.accent,
+            explanationKey="harness.op.render_label",
+        ),
+        PlaceLabelOp(
+            id="place",
+            labelOp="label",
+            dependsOn=["label"],
+            range=parsed.range,
+            widthPct=parsed.widthPct,
+            explanationKey="harness.op.place_label",
+        ),
+        TrackKeyframesOp(
+            id="follow",
+            targetOp="place",
+            trackOp="track",
+            dependsOn=["place", "track"],
+            offsetX=offset_x,
+            offsetY=0.0,
+            explanationKey="harness.op.follow_track",
+        ),
+    ]
+    return HarnessPlan(
+        recipe="tracked_callout",
+        recipeVersion=RECIPES["tracked_callout"]["version"],
+        operations=operations,
+        warnings=[],
+    )
+
+
 _COMPILERS = {
     "subject_behind_text": compile_subject_behind_text,
     "review_fix": compile_review_fix,
+    "tracked_callout": compile_tracked_callout,
 }
 
 
@@ -313,6 +419,11 @@ def estimate_plan(plan: HarnessPlan) -> dict[str, Any]:
         if op.type == "visual.apply_subject_mask":
             # Local segmentation runs roughly realtime-and-a-half on CPU.
             stage_seconds += max(10.0, affected * 1.5)
+        elif op.type == "analysis.track_object":
+            # Frame extraction plus propagation: near segmentation's cost.
+            stage_seconds += max(10.0, affected * 1.2)
+        elif op.type == "media.stage_label":
+            stage_seconds += 2.0
     return {
         "processingSeconds": round(stage_seconds, 1),
         "providerCostUsd": 0.0,

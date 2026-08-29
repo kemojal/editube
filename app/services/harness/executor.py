@@ -247,9 +247,11 @@ def set_operation_enabled(
             for op in plan.operations:
                 if not op.enabled:
                     continue
-                deps = set(op.dependsOn) | (
-                    {getattr(op, "targetOp")} if getattr(op, "targetOp", None) else set()
-                )
+                deps = set(op.dependsOn)
+                for reference in ("targetOp", "labelOp", "trackOp"):
+                    value = getattr(op, reference, None)
+                    if value:
+                        deps.add(value)
                 if any(not keyed[d].enabled for d in deps if d in keyed):
                     op.enabled = False
                     changed = True
@@ -348,6 +350,118 @@ def _stage_subject_mask(
     )
 
 
+def _stage_track_object(
+    db: Session, run: HarnessRun, op_row: HarnessOperation, plan: HarnessPlan
+) -> dict[str, Any]:
+    """Phase A for `analysis.track_object`: follow the box through the clip.
+
+    Runs the propagation tracker in-process (the same fork-safety rules as
+    segmentation apply — SimpleWorker). The staged result is the keyframe
+    list in transform space plus where tracking lost the subject, if it did.
+    """
+    op = next(o for o in plan.operations if o.id == op_row.operation_key)
+    video = db.query(Video).filter(Video.id == run.video_id).first()
+    if video is None:
+        raise HarnessError("staging_failed", "The video disappeared before tracking.")
+
+    from app.jobs.mask_track import _assert_media_source_safe, _resolve_media_source
+
+    media_src = _resolve_media_source(video, None)
+    _assert_media_source_safe(media_src)
+
+    anchor_time = op.range.duration / 2
+    try:
+        result = _run_tracking(
+            media_src,
+            mask_bbox_normalized=op.box.model_dump(),
+            clip_start=op.range.start,
+            clip_end=op.range.end,
+            anchor_time=anchor_time,
+            direction="both",
+            quality=op.quality,
+        )
+    except Exception as exc:  # noqa: BLE001 — surfaced as a staged failure
+        raise HarnessError("tracking_failed", str(exc)) from exc
+
+    keyframes = result.get("keyframes") or []
+    if not keyframes:
+        raise HarnessError("tracking_failed", "Tracking could not follow the object.")
+    fps = float(result.get("fps") or 30.0)
+    lost_frame = result.get("lostAtFrame")
+    staged: dict[str, Any] = {"keyframes": keyframes, "fps": fps}
+    if lost_frame is not None:
+        staged["lostAtSeconds"] = max(
+            0.0, (float(lost_frame) / fps if fps > 0 else 0.0) - op.range.start
+        )
+    return staged
+
+
+def _stage_label(
+    db: Session, run: HarnessRun, op_row: HarnessOperation, plan: HarnessPlan
+) -> dict[str, Any]:
+    """Phase A for `media.stage_label`: render the card, store it, own it.
+
+    The asset is a real `GeneratedMedia` row — the export already authorizes
+    those by project, the media panel can show it, and deleting the run never
+    deletes it (the same ON-DELETE discipline the Director's assets follow).
+    """
+    from app.db.models import GeneratedMedia
+    from app.storage import build_key, get_storage, storage_available
+
+    op = next(o for o in plan.operations if o.id == op_row.operation_key)
+    if not storage_available():
+        raise HarnessError(
+            "storage_unavailable", "No storage backend is configured for the label."
+        )
+    try:
+        data, width, height = _render_label(op.text, side=op.side, accent=op.accent)
+    except Exception as exc:  # noqa: BLE001
+        raise HarnessError("label_render_failed", f"Could not render the label: {exc}") from exc
+
+    key = build_key(
+        folder=f"generated/{run.project_id}",
+        public_id=f"label_ehr{run.id}_{op_row.operation_key}",
+        content_type="image/png",
+    )
+    upload = get_storage().upload_bytes(data, key=key, content_type="image/png")
+    asset = GeneratedMedia(
+        project_id=run.project_id,
+        video_id=run.video_id,
+        user_id=run.created_by,
+        kind="image",
+        prompt=f"Harness label: {op.text}",
+        model="harness/label-card",
+        status="ready",
+        progress=100,
+        url=upload.url,
+        storage_key=key,
+        mime_type="image/png",
+        width=width,
+        height=height,
+        saved=True,
+    )
+    db.add(asset)
+    db.commit()
+    return {
+        "generatedMediaId": asset.id,
+        "url": upload.url,
+        "width": width,
+        "height": height,
+    }
+
+
+# Patched in tests; the real things need ML / Pillow / storage.
+from app.services.harness.label_card import render_label_card as _render_label  # noqa: E402
+from app.services.propagation_tracker import track_by_propagation as _run_tracking  # noqa: E402
+
+#: Phase A dispatch: op type → (progress sentence, handler).
+_STAGE_HANDLERS: dict[str, tuple[str, Any]] = {
+    "visual.apply_subject_mask": ("Cutting out the subject", _stage_subject_mask),
+    "analysis.track_object": ("Following the object", _stage_track_object),
+    "media.stage_label": ("Rendering the label", _stage_label),
+}
+
+
 def request_apply(
     db: Session, run: HarnessRun, *, expected_revision: int | None
 ) -> HarnessRun:
@@ -403,29 +517,38 @@ def execute_apply(db: Session, run_id: int) -> None:
         row = op_rows.get(op.id)
         if row is None:
             continue
-        if op.type == "visual.apply_subject_mask":
-            row.state = "staging"
-            row.started_at = _now()
-            run.stage = "Cutting out the subject"
+        handler = _STAGE_HANDLERS.get(op.type)
+        if handler is None:
+            continue
+        stage_label, stage_fn = handler
+        row.state = "staging"
+        row.started_at = _now()
+        run.stage = stage_label
+        db.commit()
+        try:
+            staged = stage_fn(db, run, row, plan)
+        except HarnessError as exc:
+            row.state = "failed"
+            row.error_code = exc.code
+            row.error_detail = str(exc)[:2000]
             db.commit()
-            try:
-                staged = _stage_subject_mask(db, run, row, plan)
-            except HarnessError as exc:
-                row.state = "failed"
-                row.error_code = exc.code
-                row.error_detail = str(exc)[:2000]
-                db.commit()
-                if getattr(op, "required", True):
-                    _fail(
-                        db, run, exc.code,
-                        f"{exc} The timeline was not changed.",
-                    )
-                    return
-                staged = {}
-            row.staged_asset = {**(row.staged_asset or {}), **staged}
-            row.state = "staged"
-            db.commit()
-            staged_assets[op.id] = staged
+            if getattr(op, "required", True):
+                _fail(
+                    db, run, exc.code,
+                    f"{exc} The timeline was not changed.",
+                )
+                return
+            staged = {}
+        row.staged_asset = {**(row.staged_asset or {}), **staged}
+        row.state = "staged"
+        if staged.get("lostAtSeconds") is not None:
+            run.warnings = [
+                *(run.warnings or []),
+                f"Tracking lost the object {float(staged['lostAtSeconds']):.1f}s into "
+                "the clip; the callout follows it up to there.",
+            ]
+        db.commit()
+        staged_assets[op.id] = staged
 
     # Phase B — commit, atomically, against the recorded revision.
     run.state = "applying"

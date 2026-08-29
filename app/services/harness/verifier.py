@@ -108,6 +108,31 @@ def verify_committed(
                 _check(f"mask_asset:{clip_key}", "warn", "Optional mask missing.")
             )
 
+    # A tracked callout that does not move is a broken promise: the placed
+    # label must carry the follow keyframes the plan bound to it.
+    for op in plan.operations:
+        if op.type != "motion.track_keyframes" or not op.enabled:
+            continue
+        clip_key = f"media:{entity_id(run.id, op.targetOp)}"
+        keyframes = ((attrs.get(clip_key) or {}).get("keyframes") or {})
+        xs = keyframes.get("video.x") or []
+        if len(xs) >= 2:
+            checks.append(_check(f"follow_motion:{clip_key}", "pass"))
+        elif len(xs) == 1:
+            checks.append(
+                _check(
+                    f"follow_motion:{clip_key}", "warn",
+                    "Tracking produced a single position; the label will not move.",
+                )
+            )
+        else:
+            checks.append(
+                _check(
+                    f"follow_motion:{clip_key}", "fail",
+                    "The label was placed but its follow keyframes are missing.",
+                )
+            )
+
     # Overlay geometry sanity.
     for overlay in overlays:
         oid = str(overlay.get("id"))
