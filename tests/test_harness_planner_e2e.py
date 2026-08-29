@@ -68,3 +68,29 @@ def test_intent_to_validated_plan_end_to_end():
     text_op = next(op for op in plan.operations if op.type == "overlay.create_text")
     assert "launch" in text_op.text.lower()
     assert 0 <= text_op.range.start < text_op.range.end <= 42.5
+
+
+def test_provider_chain_end_to_end_on_the_free_tier(monkeypatch):
+    """The production entry point (`plan_recipe_params`), live.
+
+    Claude is masked off so the chain exercises its fallback leg — the same
+    free-tier path a deployment without ANTHROPIC_API_KEY runs.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+
+    from app.services.harness.compiler import compile_recipe
+    from app.services.harness.planner import plan_recipe_params
+
+    result = plan_recipe_params(
+        "Title saying SHIP IT behind me for the first few seconds",
+        video_duration=30.0,
+        selection={"start": 1.0, "end": 6.0},
+    )
+    plan = compile_recipe(
+        "subject_behind_text",
+        result.params,
+        capability_snapshot=SEG_SNAPSHOT,
+        video_duration=30.0,
+    )
+    text_op = next(op for op in plan.operations if op.type == "overlay.create_text")
+    assert "ship" in text_op.text.lower()

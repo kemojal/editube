@@ -312,6 +312,29 @@ def probe_fonts() -> dict[str, Any]:
         return _entry("server_fonts", False, reason=f"Probe failed: {exc}")
 
 
+def probe_planner() -> dict[str, Any]:
+    """Natural-language planning: which model providers can answer an intent."""
+    try:
+        from app.services.harness.planner import planner_availability
+
+        providers = planner_availability()
+    except Exception as exc:  # noqa: BLE001
+        return _entry("planner", False, reason=f"Probe failed: {exc}")
+    available = any(providers.values())
+    provider = "anthropic" if providers.get("claude") else (
+        "openrouter" if providers.get("openrouter") else None
+    )
+    return _entry(
+        "planner",
+        available,
+        reason=None
+        if available
+        else "Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY to plan from a description.",
+        provider=provider,
+        detail={"providers": providers},
+    )
+
+
 def snapshot() -> dict[str, Any]:
     """The full capability snapshot, stored verbatim on every run."""
     entries = [
@@ -324,6 +347,7 @@ def snapshot() -> dict[str, Any]:
         probe_audio_enhance(),
         probe_generation(),
         probe_fonts(),
+        probe_planner(),
     ]
     return {
         "version": SNAPSHOT_VERSION,

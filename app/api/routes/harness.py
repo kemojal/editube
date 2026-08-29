@@ -133,12 +133,23 @@ def get_capabilities(
     return {"capabilities": snapshot, "recipes": list_recipes(snapshot)}
 
 
+class SelectionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+
+
 class CreateRunBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     recipe_id: str = Field(min_length=1, max_length=64)
+    #: Explicit parameters (the quick-action path). Empty + `intent` set means
+    #: "plan it from the description" via the planner chain.
     params: dict[str, Any] = Field(default_factory=dict)
     intent: str | None = Field(default=None, max_length=2000)
+    #: The user's current selection, source seconds — the planner prefers it.
+    selection: SelectionBody | None = None
 
 
 @router.post("/{video_id}/editing/runs")
@@ -159,6 +170,7 @@ def create_run(
         recipe_id=body.recipe_id,
         params=body.params,
         intent=body.intent,
+        selection=body.selection.model_dump() if body.selection else None,
     )
     return _serialize_run(db, run)
 

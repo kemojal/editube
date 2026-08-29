@@ -123,9 +123,18 @@ def create_run(
     recipe_id: str,
     params: dict[str, Any],
     intent: str | None = None,
+    selection: dict[str, float] | None = None,
     request_id: str | None = None,
 ) -> HarnessRun:
-    """Create, compile, and simulate a run in one step (deterministic recipes)."""
+    """Create, compile, and simulate a run in one step.
+
+    Two ways in: explicit `params` (the deterministic quick-action path), or a
+    natural-language `intent` with no params — then the planner chain proposes
+    parameters, and everything it proposes still goes through the same
+    `compile_recipe` validation. A deployment with no planning model does not
+    fail cryptically; the run lands in `needs_input` with the sentence naming
+    what to configure.
+    """
     snapshot = caps.snapshot()
     run = HarnessRun(
         project_id=project.id,
@@ -143,13 +152,51 @@ def create_run(
     db.flush()
 
     view = draft_store.get_draft(db, project.id)
+    video_duration = float(getattr(video, "duration", 0) or 0) or float(
+        view.payload.get("sourceDuration") or 0
+    )
+
+    plan_params = dict(params or {})
+    if not plan_params and intent:
+        from app.services.harness.planner import (
+            PROMPT_VERSION,
+            PlannerError,
+            plan_recipe_params,
+        )
+
+        seg = caps.capability(snapshot, "segmentation")
+        max_clip = float((seg.get("limits") or {}).get("maxClipSeconds") or 120)
+        run.stage = "Reading the request"
+        db.commit()
+        try:
+            planned = plan_recipe_params(
+                intent,
+                video_duration=video_duration,
+                max_clip_seconds=max_clip,
+                selection=selection,
+            )
+        except PlannerError as exc:
+            run.state = "needs_input"
+            run.error_code = "planner_unavailable"
+            run.error_detail = str(exc)[:2000]
+            run.stage = "Could not plan from the description"
+            db.commit()
+            return run
+        plan_params = planned.params
+        run.params = plan_params
+        run.model_provider = (
+            "anthropic" if "claude" in planned.model.lower() else "openrouter"
+        )
+        run.model_name = planned.model
+        run.prompt_version = PROMPT_VERSION
+        run.token_usage = planned.usage
+
     try:
         plan = compile_recipe(
             recipe_id,
-            params,
+            plan_params,
             capability_snapshot=snapshot,
-            video_duration=float(getattr(video, "duration", 0) or 0)
-            or float(view.payload.get("sourceDuration") or 0),
+            video_duration=video_duration,
         )
     except CompileError as exc:
         _fail(db, run, exc.code, str(exc))
