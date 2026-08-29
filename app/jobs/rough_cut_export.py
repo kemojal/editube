@@ -1077,6 +1077,7 @@ def _remap_timeline_layers_to_export(
     kept_ranges: list[tuple[float, float]],
     *,
     source_duration: float | None = None,
+    rates: list[float] | None = None,
 ) -> list[dict[str, Any]]:
     """Intersect source-time layers and map them onto the concatenated MP4.
 
@@ -1095,7 +1096,8 @@ def _remap_timeline_layers_to_export(
     """
     chunks: list[dict[str, Any]] = []
     output_cursor = 0.0
-    for kept_start, kept_end in kept_ranges:
+    for range_index, (kept_start, kept_end) in enumerate(kept_ranges):
+        rate = rates[range_index] if rates and range_index < len(rates) else 1.0
         for layer in layers:
             overlap_start = max(kept_start, float(layer["start"]))
             overlap_end = min(kept_end, float(layer["end"]))
@@ -1105,8 +1107,8 @@ def _remap_timeline_layers_to_export(
             chunks.append(
                 {
                     **layer,
-                    "outputStart": output_cursor + overlap_start - kept_start,
-                    "outputEnd": output_cursor + overlap_end - kept_start,
+                    "outputStart": output_cursor + (overlap_start - kept_start) / rate,
+                    "outputEnd": output_cursor + (overlap_end - kept_start) / rate,
                     "clipOffset": clip_offset,
                     "layerDuration": float(layer["end"]) - float(layer["start"]),
                     "layerOffset": clip_offset,
@@ -1117,7 +1119,7 @@ def _remap_timeline_layers_to_export(
                     ),
                 }
             )
-        output_cursor += kept_end - kept_start
+        output_cursor += (kept_end - kept_start) / rate
 
     if source_duration and source_duration > 0:
         kept_total = output_cursor
@@ -1450,6 +1452,7 @@ def _segment_audio_filter(
     *,
     segment_start: float,
     segment_end: float,
+    rate: float = 1.0,
 ) -> str | None:
     """Build one A-roll segment's `-af` chain, or None to leave audio alone.
 
@@ -1468,7 +1471,23 @@ def _segment_audio_filter(
         high = min(duration, muted_end - segment_start)
         if high - low > 0.001:
             parts.append(f"volume=0:enable='between(t,{low:.6f},{high:.6f})'")
-    parts.extend(_audio_effect_filter_parts(audio, duration))
+    if abs(rate - 1.0) > 0.001:
+        # Mutes above run in the SOURCE clock (pre-retime); the atempo sits
+        # between them and the fades, which then run in the OUTPUT clock with
+        # their times compressed to match the retimed clip.
+        from app.jobs.rough_cut_effect import _atempo_chain
+
+        parts.extend(_atempo_chain(rate))
+        scaled = dict(audio) if isinstance(audio, dict) else None
+        if scaled:
+            for key in ("fadeIn", "fadeOut"):
+                try:
+                    scaled[key] = max(0.0, float(scaled.get(key) or 0.0)) / rate
+                except (TypeError, ValueError):
+                    scaled[key] = 0.0
+        parts.extend(_audio_effect_filter_parts(scaled, duration / rate))
+    else:
+        parts.extend(_audio_effect_filter_parts(audio, duration))
     return ",".join(parts) if parts else None
 
 
@@ -2816,13 +2835,19 @@ def _resolve_numeric_fps(settings: dict[str, Any], source_video: str) -> float:
 def _remap_segments_to_export_timeline(
     segments: list[dict[str, Any]],
     normalized_ranges: list[tuple[float, float]],
+    rates: list[float] | None = None,
 ) -> list[tuple[float, float, str]]:
-    """Intersect segment timings with kept ranges; map to concatenated export time."""
+    """Intersect segment timings with kept ranges; map to concatenated export time.
+
+    `rates` (aligned with the ranges) compresses time inside a sped range:
+    a caption over a 2x clip lands at half the offset and half the length.
+    """
     out: list[tuple[float, float, str]] = []
     if not normalized_ranges:
         return out
     t_off = 0.0
-    for ks, ke in normalized_ranges:
+    for range_index, (ks, ke) in enumerate(normalized_ranges):
+        rate = rates[range_index] if rates and range_index < len(rates) else 1.0
         for seg in segments:
             if not isinstance(seg, dict):
                 continue
@@ -2838,10 +2863,10 @@ def _remap_segments_to_export_timeline(
             b = min(e, ke)
             if b - a < 0.02:
                 continue
-            out_s = t_off + (a - ks)
-            out_e = t_off + (b - ks)
+            out_s = t_off + (a - ks) / rate
+            out_e = t_off + (b - ks) / rate
             out.append((out_s, out_e, text))
-        t_off += ke - ks
+        t_off += (ke - ks) / rate
     out.sort(key=lambda x: x[0])
     return out
 
@@ -2849,6 +2874,7 @@ def _remap_segments_to_export_timeline(
 def _remap_segments_with_words(
     segments: list[dict[str, Any]],
     normalized_ranges: list[tuple[float, float]],
+    rates: list[float] | None = None,
 ) -> list[dict[str, Any]]:
     """`_remap_segments_to_export_timeline`, keeping word timings.
 
@@ -2860,7 +2886,8 @@ def _remap_segments_with_words(
     if not normalized_ranges:
         return out
     t_off = 0.0
-    for ks, ke in normalized_ranges:
+    for range_index, (ks, ke) in enumerate(normalized_ranges):
+        rate = rates[range_index] if rates and range_index < len(rates) else 1.0
         for seg in segments:
             if not isinstance(seg, dict):
                 continue
@@ -2895,19 +2922,19 @@ def _remap_segments_with_words(
                 words.append(
                     {
                         "word": token,
-                        "start": round(t_off + (ws_clipped - ks), 3),
-                        "end": round(t_off + (we_clipped - ks), 3),
+                        "start": round(t_off + (ws_clipped - ks) / rate, 3),
+                        "end": round(t_off + (we_clipped - ks) / rate, 3),
                     }
                 )
             out.append(
                 {
-                    "start": round(t_off + (a - ks), 3),
-                    "end": round(t_off + (b - ks), 3),
+                    "start": round(t_off + (a - ks) / rate, 3),
+                    "end": round(t_off + (b - ks) / rate, 3),
                     "text": text,
                     "words": words,
                 }
             )
-        t_off += ke - ks
+        t_off += (ke - ks) / rate
     out.sort(key=lambda item: item["start"])
     return out
 
@@ -3161,6 +3188,68 @@ def _masks_for_segment(
         if overlap > 0 and edge:
             out.append({k: v for k, v in mask.items() if k != "sourceRange"})
     return out
+
+
+
+#: Per-clip speed bounds — mirror the inspector's slider (0.25x–4x).
+_SPEED_MIN, _SPEED_MAX = 0.25, 4.0
+
+
+def _clip_speed_rate(settings: dict[str, Any] | None) -> float:
+    """The clip's speed multiplier from `videoRanges[].settings.speed.rate`."""
+    if not isinstance(settings, dict):
+        return 1.0
+    speed = settings.get("speed")
+    if not isinstance(speed, dict):
+        return 1.0
+    try:
+        rate = float(speed.get("rate", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(rate) or abs(rate - 1.0) < 0.001:
+        return 1.0
+    return max(_SPEED_MIN, min(_SPEED_MAX, rate))
+
+
+def _speed_rates_for_ranges(
+    normalized: list[tuple[float, float]],
+    *,
+    video_ranges: dict[tuple[float, float], dict[str, Any]],
+    masks: list[Any],
+    processed_ranges: dict[tuple[float, float], Any],
+) -> tuple[list[float], list[str]]:
+    """Per-range playback rates, with the v1 support boundary enforced.
+
+    Speed retimes a segment with `setpts`/`atempo`. That composes cleanly with
+    the plain render path; it does NOT yet compose with the compositor's
+    keyframe expressions (their `t` is source clock), a matte video (rendered
+    at source cadence), or a processed effect source (already its own file) —
+    so those clips render at 1x with a warning instead of rendering wrongly.
+    The client applies the same veto before it stamps burn-in times, so the
+    burn-in clock and the render agree by construction.
+    """
+    rates: list[float] = []
+    warnings: list[str] = []
+    for start, end in normalized:
+        settings = _match_audio_range(video_ranges, start, end)
+        rate = _clip_speed_rate(settings)
+        if rate != 1.0 and (
+            _needs_clip_compositor(settings)
+            or _masks_for_segment(masks, start, end)
+            or _match_audio_range(processed_ranges, start, end) is not None
+        ):
+            warnings.append(
+                f"Speed on the clip at {start:.1f}s was not applied in the export "
+                "(speed does not yet combine with masks, keyframed transforms, or "
+                "rendered effects on the same clip)."
+            )
+            rate = 1.0
+        rates.append(rate)
+    return rates, warnings
+
+
+def _output_span(start: float, end: float, rate: float) -> float:
+    return max(0.0, end - start) / max(_SPEED_MIN, rate)
 
 
 #: Output-profile loudness targets (integrated LUFS). Measured after the FULL
@@ -3563,6 +3652,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
         processed_ranges = _approved_processed_ranges(
             db, video_id, payload.get("processedRanges")
         )
+        caption_warnings: list[str] = []
         color_ranges = _range_settings(payload.get("colorRanges"))
         video_ranges = _range_settings(payload.get("videoRanges"))
         # LUT references become rendered cube paths before any chain is built.
@@ -3580,6 +3670,15 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
             for ref in lut_refs:
                 if ref.get("lut"):
                     resolve_adjust_lut(db, ref, allowed_workspace_ids=allowed)
+        # Per-range speed, with the v1 support veto. The client applies the
+        # same veto before stamping burn-in times, so both clocks agree.
+        range_rates, speed_warnings = _speed_rates_for_ranges(
+            normalized,
+            video_ranges=video_ranges,
+            masks=masks,
+            processed_ranges=processed_ranges,
+        )
+        caption_warnings.extend(speed_warnings)
         audio_ranges = _audio_range_settings(payload.get("audioRanges"))
         enhanced_audio_ranges = _approved_audio_ranges(
             db, video_id, payload.get("audioRanges")
@@ -3619,7 +3718,10 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 layer for layer in timeline_layers if str(layer.get("kind")) == "audio"
             ]
         timeline_chunks = _remap_timeline_layers_to_export(
-            timeline_layers, normalized, source_duration=source_duration
+            timeline_layers,
+            normalized,
+            source_duration=source_duration,
+            rates=range_rates,
         )
         # An audio lane never reaches a compositing pass as picture; it is fed
         # to the mixer alone, so it must be held apart from both text passes.
@@ -3630,7 +3732,10 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
         # How much timeline sits past the end of the A-roll. The base MP4 is
         # built from the source's own frames and so stops where they do; this
         # is the black-and-silence the appended clips need underneath them.
-        kept_total = sum(end - start for start, end in normalized)
+        kept_total = sum(
+            _output_span(start, end, range_rates[index])
+            for index, (start, end) in enumerate(normalized)
+        )
         timeline_tail = min(
             MAX_TAIL_SECONDS,
             max(
@@ -3672,7 +3777,6 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
         subtitle_worded: list[dict[str, Any]] = []
         subtitle_layer_entries: list[tuple[float, float, str]] = []
         caption_renderer = "srt"
-        caption_warnings: list[str] = []
         caption_style = (
             payload.get("captionStyle")
             if isinstance(payload.get("captionStyle"), dict)
@@ -3686,11 +3790,13 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 db, [*below_text_chunks, *above_text_chunks]
             )
             subtitle_entries = _merge_subtitle_entries(
-                _remap_segments_to_export_timeline(segments, normalized),
+                _remap_segments_to_export_timeline(segments, normalized, range_rates),
                 subtitle_layer_entries,
             )
             if caption_style:
-                subtitle_worded = _remap_segments_with_words(segments, normalized)
+                subtitle_worded = _remap_segments_with_words(
+                    segments, normalized, range_rates
+                )
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -3723,11 +3829,13 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                     # folding the halves here too would dip inside the cross.
                     fold_between=not audio_crossfades,
                 )
+                segment_rate = range_rates[index] if index < len(range_rates) else 1.0
                 segment_af = _segment_audio_filter(
                     segment_audio,
                     muted_ranges,
                     segment_start=start,
                     segment_end=start + dur,
+                    rate=segment_rate,
                 )
                 _run_ffmpeg(
                     [
@@ -3768,7 +3876,17 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                         *([] if use_clip_compositor else _motion_blur_filter_parts(video_settings)),
                         "format=rgba",
                     ]
-                    vf = ",".join(vf_parts) + fps_extra
+                    # Retiming runs AFTER the source-clock stages (keyframed
+                    # adjust windows, mutes) and BEFORE the CFR resample, so
+                    # their `t` still means source seconds. The veto in
+                    # `_speed_rates_for_ranges` guarantees this is the plain
+                    # `-vf` path whenever the rate is not 1.
+                    speed_part = (
+                        f",setpts=PTS/{segment_rate:.5f}"
+                        if abs(segment_rate - 1.0) > 0.001
+                        else ""
+                    )
+                    vf = ",".join(vf_parts) + speed_part + fps_extra
 
                     matte_path: Path | None = None
                     # Only THIS clip's masks. One flat list used to be applied
@@ -3902,7 +4020,10 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 merged_vid = tmp_path / "merged_v.mp4"
                 transition_command = _transition_video_command(
                     vid_parts,
-                    [max(0.04, end - start) for start, end in normalized],
+                    [
+                        max(0.04, _output_span(start, end, range_rates[index]))
+                        for index, (start, end) in enumerate(normalized)
+                    ],
                     transitions,
                     audio_path=merged_wav,
                     crf=crf,
