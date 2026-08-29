@@ -3449,6 +3449,8 @@ def _sanitize_burn_ins(
             # the overlay would never reach full opacity.
             fades.append(min(value, span / 2.0))
 
+        motion = _sanitize_burn_in_motion(item.get("motion"), index, skipped)
+
         path = tmp_path / f"burn_in_{len(entries)}.png"
         path.write_bytes(data)
         entries.append(
@@ -3458,10 +3460,276 @@ def _sanitize_burn_ins(
                 "end": end,
                 "fadeIn": fades[0],
                 "fadeOut": fades[1],
+                "motion": motion,
             }
         )
 
     return entries, skipped
+
+
+#: The text engine's own preset vocabulary (`animationIn`/`animationOut` in
+#: `rough-cut-types.ts`), NOT the timeline-layer preset names -- the two are
+#: different curves in the editor and stay different here.
+_TEXT_MOTION_PRESETS = {"none", "fade", "slide", "rise", "pop", "spin", "twist"}
+
+#: Presets whose motion is a transform about the block's own centre. Without a
+#: bounding box there is no pivot: scaling the full-frame raster about the
+#: frame centre would swing an off-centre title across the picture.
+_PIVOT_MOTION_PRESETS = {"pop", "spin", "twist"}
+
+
+def _sanitize_burn_in_motion(
+    raw: Any, index: int, skipped: list[str]
+) -> dict[str, Any] | None:
+    """Validate a burn-in's optional text-motion block.
+
+    The client sends the overlay's own animation settings -- preset names from
+    the text engine, the duration the user chose, the resolved em (frame px,
+    block scale included) the offsets are proportional to, and the block's
+    bounding box so transforms pivot about the block rather than the frame.
+    Hostile or missing pieces degrade one channel at a time with a reason,
+    never the whole entry: a title with a broken box still fades.
+    """
+    if not isinstance(raw, dict):
+        return None
+    preset_in = str(raw.get("in") or "none")
+    preset_out = str(raw.get("out") or "none")
+    if preset_in not in _TEXT_MOTION_PRESETS:
+        preset_in = "none"
+    if preset_out not in _TEXT_MOTION_PRESETS:
+        preset_out = "none"
+    if preset_in == "none" and preset_out == "none":
+        return None
+
+    duration = _number_between(raw.get("duration"), 0.02, 3.0, 0.45)
+    em = _number_between(raw.get("em"), 4.0, 400.0, 32.0)
+
+    box: dict[str, float] | None = None
+    raw_box = raw.get("box")
+    if isinstance(raw_box, dict):
+        try:
+            values = [float(raw_box.get(key, 0.0)) for key in ("x", "y", "width", "height")]
+        except (TypeError, ValueError):
+            values = []
+        if (
+            len(values) == 4
+            and all(math.isfinite(value) for value in values)
+            and values[2] >= 4
+            and values[3] >= 4
+        ):
+            box = {"x": values[0], "y": values[1], "width": values[2], "height": values[3]}
+
+    frame: dict[str, float] | None = None
+    raw_frame = raw.get("frame")
+    if isinstance(raw_frame, dict):
+        try:
+            frame_w = float(raw_frame.get("width", 0.0))
+            frame_h = float(raw_frame.get("height", 0.0))
+        except (TypeError, ValueError):
+            frame_w = frame_h = 0.0
+        if math.isfinite(frame_w) and math.isfinite(frame_h) and frame_w >= 2 and frame_h >= 2:
+            frame = {"width": frame_w, "height": frame_h}
+
+    if box is None:
+        downgraded = False
+        if preset_in in _PIVOT_MOTION_PRESETS:
+            preset_in, downgraded = "fade", True
+        if preset_out in _PIVOT_MOTION_PRESETS:
+            preset_out, downgraded = "fade", True
+        if downgraded:
+            skipped.append(f"burnIn[{index}]:motionPivotMissing")
+
+    return {
+        "in": preset_in,
+        "out": preset_out,
+        "duration": duration,
+        "em": em,
+        "box": box,
+        "frame": frame,
+    }
+
+
+def _eased_out_cubic01(progress: str) -> str:
+    """Clamp to 0-1 then cubic ease-out -- `easeOut` in text-canvas-animation.ts."""
+    clamped = f"max(0,min(1,{progress}))"
+    return f"(1-pow(1-({clamped}),3))"
+
+
+def _text_motion_channels(
+    motion: dict[str, Any], start: float, end: float, time_var: str = "t"
+) -> dict[str, str]:
+    """Per-channel ffmpeg expressions mirroring `textUnitTransform`.
+
+    The viewer's enter/exit transforms, reproduced curve for curve: slide is
+    0.45em, rise enters by 0.4em and leaves by 0.3em, pop overshoots
+    0.82->1.04->1, spin is 12 degrees with a 0.9->1 scale, twist is a cos()
+    foreshortening standing in for rotateY. Exit wins over enter -- an overlay
+    shorter than twice its animation duration must be seen to go -- so the
+    exit window is the OUTER if(), exactly as `textAnimationState` orders it.
+    """
+    duration = float(motion["duration"])
+    em = float(motion["em"])
+    settled = {"dx": "0", "dy": "0", "scale": "1", "scaleX": "1", "rot": "0", "opacity": "1"}
+
+    def _enter() -> dict[str, str]:
+        eased = _eased_out_cubic01(f"(({time_var})-{start:.6f})/{duration:.6f}")
+        away = f"(1-{eased})"
+        channels = dict(settled)
+        preset = motion["in"]
+        if preset == "fade":
+            channels["opacity"] = eased
+        elif preset == "slide":
+            channels["dx"] = f"({away})*{em * 0.45:.6f}"
+            channels["opacity"] = eased
+        elif preset == "rise":
+            channels["dy"] = f"({away})*{em * 0.4:.6f}"
+            channels["opacity"] = eased
+        elif preset == "pop":
+            channels["scale"] = (
+                f"if(lt({eased},0.7),0.82+(({eased})/0.7)*0.22,"
+                f"1.04-((({eased})-0.7)/0.3)*0.04)"
+            )
+            channels["opacity"] = eased
+        elif preset == "spin":
+            channels["rot"] = f"-12*({away})"
+            channels["scale"] = f"(0.9+({eased})*0.1)"
+            channels["opacity"] = eased
+        elif preset == "twist":
+            channels["scaleX"] = f"cos(34*({away})*PI/180)"
+            channels["opacity"] = eased
+        return channels
+
+    def _exit() -> dict[str, str]:
+        eased = _eased_out_cubic01(f"1-({end:.6f}-({time_var}))/{duration:.6f}")
+        channels = dict(settled)
+        preset = motion["out"]
+        if preset == "fade":
+            channels["opacity"] = f"(1-{eased})"
+        elif preset == "slide":
+            channels["dx"] = f"({eased})*{em * 0.45:.6f}"
+            channels["opacity"] = f"(1-{eased})"
+        elif preset == "rise":
+            channels["dy"] = f"-({eased})*{em * 0.3:.6f}"
+            channels["opacity"] = f"(1-{eased})"
+        elif preset == "pop":
+            channels["scale"] = f"(1-({eased})*0.18)"
+            channels["opacity"] = f"(1-{eased})"
+        elif preset == "spin":
+            channels["rot"] = f"12*({eased})"
+            channels["scale"] = f"(1-({eased})*0.1)"
+            channels["opacity"] = f"(1-{eased})"
+        elif preset == "twist":
+            channels["scaleX"] = f"cos(34*({eased})*PI/180)"
+            channels["opacity"] = f"(1-{eased})"
+        return channels
+
+    entered = _enter() if motion["in"] != "none" else None
+    exited = _exit() if motion["out"] != "none" else None
+    result: dict[str, str] = {}
+    for key, base in settled.items():
+        # A channel neither phase touches stays its literal identity, so the
+        # graph builder can tell "no scale anywhere" from "scale that happens
+        # to be 1 right now" and skip the whole filter.
+        expression = base
+        if entered is not None and entered[key] != base:
+            expression = (
+                f"if(lte(({time_var})-{start:.6f},{duration:.6f}),{entered[key]},{base})"
+            )
+        if exited is not None and exited[key] != base:
+            expression = (
+                f"if(lte({end:.6f}-({time_var}),{duration:.6f}),{exited[key]},{expression})"
+            )
+        result[key] = expression
+    return result
+
+
+def _append_motion_burn_in(
+    graph: list[str],
+    *,
+    index: int,
+    item: dict[str, Any],
+    width: int,
+    height: int,
+    base_label: str,
+    out_label: str,
+) -> None:
+    """One animated burn-in's filter chain -- the compositor's own moves.
+
+    The looped PNG stream's clock is the OUTPUT clock (its `-t` bound is the
+    overlay's exit, not its span), so every expression can use `t` directly.
+    With a bounding box, the raster is cropped to the block and animated about
+    the block's own centre: geq ramps alpha (pixel time `T`), rotate spins on
+    an enlarged transparent canvas, `scale ... eval=frame` breathes, and the
+    overlay places the animated centre back where the block lives, plus the
+    slide/rise offset. Without a box only the pivot-free channels run
+    (translate + opacity) on the full frame -- `_sanitize_burn_in_motion`
+    already downgraded the rest. Motion owns opacity: the static path's
+    fade filters do not apply here, so a client that sent both cannot fade
+    the same alpha twice.
+    """
+    motion = item["motion"]
+    start = float(item["start"])
+    end = float(item["end"])
+    channels = _text_motion_channels(motion, start, end)
+    filters = ["format=rgba", f"scale={width}:{height}"]
+
+    box = motion.get("box")
+    if box:
+        frame = motion.get("frame")
+        scale_x = width / frame["width"] if frame else 1.0
+        scale_y = height / frame["height"] if frame else 1.0
+        box_x = max(0.0, min(box["x"] * scale_x, width - 4.0))
+        box_y = max(0.0, min(box["y"] * scale_y, height - 4.0))
+        box_w = max(4.0, min(box["width"] * scale_x, width - box_x))
+        box_h = max(4.0, min(box["height"] * scale_y, height - box_y))
+        crop_w = max(2, int(round(box_w / 2)) * 2)
+        crop_h = max(2, int(round(box_h / 2)) * 2)
+        crop_x = min(int(round(box_x)), width - crop_w)
+        crop_y = min(int(round(box_y)), height - crop_h)
+        filters.append(f"crop={crop_w}:{crop_h}:{max(0, crop_x)}:{max(0, crop_y)}")
+        centre_x = max(0, crop_x) + crop_w / 2.0
+        centre_y = max(0, crop_y) + crop_h / 2.0
+        base_w, base_h = crop_w, crop_h
+    else:
+        centre_x = width / 2.0
+        centre_y = height / 2.0
+        base_w, base_h = width, height
+
+    if channels["opacity"] != "1":
+        opacity_at_pixel_time = re.sub(r"\bt\b", "T", channels["opacity"])
+        filters.append(
+            "geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+            f"a='alpha(X,Y)*({opacity_at_pixel_time})'"
+        )
+
+    layer = f"burn_layer{index}"
+    graph.append(f"[{index + 1}:v]{','.join(filters)}[{layer}]")
+    current = layer
+
+    if channels["rot"] != "0":
+        diagonal = max(2, int(math.ceil(math.hypot(base_w, base_h) / 2) * 2))
+        graph.append(
+            f"[{current}]rotate=angle='({channels['rot']})*PI/180':"
+            f"ow={diagonal}:oh={diagonal}:c=none[{layer}_rot]"
+        )
+        current = f"{layer}_rot"
+        base_w = base_h = diagonal
+
+    if channels["scale"] != "1" or channels["scaleX"] != "1":
+        scale_x_expression = f"({channels['scale']})*({channels['scaleX']})"
+        graph.append(
+            f"[{current}]scale="
+            f"w='trunc(max(2,{base_w}*({scale_x_expression}))/2)*2':"
+            f"h='trunc(max(2,{base_h}*({channels['scale']}))/2)*2':eval=frame[{layer}_scaled]"
+        )
+        current = f"{layer}_scaled"
+
+    overlay_x = f"{centre_x:.4f}-w/2+({channels['dx']})"
+    overlay_y = f"{centre_y:.4f}-h/2+({channels['dy']})"
+    graph.append(
+        f"[{base_label}][{current}]overlay=x='{overlay_x}':y='{overlay_y}':format=auto:"
+        f"enable='between(t,{start:.6f},{end:.6f})'[{out_label}]"
+    )
 
 
 def _burn_in_overlay_command(
@@ -3505,6 +3773,19 @@ def _burn_in_overlay_command(
     for index, item in enumerate(burn_ins):
         start = float(item["start"])
         end = float(item["end"])
+        nxt = f"burn_base{index + 1}"
+        if item.get("motion"):
+            _append_motion_burn_in(
+                graph,
+                index=index,
+                item=item,
+                width=int(width),
+                height=int(height),
+                base_label=current,
+                out_label=nxt,
+            )
+            current = nxt
+            continue
         fade_in = float(item.get("fadeIn") or 0.0)
         fade_out = float(item.get("fadeOut") or 0.0)
         filters = ["format=rgba", f"scale={int(width)}:{int(height)}"]
@@ -3515,7 +3796,6 @@ def _burn_in_overlay_command(
             filters.append(f"fade=t=out:st={fade_out_start:.6f}:d={fade_out:.6f}:alpha=1")
         layer = f"burn_layer{index}"
         graph.append(f"[{index + 1}:v]{','.join(filters)}[{layer}]")
-        nxt = f"burn_base{index + 1}"
         graph.append(
             f"[{current}][{layer}]overlay=0:0:format=auto:"
             f"enable='between(t,{start:.6f},{end:.6f})'[{nxt}]"
@@ -4264,6 +4544,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 "timelineLayerChunks": len(timeline_chunks),
                 "shortsExport": shorts_export,
                 "burnInsApplied": len(burn_in_entries),
+                "burnInsAnimated": sum(1 for entry in burn_in_entries if entry.get("motion")),
                 "loudnessTarget": loudness_target if loudness_target in _LOUDNESS_TARGETS else None,
             }
             if caption_warnings:
