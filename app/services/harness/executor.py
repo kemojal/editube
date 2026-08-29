@@ -197,6 +197,7 @@ def create_run(
             plan_params,
             capability_snapshot=snapshot,
             video_duration=video_duration,
+            draft=view.payload,
         )
     except CompileError as exc:
         _fail(db, run, exc.code, str(exc))

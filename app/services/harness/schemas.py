@@ -18,7 +18,7 @@ import hashlib
 import json
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SCHEMA_VERSION = 1
 
@@ -171,8 +171,67 @@ class SetKeyframesOp(_OperationBase):
         return value
 
 
+#: Adjust keys a harness plan may set — the subset of the editor's grade with
+#: unambiguous, bounded semantics. Everything is the editor's own −100..100
+#: slider scale (`app/services/color_adjust.py` clamps identically).
+ADJUSTABLE_KEYS = (
+    "temp", "tint", "exposure", "contrast", "saturation", "vibrance",
+    "highlight", "shadow", "brilliance", "fade",
+)
+
+
+class _ExistingClipOp(_OperationBase):
+    """An operation on a clip the USER made — the non-additive family.
+
+    `clipKey` addresses the clip the way the editor does
+    (`<track>:<rangeId>` / `media:<itemId>`); `fingerprint` records the
+    source range the plan believed that key covered. At apply time a missing
+    key or a moved fingerprint SKIPS the operation with a warning — the
+    anchor-miss discipline: never modify approximately.
+    """
+
+    clipKey: str = Field(min_length=1, max_length=128, pattern=r"^(video|audio|media):")
+    fingerprint: SourceRange | None = None
+
+
+class AdjustClipOp(_ExistingClipOp):
+    type: Literal["visual.adjust"] = "visual.adjust"
+    settings: dict[str, float] = Field(min_length=1, max_length=len(ADJUSTABLE_KEYS))
+
+    @field_validator("settings")
+    @classmethod
+    def _bounded_known_keys(cls, value: dict[str, float]) -> dict[str, float]:
+        for key, amount in value.items():
+            if key not in ADJUSTABLE_KEYS:
+                raise ValueError(f"unknown adjust key {key!r}")
+            if not -100 <= float(amount) <= 100:
+                raise ValueError(f"adjust {key} out of the -100..100 slider range")
+        return value
+
+
+class AudioClipOp(_ExistingClipOp):
+    type: Literal["audio.adjust"] = "audio.adjust"
+    volume: float | None = Field(default=None, ge=-60, le=60)
+    fadeIn: float | None = Field(default=None, ge=0, le=10)
+    fadeOut: float | None = Field(default=None, ge=0, le=10)
+
+    @model_validator(mode="after")
+    def _something_to_do(self) -> "AudioClipOp":
+        if self.volume is None and self.fadeIn is None and self.fadeOut is None:
+            raise ValueError("audio.adjust needs at least one of volume/fadeIn/fadeOut")
+        return self
+
+
 Operation = Annotated[
-    Union[DuplicateLinkedOp, SubjectMaskOp, CreateTextOp, ApplyPresetOp, SetKeyframesOp],
+    Union[
+        DuplicateLinkedOp,
+        SubjectMaskOp,
+        CreateTextOp,
+        ApplyPresetOp,
+        SetKeyframesOp,
+        AdjustClipOp,
+        AudioClipOp,
+    ],
     Field(discriminator="type"),
 ]
 

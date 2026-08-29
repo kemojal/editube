@@ -26,7 +26,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.services.harness.schemas import (
+    AdjustClipOp,
     ApplyPresetOp,
+    AudioClipOp,
     CreateTextOp,
     DuplicateLinkedOp,
     HarnessPlan,
@@ -279,12 +281,87 @@ def _apply_keyframes(
     _set_attribute(draft, clip_key, "keyframes", keyframes, result)
 
 
+def _existing_clip_present(
+    draft: dict[str, Any], op: AdjustClipOp | AudioClipOp
+) -> tuple[bool, str | None]:
+    """Does the clip this op targets still exist where the plan left it?
+
+    A `video:`/`audio:` key resolves against the keep range whose id the key
+    names; a `media:` key against the timeline item. The fingerprint tolerates
+    small trims (the same 50 ms drift budget the exporter uses) and rejects a
+    range that moved wholesale — the anchor-miss discipline: skip with a
+    reason, never modify approximately.
+    """
+    track, _, target_id = op.clipKey.partition(":")
+    if track == "media":
+        items = draft.get("timelineMediaItems") or []
+        found = any(
+            isinstance(item, dict) and str(item.get("id")) == target_id for item in items
+        )
+        return (True, None) if found else (False, f"clip {op.clipKey} is no longer on the timeline")
+    ranges = draft.get("keepRanges") or []
+    for entry in ranges:
+        if not isinstance(entry, dict) or str(entry.get("id")) != target_id:
+            continue
+        if op.fingerprint is None:
+            return True, None
+        try:
+            start = float(entry.get("start"))
+            end = float(entry.get("end"))
+        except (TypeError, ValueError):
+            return False, f"clip {op.clipKey} has no readable range any more"
+        if (
+            abs(start - op.fingerprint.start) <= 0.05
+            or abs(end - op.fingerprint.end) <= 0.05
+        ):
+            return True, None
+        return False, (
+            f"clip {op.clipKey} was re-cut after the plan was written "
+            f"({op.fingerprint.start:.2f}–{op.fingerprint.end:.2f}s is now "
+            f"{start:.2f}–{end:.2f}s)"
+        )
+    return False, f"clip {op.clipKey} was deleted after the plan was written"
+
+
+def _apply_adjust_clip(
+    draft: dict[str, Any], op: AdjustClipOp, ctx: MutationContext, result: MutationResult
+) -> None:
+    present, reason = _existing_clip_present(draft, op)
+    if not present:
+        result.warnings.append(f"Skipped the colour change: {reason}.")
+        return
+    attrs = (draft.get("clipAttributes") or {}).get(op.clipKey) or {}
+    existing = attrs.get("adjust") if isinstance(attrs.get("adjust"), dict) else {}
+    # Merge, never replace: the user's other grade keys survive, and the
+    # inverse restores the whole `adjust` value they had before.
+    _set_attribute(draft, op.clipKey, "adjust", {**existing, **op.settings}, result)
+
+
+def _apply_audio_clip(
+    draft: dict[str, Any], op: AudioClipOp, ctx: MutationContext, result: MutationResult
+) -> None:
+    present, reason = _existing_clip_present(draft, op)
+    if not present:
+        result.warnings.append(f"Skipped the audio change: {reason}.")
+        return
+    attrs = (draft.get("clipAttributes") or {}).get(op.clipKey) or {}
+    existing = attrs.get("audio") if isinstance(attrs.get("audio"), dict) else {}
+    changes = {
+        key: value
+        for key, value in (("volume", op.volume), ("fadeIn", op.fadeIn), ("fadeOut", op.fadeOut))
+        if value is not None
+    }
+    _set_attribute(draft, op.clipKey, "audio", {**existing, **changes}, result)
+
+
 _APPLIERS = {
     "timeline.duplicate_linked": _apply_duplicate,
     "visual.apply_subject_mask": _apply_subject_mask,
     "overlay.create_text": _apply_create_text,
     "motion.apply_preset": _apply_preset,
     "motion.set_keyframes": _apply_keyframes,
+    "visual.adjust": _apply_adjust_clip,
+    "audio.adjust": _apply_audio_clip,
 }
 
 

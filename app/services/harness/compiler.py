@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.services.harness.schemas import (
     ANIMATION_PRESETS,
     TEXT_TEMPLATES,
+    AdjustClipOp,
     CreateTextOp,
     DuplicateLinkedOp,
     HarnessPlan,
@@ -52,6 +53,39 @@ class SubjectBehindTextParams(BaseModel):
     maskQuality: str = Field(default="faster", pattern="^(faster|better)$")
     animationIn: str = Field(default="fade", pattern="^(none|fade|rise|pop)$")
     animationDuration: float = Field(default=0.35, ge=0.12, le=1.5)
+    #: Pull the base plate down a touch so the title reads against it. This is
+    #: the recipe's first NON-additive step: it modifies the user's own A-roll
+    #: clip, and reverting restores their exact previous grade.
+    dimBackground: bool = False
+
+
+def _base_clip_for_range(
+    draft: dict[str, Any] | None, target: SourceRange
+) -> tuple[str, SourceRange] | None:
+    """The A-roll keep range under the selection, as (clipKey, fingerprint).
+
+    Resolved from the draft at COMPILE time and re-verified against it at
+    apply time by the mutation's own fingerprint check. A range without a
+    persisted id cannot be addressed durably and returns None — the caller
+    degrades with a warning rather than guessing.
+    """
+    if not isinstance(draft, dict):
+        return None
+    midpoint = (target.start + target.end) / 2
+    for entry in draft.get("keepRanges") or []:
+        if not isinstance(entry, dict):
+            continue
+        range_id = str(entry.get("id") or "").strip()
+        try:
+            start = float(entry.get("start"))
+            end = float(entry.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if not range_id or end <= start:
+            continue
+        if start - 0.05 <= midpoint <= end + 0.05:
+            return f"video:{range_id}", SourceRange(start=start, end=end)
+    return None
 
 
 def compile_subject_behind_text(
@@ -59,6 +93,7 @@ def compile_subject_behind_text(
     *,
     capability_snapshot: dict[str, Any],
     video_duration: float,
+    draft: dict[str, Any] | None = None,
 ) -> HarnessPlan:
     parsed = SubjectBehindTextParams.model_validate(params)
 
@@ -126,6 +161,28 @@ def compile_subject_behind_text(
             explanationKey="harness.op.title_between_layers",
         ),
     ]
+
+    if parsed.dimBackground:
+        base = _base_clip_for_range(draft, parsed.range)
+        if base is None:
+            warnings.append(
+                "Could not dim the background: the clip under the selection has "
+                "no addressable id yet (save the draft once and re-plan)."
+            )
+        else:
+            clip_key, fingerprint = base
+            operations.append(
+                AdjustClipOp(
+                    id="dim",
+                    clipKey=clip_key,
+                    fingerprint=fingerprint,
+                    # Conservative, on the editor's own −100..100 slider scale:
+                    # enough for the title to read, not enough to look graded.
+                    settings={"exposure": -22.0, "saturation": -12.0},
+                    explanationKey="harness.op.dim_background",
+                )
+            )
+
     return HarnessPlan(
         recipe="subject_behind_text",
         recipeVersion=RECIPES["subject_behind_text"]["version"],
@@ -145,12 +202,16 @@ def compile_recipe(
     *,
     capability_snapshot: dict[str, Any],
     video_duration: float,
+    draft: dict[str, Any] | None = None,
 ) -> HarnessPlan:
     compiler = _COMPILERS.get(recipe_id)
     if compiler is None:
         raise CompileError("unknown_recipe", f"Unknown recipe {recipe_id!r}.")
     return compiler(
-        params, capability_snapshot=capability_snapshot, video_duration=video_duration
+        params,
+        capability_snapshot=capability_snapshot,
+        video_duration=video_duration,
+        draft=draft,
     )
 
 
