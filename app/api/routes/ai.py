@@ -1526,6 +1526,9 @@ class RoughCutExportBody(BaseModel):
     # worker only decodes, validates and overlays it at 0:0.
     burnIns: list[dict[str, Any]] = Field(default_factory=list)
     burnInsIncludeLowerThirds: bool = False
+    #: True when `burnIns` carries the brand badge — the worker then stops
+    #: reporting brand as skipped.
+    burnInsIncludeBrand: bool = False
     # When true, the rendered output registers as the NEXT VERSION of this
     # video (same version_group_id, version = max+1) once the export
     # completes. Back-compat default off — existing callers keep getting
@@ -1594,6 +1597,7 @@ def start_rough_cut_export(
         "burnIns": burn_ins,
         "burnInsRejected": burn_ins_rejected,
         "burnInsIncludeLowerThirds": body.burnInsIncludeLowerThirds,
+        "burnInsIncludeBrand": body.burnInsIncludeBrand,
         "progress": 0,
     }
 

@@ -255,13 +255,6 @@ def _track_direction(
     backward (never past the source video's own bounds either). Returns
     (keyframes, lost_at_frame_or_None). Never emits keyframes past the loss
     point. Re-checks cancellation every `_CANCEL_CHECK_STRIDE` frames."""
-    # Lazy like the job's own import: this module is imported by the API
-    # process for its pure helpers, and cv2 must never be a hard dependency
-    # there. Referencing a module-global `cv2` here was in fact a latent
-    # NameError — the job's `import cv2` is function-local — one more way the
-    # tracking path had never actually run (plan §5.2 G7).
-    import cv2
-
     keyframes: list[dict[str, Any]] = []
     frame_idx = start_frame_idx
     bbox = initial_bbox
@@ -331,11 +324,18 @@ def tracker_availability() -> tuple[str | None, str | None]:
         return None, "OpenCV is not installed in this worker environment."
     if hasattr(cv2, "TrackerCSRT_create"):
         return "csrt", None
+    # Semantic propagation beats a generic box tracker when the ML stack is
+    # installed: SAM2 follows the SUBJECT, not a rectangle of pixels.
+    from app.services.propagation_tracker import propagation_available
+
+    if propagation_available():
+        return "propagate", None
     if hasattr(cv2, "TrackerMIL_create") and os.environ.get("MASK_TRACK_ALLOW_MIL") == "1":
         return "mil", None
     return None, (
         "This server's OpenCV build has no CSRT tracker (it needs the contrib "
-        "'tracking' module). Install opencv-contrib-python-headless on the "
+        "'tracking' module) and the SAM 2 stack is not installed. Install "
+        "opencv-contrib-python-headless or run scripts/setup_ml_env.sh on the "
         "worker, or set MASK_TRACK_ALLOW_MIL=1 to allow the lower-quality "
         "built-in MIL tracker."
     )
@@ -350,6 +350,77 @@ def _create_tracker():
     if backend == "mil":
         return cv2.TrackerMIL_create()
     raise TrackerUnavailable(reason or "No tracker available.")
+
+
+def _run_propagation_tracking(
+    db,
+    ai_result_id: int,
+    media_src: str,
+    *,
+    mask: dict[str, Any],
+    direction: str,
+    anchor_time: float,
+    clip_start: float,
+    clip_end: float,
+) -> dict[str, Any]:
+    """The SAM2 backend: same inputs, same result shape as the box tracker."""
+    from app.services.propagation_tracker import track_by_propagation
+
+    result = track_by_propagation(
+        media_src,
+        mask_bbox_normalized=mask,
+        clip_start=clip_start,
+        clip_end=clip_end,
+        anchor_time=anchor_time,
+        direction=direction,
+        progress=lambda value: _update_progress(db, ai_result_id, progress=value),
+        cancelled=lambda: _row_is_stopped(db, ai_result_id),
+    )
+    return {
+        "keyframes": result.get("keyframes") or [],
+        "lost_at_frame": result.get("lostAtFrame"),
+        "fps": float(result.get("fps") or 30.0),
+        "cancelled": bool(result.get("cancelled")),
+    }
+
+
+def _finalize_tracking_result(
+    db,
+    ai_result_id: int,
+    *,
+    keyframes: list[dict[str, Any]],
+    lost_at_frame: int | None,
+    fps: float,
+    clip_start: float,
+    cancelled: bool = False,
+) -> None:
+    """Commit a finished run: `completed`, or `partial` with a clip-relative
+    `lostAt`. Shared by both tracking backends so the frontend's Keep/Discard
+    flow cannot tell them apart. A cancelled run commits nothing — the cancel
+    endpoint already wrote the user's answer."""
+    if cancelled or _row_is_stopped(db, ai_result_id):
+        return
+    row = db.query(AiResult).filter(AiResult.id == ai_result_id).first()
+    if row is None:
+        return
+    keyframes = sorted(keyframes, key=lambda kf: kf["frame"])
+    final_payload = dict(row.result_data or {})
+    final_payload["keyframes"] = keyframes
+    final_payload["progress"] = 100
+    if lost_at_frame is not None:
+        final_payload["status"] = "partial"
+        # Clip-relative seconds, matching the frontend's `formatMinSec`
+        # rendering of `lostAt` -- NOT a source-absolute frame index.
+        final_payload["lostAt"] = max(
+            0.0, (lost_at_frame / fps if fps > 0 else 0.0) - clip_start
+        )
+        row.status = "partial"
+    else:
+        final_payload["status"] = "completed"
+        row.status = "completed"
+    row.result_data = final_payload
+    row.error_message = None
+    db.commit()
 
 
 def mask_track_job(ai_result_id: int) -> None:
@@ -407,6 +478,24 @@ def mask_track_job(ai_result_id: int) -> None:
         # link-local hosts before ever handing the source to OpenCV. Do not
         # echo `media_src` in any error raised from here on.
         _assert_media_source_safe(media_src)
+
+        if _backend == "propagate":
+            _finalize_tracking_result(
+                db,
+                ai_result_id,
+                clip_start=clip_start,
+                **_run_propagation_tracking(
+                    db,
+                    ai_result_id,
+                    media_src,
+                    mask=mask,
+                    direction=direction,
+                    anchor_time=anchor_time,
+                    clip_start=clip_start,
+                    clip_end=clip_end,
+                ),
+            )
+            return
 
         import cv2
 
@@ -487,31 +576,14 @@ def mask_track_job(ai_result_id: int) -> None:
         finally:
             cap.release()
 
-        # Final cancellation check before committing a result.
-        if _row_is_stopped(db, ai_result_id):
-            return
-
-        keyframes.sort(key=lambda kf: kf["frame"])
-
-        row = db.query(AiResult).filter(AiResult.id == ai_result_id).first()
-        if row is None:
-            return
-        final_payload = dict(row.result_data or {})
-        final_payload["keyframes"] = keyframes
-        final_payload["progress"] = 100
-        if lost_at is not None:
-            final_payload["status"] = "partial"
-            # Clip-relative seconds, matching the frontend's `formatMinSec`
-            # rendering of `lostAt` -- NOT a source-absolute frame index.
-            # Clamped at zero for the same rounding reason as `t` above.
-            final_payload["lostAt"] = max(0.0, (lost_at / fps if fps > 0 else 0.0) - clip_start)
-            row.status = "partial"
-        else:
-            final_payload["status"] = "completed"
-            row.status = "completed"
-        row.result_data = final_payload
-        row.error_message = None
-        db.commit()
+        _finalize_tracking_result(
+            db,
+            ai_result_id,
+            keyframes=keyframes,
+            lost_at_frame=lost_at,
+            fps=fps,
+            clip_start=clip_start,
+        )
     except Exception as exc:
         logger.exception("mask_track_job failed for ai_result=%s: %s", ai_result_id, exc)
         try:

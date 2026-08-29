@@ -3535,16 +3535,18 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
 
         burn_skipped: list[str] = []
         # "lowerThirds"/"brand" report overlays this worker cannot draw itself.
-        # A client that rasterized its lower thirds says so explicitly, and
-        # those cards are in `burnIns` below -- reporting them as skipped would
-        # then be a lie. Anything else (an older client, the brand overlay,
-        # which nothing rasterizes yet) is still genuinely absent.
+        # A client that rasterized them says so explicitly, and those cards are
+        # in `burnIns` below -- reporting them as skipped would then be a lie.
+        # Anything else (an older client) is still genuinely absent.
         client_burned_lower_thirds = bool(
             payload.get("burnInsIncludeLowerThirds") and raw_burn_ins and want_mp4_video
         )
         if include_lt and not client_burned_lower_thirds:
             burn_skipped.append("lowerThirds")
-        if include_brand:
+        client_burned_brand = bool(
+            payload.get("burnInsIncludeBrand") and raw_burn_ins and want_mp4_video
+        )
+        if include_brand and not client_burned_brand:
             burn_skipped.append("brand")
         try:
             rejected_at_ingest = int(payload.get("burnInsRejected") or 0)
