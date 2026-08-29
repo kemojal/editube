@@ -20,6 +20,7 @@ import pytest
 
 from app.jobs.rough_cut_export import (
     _burn_in_overlay_command,
+    _sampled_motion_channels,
     _sanitize_burn_in_motion,
     _sanitize_burn_ins,
     _text_motion_channels,
@@ -209,6 +210,154 @@ class TestCommand:
         assert "crop=" not in joined and "eval=frame" not in joined
         assert "rotate=" not in joined
         assert "-h/2+(if(" in joined  # the rise offset rides the overlay y
+
+
+SAMPLED = {
+    "box": MOTION["box"],
+    "frame": MOTION["frame"],
+    "phases": [
+        {
+            "at": "in",
+            "duration": 0.5,
+            "tracks": {
+                "opacity": [{"t": 0.0, "v": 0.0}, {"t": 0.5, "v": 1.0}],
+                "dy": [{"t": 0.0, "v": 40.0}, {"t": 0.25, "v": 8.0}, {"t": 0.5, "v": 0.0}],
+                "scale": [{"t": 0.0, "v": 0.4}, {"t": 0.5, "v": 1.0}],
+            },
+        },
+        {
+            "at": "loop",
+            "duration": 1.0,
+            "tracks": {
+                "rotation": [{"t": 0.0, "v": -4.0}, {"t": 0.5, "v": 4.0}, {"t": 1.0, "v": -4.0}],
+            },
+        },
+    ],
+}
+
+
+class TestSampledForm:
+    def test_sanitize_keeps_the_engine_samples(self):
+        skipped: list[str] = []
+        motion = _sanitize_burn_in_motion(dict(SAMPLED), 0, skipped)
+        assert skipped == []
+        assert motion is not None and len(motion["phases"]) == 2
+        assert motion["phases"][0]["tracks"]["dy"][0] == {"t": 0.0, "v": 40.0}
+
+    def test_pivot_tracks_are_dropped_without_a_box(self):
+        skipped: list[str] = []
+        motion = _sanitize_burn_in_motion(
+            {"phases": SAMPLED["phases"]}, 2, skipped
+        )
+        assert motion is not None
+        tracks = motion["phases"][0]["tracks"]
+        assert "scale" not in tracks and "opacity" in tracks and "dy" in tracks
+        # The loop phase held only rotation, so it fell away entirely.
+        assert len(motion["phases"]) == 1
+        assert skipped == ["burnIn[2]:motionPivotMissing"]
+
+    def test_garbage_phases_yield_no_motion_with_a_reason(self):
+        skipped: list[str] = []
+        motion = _sanitize_burn_in_motion(
+            {"phases": [{"at": "in", "duration": "soon", "tracks": {}}]}, 5, skipped
+        )
+        assert motion is None
+        assert skipped == ["burnIn[5]:motionInvalid"]
+
+    def test_hostile_samples_are_clamped(self):
+        motion = _sanitize_burn_in_motion(
+            {
+                "box": MOTION["box"],
+                "phases": [
+                    {
+                        "at": "in",
+                        "duration": 0.5,
+                        "tracks": {
+                            "opacity": [{"t": -3.0, "v": 9.0}, {"t": 99.0, "v": -1.0}],
+                        },
+                    }
+                ],
+            },
+            0,
+            [],
+        )
+        samples = motion["phases"][0]["tracks"]["opacity"]
+        assert samples[0] == {"t": 0.0, "v": 1.5}
+        assert samples[1] == {"t": 0.5, "v": 0.0}
+
+    def test_channels_merge_like_the_element_engine(self):
+        channels = _sampled_motion_channels(SAMPLED, 1.0, 5.0)
+        # The in-phase gates on its window; the loop wraps for the whole span.
+        assert channels["opacity"].startswith("if(lte((t)-1.000000,0.500000)")
+        assert "mod((t)-1.000000,1.000000)" in channels["rot"]
+        # dy interpolates through the mid sample.
+        assert "40.000000+(-32.000000)*" in channels["dy"]
+
+    def test_an_out_phase_ends_at_the_exit(self):
+        channels = _sampled_motion_channels(
+            {
+                "phases": [
+                    {
+                        "at": "out",
+                        "duration": 0.4,
+                        "tracks": {"opacity": [{"t": 0.0, "v": 1.0}, {"t": 0.4, "v": 0.0}]},
+                    }
+                ]
+            },
+            1.0,
+            5.0,
+        )
+        assert "gte((t),4.600000)" in channels["opacity"]
+
+    def test_command_animates_from_sampled_phases(self, tmp_path: Path):
+        entries, skipped = _sanitize_burn_ins(
+            [_entry(motion=dict(SAMPLED))], tmp_path=tmp_path, output_duration=10.0
+        )
+        assert skipped == []
+        command = " ".join(
+            _burn_in_overlay_command(
+                base_video=Path("in.mp4"),
+                burn_ins=entries,
+                width=640,
+                height=360,
+                frame_rate=30.0,
+                crf=23,
+                output=Path("out.mp4"),
+            )
+        )
+        assert "crop=200:80:100:60" in command
+        assert "rotate=angle=" in command  # the loop's wobble
+        assert "eval=frame" in command  # the sampled scale
+        assert "alpha(X,Y)*" in command
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="no ffmpeg on this machine")
+def test_the_sampled_graph_actually_renders(tmp_path: Path):
+    base = tmp_path / "base.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=640x360:d=3:r=30",
+            "-pix_fmt", "yuv420p", str(base),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    entries, _ = _sanitize_burn_ins(
+        [_entry(motion=dict(SAMPLED))], tmp_path=tmp_path, output_duration=3.0
+    )
+    output = tmp_path / "out.mp4"
+    command = _burn_in_overlay_command(
+        base_video=base,
+        burn_ins=entries,
+        width=640,
+        height=360,
+        frame_rate=30.0,
+        crf=28,
+        output=output,
+    )
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert output.exists() and output.stat().st_size > 0
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="no ffmpeg on this machine")

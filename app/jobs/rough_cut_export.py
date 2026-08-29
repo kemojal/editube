@@ -3493,6 +3493,15 @@ def _sanitize_burn_in_motion(
     if not isinstance(raw, dict):
         return None
     preset_in = str(raw.get("in") or "none")
+    box = _sanitize_motion_box(raw.get("box"))
+    frame = _sanitize_motion_frame(raw.get("frame"))
+
+    if isinstance(raw.get("phases"), list):
+        phases = _sanitize_motion_phases(raw["phases"], index, skipped, has_box=box is not None)
+        if not phases:
+            return None
+        return {"phases": phases, "box": box, "frame": frame}
+
     preset_out = str(raw.get("out") or "none")
     if preset_in not in _TEXT_MOTION_PRESETS:
         preset_in = "none"
@@ -3503,32 +3512,6 @@ def _sanitize_burn_in_motion(
 
     duration = _number_between(raw.get("duration"), 0.02, 3.0, 0.45)
     em = _number_between(raw.get("em"), 4.0, 400.0, 32.0)
-
-    box: dict[str, float] | None = None
-    raw_box = raw.get("box")
-    if isinstance(raw_box, dict):
-        try:
-            values = [float(raw_box.get(key, 0.0)) for key in ("x", "y", "width", "height")]
-        except (TypeError, ValueError):
-            values = []
-        if (
-            len(values) == 4
-            and all(math.isfinite(value) for value in values)
-            and values[2] >= 4
-            and values[3] >= 4
-        ):
-            box = {"x": values[0], "y": values[1], "width": values[2], "height": values[3]}
-
-    frame: dict[str, float] | None = None
-    raw_frame = raw.get("frame")
-    if isinstance(raw_frame, dict):
-        try:
-            frame_w = float(raw_frame.get("width", 0.0))
-            frame_h = float(raw_frame.get("height", 0.0))
-        except (TypeError, ValueError):
-            frame_w = frame_h = 0.0
-        if math.isfinite(frame_w) and math.isfinite(frame_h) and frame_w >= 2 and frame_h >= 2:
-            frame = {"width": frame_w, "height": frame_h}
 
     if box is None:
         downgraded = False
@@ -3547,6 +3530,119 @@ def _sanitize_burn_in_motion(
         "box": box,
         "frame": frame,
     }
+
+
+def _sanitize_motion_box(raw_box: Any) -> dict[str, float] | None:
+    if not isinstance(raw_box, dict):
+        return None
+    try:
+        values = [float(raw_box.get(key, 0.0)) for key in ("x", "y", "width", "height")]
+    except (TypeError, ValueError):
+        return None
+    if (
+        len(values) == 4
+        and all(math.isfinite(value) for value in values)
+        and values[2] >= 4
+        and values[3] >= 4
+    ):
+        return {"x": values[0], "y": values[1], "width": values[2], "height": values[3]}
+    return None
+
+
+def _sanitize_motion_frame(raw_frame: Any) -> dict[str, float] | None:
+    if not isinstance(raw_frame, dict):
+        return None
+    try:
+        frame_w = float(raw_frame.get("width", 0.0))
+        frame_h = float(raw_frame.get("height", 0.0))
+    except (TypeError, ValueError):
+        return None
+    if math.isfinite(frame_w) and math.isfinite(frame_h) and frame_w >= 2 and frame_h >= 2:
+        return {"width": frame_w, "height": frame_h}
+    return None
+
+
+#: Sampled-track channels, with the range each value is clamped into. `dx`/`dy`
+#: are frame px, `rotation` degrees, `scale`/`opacity` factors -- the same
+#: units the preset path emits, so `_append_motion_burn_in` serves both.
+_MOTION_TRACK_LIMITS: dict[str, tuple[float, float]] = {
+    "dx": (-8192.0, 8192.0),
+    "dy": (-8192.0, 8192.0),
+    "scale": (0.01, 6.0),
+    "rotation": (-3600.0, 3600.0),
+    "opacity": (0.0, 1.5),
+}
+_MOTION_PHASE_ANCHORS = {"in", "out", "loop"}
+_MOTION_MAX_SAMPLES = 120
+
+
+def _sanitize_motion_phases(
+    raw_phases: list[Any], index: int, skipped: list[str], *, has_box: bool
+) -> list[dict[str, Any]]:
+    """Validate the sampled-track motion form.
+
+    This is the generic channel: the client samples its OWN animation engine
+    (whatever curves, easings and intensities it runs) into piecewise-linear
+    tracks, and the render replays them -- no preset vocabulary to keep in
+    sync, exact by construction at the sampled density. One phase per anchor:
+    `in` plays from the overlay's entrance, `out` ends at its exit, `loop`
+    wraps `mod(t-start, duration)` for the whole span. Without a pivot box the
+    scale/rotation tracks are dropped (translate and opacity are pivot-free),
+    one channel at a time, with a reason.
+    """
+    phases: list[dict[str, Any]] = []
+    seen_anchors: set[str] = set()
+    dropped_pivot = False
+    for raw_phase in raw_phases[:4]:
+        if not isinstance(raw_phase, dict):
+            continue
+        anchor = str(raw_phase.get("at") or "")
+        if anchor not in _MOTION_PHASE_ANCHORS or anchor in seen_anchors:
+            continue
+        try:
+            duration_raw = float(raw_phase.get("duration"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(duration_raw) or duration_raw <= 0:
+            continue
+        duration = max(0.02, min(6.0, duration_raw))
+        raw_tracks = raw_phase.get("tracks")
+        if not isinstance(raw_tracks, dict):
+            continue
+        tracks: dict[str, list[dict[str, float]]] = {}
+        for key, (low, high) in _MOTION_TRACK_LIMITS.items():
+            samples = raw_tracks.get(key)
+            if not isinstance(samples, list) or len(samples) < 2:
+                continue
+            if key in {"scale", "rotation"} and not has_box:
+                dropped_pivot = True
+                continue
+            clean: list[dict[str, float]] = []
+            for sample in samples[:_MOTION_MAX_SAMPLES]:
+                if not isinstance(sample, dict):
+                    clean = []
+                    break
+                try:
+                    t = float(sample.get("t", 0.0))
+                    v = float(sample.get("v", 0.0))
+                except (TypeError, ValueError):
+                    clean = []
+                    break
+                if not (math.isfinite(t) and math.isfinite(v)):
+                    clean = []
+                    break
+                clean.append({"t": max(0.0, min(t, duration)), "v": max(low, min(high, v))})
+            if len(clean) >= 2:
+                clean.sort(key=lambda item: item["t"])
+                tracks[key] = clean
+        if tracks:
+            seen_anchors.add(anchor)
+            phases.append({"at": anchor, "duration": duration, "tracks": tracks})
+    if dropped_pivot:
+        skipped.append(f"burnIn[{index}]:motionPivotMissing")
+    if not phases and raw_phases:
+        skipped.append(f"burnIn[{index}]:motionInvalid")
+    return phases
 
 
 def _eased_out_cubic01(progress: str) -> str:
@@ -3643,6 +3739,91 @@ def _text_motion_channels(
     return result
 
 
+def _sampled_track_expression(samples: list[dict[str, float]], local: str) -> str:
+    """Piecewise-linear interpolation over a phase-local time expression.
+
+    The easing is already baked into the sample values by the client's own
+    engine, so linear segments between dense samples reproduce any curve it
+    can play -- the same shape `_channel_expression` builds for keyframes.
+    """
+    expression = f"{samples[-1]['v']:.6f}"
+    for index in range(len(samples) - 2, -1, -1):
+        start = samples[index]
+        end = samples[index + 1]
+        span = max(0.0005, end["t"] - start["t"])
+        interpolated = (
+            f"{start['v']:.6f}+({end['v'] - start['v']:.6f})*"
+            f"(({local})-{start['t']:.6f})/{span:.6f}"
+        )
+        expression = f"if(lt(({local}),{end['t']:.6f}),{interpolated},{expression})"
+    return f"if(lte(({local}),{samples[0]['t']:.6f}),{samples[0]['v']:.6f},{expression})"
+
+
+#: Sampled track key -> the channel name `_append_motion_burn_in` consumes.
+_MOTION_TRACK_CHANNEL = {
+    "dx": "dx",
+    "dy": "dy",
+    "scale": "scale",
+    "rotation": "rot",
+    "opacity": "opacity",
+}
+
+
+def _sampled_motion_channels(
+    motion: dict[str, Any], start: float, end: float, time_var: str = "t"
+) -> dict[str, str]:
+    """Channels from sampled phases -- the client engine's own curves, replayed.
+
+    `in` runs on time-from-entrance and holds its last value outside its
+    window via the phase gate; `out` runs on time-into-the-exit-window ending
+    at the overlay's exit; `loop` wraps for the whole span. Phases combine the
+    way the element engine's `merge` does: opacities and scales multiply,
+    offsets and rotations add.
+    """
+    settled = {"dx": "0", "dy": "0", "scale": "1", "scaleX": "1", "rot": "0", "opacity": "1"}
+    result = dict(settled)
+    for phase in motion.get("phases") or []:
+        duration = float(phase["duration"])
+        anchor = phase["at"]
+        if anchor == "in":
+            local = f"(({time_var})-{start:.6f})"
+            active = f"lte(({time_var})-{start:.6f},{duration:.6f})"
+        elif anchor == "out":
+            begin = end - duration
+            local = f"(({time_var})-{begin:.6f})"
+            active = f"gte(({time_var}),{begin:.6f})"
+        else:
+            local = f"mod(({time_var})-{start:.6f},{duration:.6f})"
+            active = None
+        for key, samples in phase["tracks"].items():
+            channel = _MOTION_TRACK_CHANNEL[key]
+            identity = "1" if channel in {"scale", "opacity"} else "0"
+            expression = _sampled_track_expression(samples, local)
+            if active is not None:
+                expression = f"if({active},{expression},{identity})"
+            if channel in {"scale", "opacity"}:
+                result[channel] = (
+                    expression
+                    if result[channel] == "1"
+                    else f"({result[channel]})*({expression})"
+                )
+            else:
+                result[channel] = (
+                    expression
+                    if result[channel] == "0"
+                    else f"({result[channel]})+({expression})"
+                )
+    return result
+
+
+def _burn_in_motion_channels(
+    motion: dict[str, Any], start: float, end: float, time_var: str = "t"
+) -> dict[str, str]:
+    if motion.get("phases"):
+        return _sampled_motion_channels(motion, start, end, time_var)
+    return _text_motion_channels(motion, start, end, time_var)
+
+
 def _append_motion_burn_in(
     graph: list[str],
     *,
@@ -3670,7 +3851,7 @@ def _append_motion_burn_in(
     motion = item["motion"]
     start = float(item["start"])
     end = float(item["end"])
-    channels = _text_motion_channels(motion, start, end)
+    channels = _burn_in_motion_channels(motion, start, end)
     filters = ["format=rgba", f"scale={width}:{height}"]
 
     box = motion.get("box")
