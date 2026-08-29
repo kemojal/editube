@@ -3359,6 +3359,36 @@ def _apply_loudness_target(
     return output, []
 
 
+#: Near-lossless CRFs for intermediate passes, by requested quality. The MP4
+#: chain can re-encode up to eight times (segments, transitions, tail, two
+#: layer passes, captions, the 9:16 crop, burn-ins); running every pass at the
+#: delivery CRF compounds that loss generation over generation. Intermediates
+#: now run near-lossless and only the LAST encoding pass uses the delivery
+#: CRF, so the delivered file goes through exactly one lossy video encode at
+#: its own quality. Draft stays coarser: it is a speed lane, not a master.
+_INTERMEDIATE_CRF = {"draft": 17, "standard": 10, "high": 6}
+
+
+def _encode_plan(
+    stages: list[tuple[str, bool]], *, final_crf: int, intermediate_crf: int
+) -> dict[str, int]:
+    """Which CRF each pass of the MP4 chain should encode at.
+
+    `stages` is the chain in run order, each with whether it will re-encode
+    the video. Every encoding pass with a later encoding pass behind it gets
+    the near-lossless intermediate CRF; the last one gets the delivery CRF.
+    The per-segment cuts (always first) are included as "segments".
+    """
+    plan: dict[str, int] = {}
+    flags = [encodes for _, encodes in stages]
+    plan["segments"] = intermediate_crf if any(flags) else final_crf
+    for index, (name, encodes) in enumerate(stages):
+        if not encodes:
+            continue
+        plan[name] = intermediate_crf if any(flags[index + 1 :]) else final_crf
+    return plan
+
+
 def _sanitize_burn_ins(
     raw: Any,
     *,
@@ -4279,6 +4309,28 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                     segments, normalized, range_rates
                 )
 
+        # Generation-loss plan (§5.3 item 8): every stage flag is known before
+        # the first segment encodes, so the whole chain can be told up front
+        # which single pass carries the delivery CRF. The one soft edge:
+        # burn-ins are declared here by their RAW presence — if sanitation
+        # later rejects every entry, the previous pass ends up being final at
+        # the intermediate CRF, which delivers a higher-quality (larger) file,
+        # never a worse one.
+        encode_stages = [
+            ("transitions", bool(transitions)),
+            ("tail", timeline_tail > 0.02),
+            ("below_text", bool(below_text_chunks)),
+            ("captions", bool(include_captions and subtitle_entries)),
+            ("layered", bool(above_text_chunks)),
+            ("shorts", bool(shorts_export)),
+            ("burn_ins", bool(raw_burn_ins)),
+        ]
+        encode_plan = _encode_plan(
+            encode_stages,
+            final_crf=crf,
+            intermediate_crf=_INTERMEDIATE_CRF.get(quality, 10),
+        )
+
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
 
@@ -4416,7 +4468,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                             vf=vf,
                             scale_w=int(scale.split(":", 1)[0]),
                             scale_h=int(scale.split(":", 1)[1]),
-                            crf=crf,
+                            crf=encode_plan["segments"],
                             output=v_out,
                             processed=processed_source is not None,
                             matte_path=matte_path,
@@ -4507,7 +4559,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                     ],
                     transitions,
                     audio_path=merged_wav,
-                    crf=crf,
+                    crf=encode_plan.get("transitions", crf),
                     output=merged_vid,
                 )
                 if transition_command:
@@ -4526,7 +4578,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                             tail_duration=timeline_tail,
                             has_audio=_ffprobe_has_audio(str(final_video)),
                             frame_rate=render_fps,
-                            crf=crf,
+                            crf=encode_plan.get("tail", crf),
                             output=extended,
                         )
                     )
@@ -4547,7 +4599,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                             scale_w=scale_w,
                             scale_h=scale_h,
                             frame_rate=render_fps,
-                            crf=crf,
+                            crf=encode_plan.get("below_text", crf),
                             output=below_text_video,
                             base_has_audio=_ffprobe_has_audio(str(final_video)),
                             duck=duck_music,
@@ -4588,7 +4640,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                             "-preset",
                             "veryfast",
                             "-crf",
-                            str(crf),
+                            str(encode_plan.get("captions", crf)),
                             "-pix_fmt",
                             "yuv420p",
                             "-c:a",
@@ -4612,7 +4664,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                             scale_w=scale_w,
                             scale_h=scale_h,
                             frame_rate=render_fps,
-                            crf=crf,
+                            crf=encode_plan.get("layered", crf),
                             output=layered,
                             base_has_audio=_ffprobe_has_audio(str(final_video)),
                         )
@@ -4636,13 +4688,11 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                             "-preset",
                             "veryfast",
                             "-crf",
-                            str(crf),
+                            str(encode_plan.get("shorts", crf)),
                             "-pix_fmt",
                             "yuv420p",
                             "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
+                            "copy",
                             "-movflags",
                             "+faststart",
                             str(shorts_out),
@@ -4681,7 +4731,7 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                             width=burn_w,
                             height=burn_h,
                             frame_rate=render_fps,
-                            crf=crf,
+                            crf=encode_plan.get("burn_ins", crf),
                             output=burned_overlays,
                         )
                     )
@@ -4746,6 +4796,9 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 "shortsExport": shorts_export,
                 "burnInsApplied": len(burn_in_entries),
                 "burnInsAnimated": sum(1 for entry in burn_in_entries if entry.get("motion")),
+                # Which pass carried the delivery CRF — the generation-loss
+                # receipt: everything before it encoded near-lossless.
+                "encodePlan": encode_plan,
                 "loudnessTarget": loudness_target if loudness_target in _LOUDNESS_TARGETS else None,
             }
             if caption_warnings:
