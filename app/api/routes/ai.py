@@ -1534,6 +1534,10 @@ class RoughCutExportBody(BaseModel):
     #: Fail closed on matte failure: a redaction or harness composite whose
     #: unmasked form is wrong must stop the export, not ship without the mask.
     masksRequired: bool = False
+    #: The editor's caption look (plus a client-resolved `fontFamily`). When
+    #: present, burned captions render as styled ASS instead of a bare SRT at
+    #: libass defaults — closing the biggest preview/export gap (plan §5.3).
+    captionStyle: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.post("/{video_id}/ai/rough-cut-export")
@@ -1579,6 +1583,7 @@ def start_rough_cut_export(
         "exportSettings": body.exportSettings,
         "masks": body.masks,
         "masksRequired": body.masksRequired,
+        "captionStyle": body.captionStyle,
         "processedRanges": body.processedRanges,
         "colorRanges": body.colorRanges,
         "videoRanges": body.videoRanges,

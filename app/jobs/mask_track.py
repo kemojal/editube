@@ -255,10 +255,17 @@ def _track_direction(
     backward (never past the source video's own bounds either). Returns
     (keyframes, lost_at_frame_or_None). Never emits keyframes past the loss
     point. Re-checks cancellation every `_CANCEL_CHECK_STRIDE` frames."""
+    # Lazy like the job's own import: this module is imported by the API
+    # process for its pure helpers, and cv2 must never be a hard dependency
+    # there. Referencing a module-global `cv2` here was in fact a latent
+    # NameError — the job's `import cv2` is function-local — one more way the
+    # tracking path had never actually run (plan §5.2 G7).
+    import cv2
+
     keyframes: list[dict[str, Any]] = []
     frame_idx = start_frame_idx
     bbox = initial_bbox
-    tracker = cv2.TrackerCSRT_create()
+    tracker = _create_tracker()
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     ok, frame = cap.read()
@@ -303,6 +310,48 @@ def _track_direction(
     return keyframes, None
 
 
+class TrackerUnavailable(RuntimeError):
+    """No usable box tracker exists in this environment."""
+
+
+def tracker_availability() -> tuple[str | None, str | None]:
+    """(backend, reason-if-none). The harness capability registry's source of
+    truth for whether box tracking can run here at all.
+
+    The pinned `opencv-python-headless` build has no CSRT — that class lives
+    in the contrib `tracking` module — so `cv2.TrackerCSRT_create()` used to
+    die on AttributeError only after the row had committed `processing` and
+    the capture was open (plan §5.2 G7). Probe first; fail before touching
+    anything. `TrackerMIL` ships in every build but drifts badly, so it is a
+    deliberate opt-in (`MASK_TRACK_ALLOW_MIL=1`), never a silent downgrade.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None, "OpenCV is not installed in this worker environment."
+    if hasattr(cv2, "TrackerCSRT_create"):
+        return "csrt", None
+    if hasattr(cv2, "TrackerMIL_create") and os.environ.get("MASK_TRACK_ALLOW_MIL") == "1":
+        return "mil", None
+    return None, (
+        "This server's OpenCV build has no CSRT tracker (it needs the contrib "
+        "'tracking' module). Install opencv-contrib-python-headless on the "
+        "worker, or set MASK_TRACK_ALLOW_MIL=1 to allow the lower-quality "
+        "built-in MIL tracker."
+    )
+
+
+def _create_tracker():
+    import cv2
+
+    backend, reason = tracker_availability()
+    if backend == "csrt":
+        return cv2.TrackerCSRT_create()
+    if backend == "mil":
+        return cv2.TrackerMIL_create()
+    raise TrackerUnavailable(reason or "No tracker available.")
+
+
 def mask_track_job(ai_result_id: int) -> None:
     db = SessionLocal()
     try:
@@ -312,6 +361,20 @@ def mask_track_job(ai_result_id: int) -> None:
 
         if row.status not in ("queued", "processing"):
             # Already cancelled/failed before the worker picked it up.
+            return
+
+        # Fail fast, before the row flips to `processing` and a capture opens:
+        # a missing tracker is an environment fact, not a per-video failure,
+        # and the user deserves the sentence, not the AttributeError.
+        _backend, unavailable_reason = tracker_availability()
+        if unavailable_reason:
+            payload = dict(row.result_data or {})
+            payload["status"] = "failed"
+            payload["error"] = unavailable_reason
+            row.status = "failed"
+            row.error_message = unavailable_reason
+            row.result_data = payload
+            db.commit()
             return
 
         payload = dict(row.result_data or {})

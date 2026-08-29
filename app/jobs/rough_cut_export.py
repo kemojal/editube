@@ -12,7 +12,9 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+import json
 import math
+import os
 import re
 import subprocess
 import tempfile
@@ -275,8 +277,16 @@ def _transition_audio_settings(
     base: dict[str, Any] | None,
     index: int,
     transitions: list[dict[str, object]],
+    *,
+    fold_between: bool = True,
 ) -> dict[str, Any] | None:
-    """Fold linked transition ramps into the segment's existing audio edit."""
+    """Fold linked transition ramps into the segment's existing audio edit.
+
+    `fold_between=False` skips the between-cut halves: when the merge step
+    runs a real `acrossfade` over those boundaries, folding them here too
+    would fade the same seconds twice (a dip inside the crossfade). Edge
+    in/out ramps always fold — they have no crossfade counterpart.
+    """
     result = dict(base or {})
     fade_in = float(result.get("fadeIn") or 0.0)
     fade_out = float(result.get("fadeOut") or 0.0)
@@ -284,6 +294,8 @@ def _transition_audio_settings(
         duration = float(item.get("duration") or 0.0)
         placement = item.get("placement")
         if placement == "between":
+            if not fold_between:
+                continue
             if item.get("rightIndex") == index:
                 fade_in = max(fade_in, duration / 2)
             if item.get("leftIndex") == index:
@@ -297,6 +309,82 @@ def _transition_audio_settings(
     if fade_out > 0:
         result["fadeOut"] = fade_out
     return result or None
+
+
+def _crossfade_boundaries(
+    transitions: list[dict[str, object]], segment_count: int
+) -> dict[int, float]:
+    """Between-cut boundaries that get a real audio crossfade.
+
+    Keyed by the LEFT segment index. Only adjacent pairs qualify — the video
+    side xfades exactly those; a non-adjacent "between" is already a hard cut
+    there and stays one here.
+    """
+    out: dict[int, float] = {}
+    for item in transitions:
+        if item.get("placement") != "between":
+            continue
+        try:
+            left = int(item.get("leftIndex"))  # type: ignore[arg-type]
+            right = int(item.get("rightIndex"))  # type: ignore[arg-type]
+            duration = float(item.get("duration") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if right != left + 1 or not (0 <= left < segment_count - 1):
+            continue
+        if duration > 0.03:
+            out[left] = min(duration, 5.0)
+    return out
+
+
+def _crossfade_wav_command(
+    wav_parts: list[Path], boundaries: dict[int, float], output: Path
+) -> list[str] | None:
+    """Merge segment WAVs with real `acrossfade`s where transitions sit.
+
+    Runtime is preserved the same way the video side preserves it with cloned
+    handles: each crossfaded boundary pads the left segment's tail and leads
+    the right segment in with half the duration of silence, so the overlap
+    consumes exactly the seconds the padding added and the audio stays in
+    sync with the picture. The old behaviour — per-segment fades meeting at a
+    hard cut — dipped every dissolve to silence (plan §5.3).
+    """
+    if not boundaries or len(wav_parts) < 2:
+        return None
+    graph: list[str] = []
+    for index in range(len(wav_parts)):
+        chain: list[str] = ["aformat=sample_rates=48000:channel_layouts=stereo"]
+        left_cross = boundaries.get(index - 1)
+        right_cross = boundaries.get(index)
+        if left_cross:
+            lead_ms = int(round(left_cross / 2 * 1000))
+            chain.append(f"adelay=delays={lead_ms}:all=1")
+        if right_cross:
+            chain.append(f"apad=pad_dur={right_cross / 2:.3f}")
+        graph.append(f"[{index}:a]{','.join(chain)}[p{index}]")
+
+    current = "[p0]"
+    for index in range(1, len(wav_parts)):
+        merged = f"[m{index}]"
+        cross = boundaries.get(index - 1)
+        if cross:
+            graph.append(
+                f"{current}[p{index}]acrossfade=d={cross:.3f}:c1=tri:c2=tri{merged}"
+            )
+        else:
+            graph.append(f"{current}[p{index}]concat=n=2:v=0:a=1{merged}")
+        current = merged
+
+    inputs: list[str] = []
+    for part in wav_parts:
+        inputs += ["-i", str(part)]
+    return [
+        "ffmpeg", "-y", *inputs,
+        "-filter_complex", ";".join(graph),
+        "-map", current,
+        "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2",
+        str(output),
+    ]
 logger = logging.getLogger(__name__)
 
 # Absolute bound on any timeline position. The old bound was the primary
@@ -2404,6 +2492,7 @@ def _timeline_audio_graph(
     chunks: list[dict[str, Any]],
     *,
     base_has_audio: bool,
+    duck: bool = False,
 ) -> tuple[list[str], str | None]:
     """Mix the sound of every audible layer over the base.
 
@@ -2451,6 +2540,31 @@ def _timeline_audio_graph(
         # Nothing to mix against: rename rather than run a one-input amix.
         graph.append(f"{labels[0]}anull[a]")
         return graph, "[a]"
+
+    if duck and base_has_audio:
+        # Duck the layers under the programme: the base (dialogue) keys a
+        # sidechain compressor over the mixed layers, so music drops when
+        # someone speaks and swells back in the gaps — the exporter had no
+        # ducking at all before this (plan §5.3, no `sidechaincompress` in
+        # the repo).
+        layer_labels = labels[1:]
+        if len(layer_labels) == 1:
+            graph.append(f"{layer_labels[0]}anull[duck_layers]")
+        else:
+            graph.append(
+                f"{''.join(layer_labels)}amix=inputs={len(layer_labels)}"
+                ":normalize=0:dropout_transition=0[duck_layers]"
+            )
+        graph.append("[amix_base]asplit=2[duck_voice][duck_key]")
+        graph.append(
+            "[duck_layers][duck_key]sidechaincompress="
+            "threshold=0.03:ratio=8:attack=20:release=400:makeup=1[duck_ducked]"
+        )
+        graph.append(
+            "[duck_voice][duck_ducked]amix=inputs=2:normalize=0:dropout_transition=0[a]"
+        )
+        return graph, "[a]"
+
     graph.append(
         f"{''.join(labels)}amix=inputs={len(labels)}:normalize=0:dropout_transition=0[a]"
     )
@@ -2467,6 +2581,7 @@ def _timeline_layers_command(
     crf: int,
     output: Path,
     base_has_audio: bool = True,
+    duck: bool = False,
 ) -> list[str]:
     """Compose all remapped chunks in Resolve-style bottom-to-top order.
 
@@ -2528,7 +2643,7 @@ def _timeline_layers_command(
             graph.extend(layer_graph)
         graph.append(f"{base_label}format=yuv420p[v]")
 
-    audio_graph, audio_label = _timeline_audio_graph(chunks, base_has_audio=base_has_audio)
+    audio_graph, audio_label = _timeline_audio_graph(chunks, base_has_audio=base_has_audio, duck=duck)
     graph.extend(audio_graph)
 
     if graph:
@@ -2561,6 +2676,7 @@ def _timeline_audio_mix_command(
     base_audio: Path,
     chunks: list[dict[str, Any]],
     output: Path,
+    duck: bool = False,
 ) -> list[str]:
     """Mix audio-lane clips into a WAV that has no picture to composite onto.
 
@@ -2582,7 +2698,7 @@ def _timeline_audio_mix_command(
             str(chunk["source"]),
         ]
 
-    graph, audio_label = _timeline_audio_graph(chunks, base_has_audio=True)
+    graph, audio_label = _timeline_audio_graph(chunks, base_has_audio=True, duck=duck)
     if not audio_label:
         return []
     command += [
@@ -2730,6 +2846,156 @@ def _remap_segments_to_export_timeline(
     return out
 
 
+def _remap_segments_with_words(
+    segments: list[dict[str, Any]],
+    normalized_ranges: list[tuple[float, float]],
+) -> list[dict[str, Any]]:
+    """`_remap_segments_to_export_timeline`, keeping word timings.
+
+    The styled (ASS) caption path needs per-word times for the karaoke
+    highlight; the plain SRT path never did, so this is a sibling rather than
+    a change of the tuple contract every existing test pins.
+    """
+    out: list[dict[str, Any]] = []
+    if not normalized_ranges:
+        return out
+    t_off = 0.0
+    for ks, ke in normalized_ranges:
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            try:
+                s = float(seg.get("start", 0))
+                e = float(seg.get("end", 0))
+                text = str(seg.get("text") or "").strip()
+            except (TypeError, ValueError):
+                continue
+            if not text or e <= s:
+                continue
+            a = max(s, ks)
+            b = min(e, ke)
+            if b - a < 0.02:
+                continue
+            words: list[dict[str, Any]] = []
+            for word in seg.get("words") or []:
+                if not isinstance(word, dict):
+                    continue
+                try:
+                    ws = float(word.get("start", -1))
+                    we = float(word.get("end", -1))
+                except (TypeError, ValueError):
+                    continue
+                token = str(word.get("word") or "").strip()
+                if not token or we <= ws:
+                    continue
+                ws_clipped = max(ws, a)
+                we_clipped = min(we, b)
+                if we_clipped - ws_clipped < 0.01:
+                    continue
+                words.append(
+                    {
+                        "word": token,
+                        "start": round(t_off + (ws_clipped - ks), 3),
+                        "end": round(t_off + (we_clipped - ks), 3),
+                    }
+                )
+            out.append(
+                {
+                    "start": round(t_off + (a - ks), 3),
+                    "end": round(t_off + (b - ks), 3),
+                    "text": text,
+                    "words": words,
+                }
+            )
+        t_off += ke - ks
+    out.sort(key=lambda item: item["start"])
+    return out
+
+
+def _trim_worded_around_layers(
+    worded: list[dict[str, Any]],
+    layers: list[tuple[float, float, str]],
+) -> list[dict[str, Any]]:
+    """The `_merge_subtitle_entries` trimming, applied to worded entries.
+
+    Where an audible clip's own captions cover the A-roll, the A-roll entry is
+    trimmed around them — and here its words are trimmed with it, so a karaoke
+    sweep never runs across text that was cut out of the entry.
+    """
+    if not layers:
+        return sorted(worded, key=lambda item: item["start"])
+    kept: list[dict[str, Any]] = []
+    for entry in worded:
+        pieces = [(float(entry["start"]), float(entry["end"]))]
+        for layer_start, layer_end, _ in layers:
+            next_pieces: list[tuple[float, float]] = []
+            for piece_start, piece_end in pieces:
+                if layer_end <= piece_start or layer_start >= piece_end:
+                    next_pieces.append((piece_start, piece_end))
+                    continue
+                if layer_start - piece_start > 0.25:
+                    next_pieces.append((piece_start, layer_start))
+                if piece_end - layer_end > 0.25:
+                    next_pieces.append((layer_end, piece_end))
+            pieces = next_pieces
+        for piece_start, piece_end in pieces:
+            words = [
+                word
+                for word in entry.get("words") or []
+                if word["start"] < piece_end and word["end"] > piece_start
+            ]
+            kept.append(
+                {
+                    "start": piece_start,
+                    "end": piece_end,
+                    "text": entry.get("text") or "",
+                    "words": words,
+                }
+            )
+    return sorted(kept, key=lambda item: item["start"])
+
+
+def _build_caption_burn_file(
+    tmp_path: Path,
+    *,
+    plain_entries: list[tuple[float, float, str]],
+    worded_entries: list[dict[str, Any]],
+    layer_entries: list[tuple[float, float, str]],
+    caption_style: dict[str, Any],
+    scale_w: int,
+    scale_h: int,
+) -> tuple[Path, str, list[str]]:
+    """The subtitle file to burn: styled ASS when a caption style was sent,
+    the legacy bare SRT otherwise. Returns (path, renderer, warnings)."""
+    if isinstance(caption_style, dict) and caption_style:
+        from app.services.rough_cut_captions import build_ass
+
+        entries: list[dict[str, Any]] = _trim_worded_around_layers(
+            worded_entries, layer_entries
+        )
+        entries += [
+            {"start": start, "end": end, "text": text, "words": []}
+            for start, end, text in layer_entries
+        ]
+        entries.sort(key=lambda item: item["start"])
+        script, warnings = build_ass(
+            entries, caption_style, play_res_x=scale_w, play_res_y=scale_h
+        )
+        ass_path = tmp_path / "burnin.ass"
+        ass_path.write_text(script, encoding="utf-8")
+        if caption_style.get("fontFamily") and not os.environ.get("CAPTION_FONTS_DIR"):
+            warnings.append(
+                f"Caption font {caption_style.get('fontFamily')!r} renders with a system "
+                "fallback unless it is installed on the export worker "
+                "(set CAPTION_FONTS_DIR to a directory of font files)."
+            )
+        return ass_path, "ass", warnings
+
+    srt_path = tmp_path / "burnin.srt"
+    _write_srt(srt_path, plain_entries)
+    return srt_path, "srt", []
+
+
 def _remap_layer_segments_to_export_timeline(
     db: Session,
     chunks: list[dict[str, Any]],
@@ -2861,6 +3127,147 @@ def _escape_subtitles_filter_path(path: Path) -> str:
     s = path.as_posix()
     s = s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
     return s
+
+
+def _masks_for_segment(
+    masks: list[Any], start: float, end: float, *, epsilon: float = 0.05
+) -> list[Any]:
+    """The masks that belong on THIS keep-range segment.
+
+    The client stamps each mask with its clip's `sourceRange`; a mask whose
+    stamped range shares an edge with the segment (the same drift tolerance as
+    `_match_audio_range`) applies here, and `sourceRange` is stripped before
+    the matte renderer sees the spec. Unstamped masks (legacy clients) apply
+    to every segment — the old flattening behaviour, kept as the fallback
+    rather than silently changing what an old request renders.
+    """
+    out: list[Any] = []
+    for mask in masks:
+        if not isinstance(mask, dict):
+            out.append(mask)
+            continue
+        source_range = mask.get("sourceRange")
+        if not isinstance(source_range, dict):
+            out.append(mask)
+            continue
+        try:
+            mask_start = float(source_range.get("start"))
+            mask_end = float(source_range.get("end"))
+        except (TypeError, ValueError):
+            out.append({k: v for k, v in mask.items() if k != "sourceRange"})
+            continue
+        overlap = min(end, mask_end) - max(start, mask_start)
+        edge = abs(mask_start - start) <= epsilon or abs(mask_end - end) <= epsilon
+        if overlap > 0 and edge:
+            out.append({k: v for k, v in mask.items() if k != "sourceRange"})
+    return out
+
+
+#: Output-profile loudness targets (integrated LUFS). Measured after the FULL
+#: mix — the mix had no loudness handling at all before this; `loudnorm` lived
+#: only inside the enhancement effect job (plan §5.3).
+_LOUDNESS_TARGETS: dict[str, float] = {
+    "youtube": -14.0,
+    "social": -14.0,
+    "podcast": -16.0,
+    "broadcast": -23.0,
+}
+
+
+def _measure_loudness(input_path: Path, target_i: float) -> dict[str, str] | None:
+    """Pass one of two-pass loudnorm: measure the final mix."""
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-y", "-i", str(input_path),
+            "-af", f"loudnorm=I={target_i}:TP=-1.5:LRA=11:print_format=json",
+            "-f", "null", "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=3600,
+    )
+    match = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", result.stderr, re.DOTALL)
+    if not match:
+        return None
+    try:
+        measured = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    keys = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+    if not all(key in measured for key in keys):
+        return None
+    return {key: str(measured[key]) for key in keys}
+
+
+def _normalize_loudness_command(
+    input_path: Path,
+    output_path: Path,
+    target_i: float,
+    measured: dict[str, str],
+    *,
+    has_video: bool,
+) -> list[str]:
+    """Pass two: linear gain to the target, video stream copied untouched —
+    normalization must not cost a generation of picture quality."""
+    loudnorm = (
+        f"loudnorm=I={target_i}:TP=-1.5:LRA=11"
+        f":measured_I={measured['input_i']}"
+        f":measured_TP={measured['input_tp']}"
+        f":measured_LRA={measured['input_lra']}"
+        f":measured_thresh={measured['input_thresh']}"
+        f":offset={measured['target_offset']}"
+        ":linear=true"
+    )
+    if has_video:
+        return [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-c:v", "copy",
+            "-af", loudnorm,
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
+    if str(output_path).lower().endswith(".wav"):
+        return [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-af", loudnorm,
+            "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2",
+            str(output_path),
+        ]
+    return [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-af", loudnorm,
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+
+
+def _apply_loudness_target(
+    input_path: Path,
+    tmp_path: Path,
+    target: str,
+    *,
+    has_video: bool,
+    suffix: str,
+) -> tuple[Path, list[str]]:
+    """Normalize the final mix to the named profile. Never fails the export:
+    an unmeasurable file ships as-is with a warning."""
+    target_i = _LOUDNESS_TARGETS.get(target)
+    if target_i is None:
+        return input_path, []
+    measured = _measure_loudness(input_path, target_i)
+    if measured is None:
+        return input_path, [
+            f"Loudness normalization ({target}) was skipped: the mix could not be measured."
+        ]
+    output = tmp_path / f"loudnorm_{suffix}"
+    _run_ffmpeg(
+        _normalize_loudness_command(
+            input_path, output, target_i, measured, has_video=has_video
+        )
+    )
+    return output, []
 
 
 def _sanitize_burn_ins(
@@ -3091,6 +3498,9 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
         source_duration = _ffprobe_duration(media_src) if media_src else None
         normalized = _normalize_ranges(payload.get("keepRanges"), max_end=source_duration)
         transitions = _normalize_transitions(payload.get("transitions"), normalized)
+        # Adjacent between-cut transitions get a REAL audio crossfade at the
+        # WAV merge, replacing the old fade-out-then-fade-in dip to silence.
+        audio_crossfades = _crossfade_boundaries(transitions, len(normalized))
 
         row.status = "processing"
         row.error_message = None
@@ -3110,6 +3520,10 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
         scale = {"720p": "1280:720", "1080p": "1920:1080", "4k": "3840:2160"}.get(resolution, "1920:1080")
 
         include_captions = bool(settings.get("includeCaptions", True))
+        # Music/audio-lane ducking under the programme's own voice, and the
+        # final-mix loudness target — both export-settings-driven (plan §7.7).
+        duck_music = bool(settings.get("duckMusic"))
+        loudness_target = str(settings.get("loudnessTarget") or "off").strip().lower()
         include_lt = bool(settings.get("includeLowerThirds", False))
         include_brand = bool(settings.get("includeBrand", False))
         shorts_export = bool(settings.get("shortsExport") or settings.get("verticalExport"))
@@ -3253,16 +3667,28 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
 
         segments = _load_transcription_segments(db, video_id)
         subtitle_entries: list[tuple[float, float, str]] = []
+        subtitle_worded: list[dict[str, Any]] = []
+        subtitle_layer_entries: list[tuple[float, float, str]] = []
+        caption_renderer = "srt"
+        caption_warnings: list[str] = []
+        caption_style = (
+            payload.get("captionStyle")
+            if isinstance(payload.get("captionStyle"), dict)
+            else {}
+        )
         if include_captions:
             # `below_text_chunks` and `above_text_chunks` are only a stacking
             # order; a clip is saying what it is saying on either side of the
             # text layer, so captions come from all of them.
+            subtitle_layer_entries = _remap_layer_segments_to_export_timeline(
+                db, [*below_text_chunks, *above_text_chunks]
+            )
             subtitle_entries = _merge_subtitle_entries(
                 _remap_segments_to_export_timeline(segments, normalized),
-                _remap_layer_segments_to_export_timeline(
-                    db, [*below_text_chunks, *above_text_chunks]
-                ),
+                subtitle_layer_entries,
             )
+            if caption_style:
+                subtitle_worded = _remap_segments_with_words(segments, normalized)
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -3291,6 +3717,9 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                     _match_audio_range(audio_ranges, start, end),
                     index,
                     transitions,
+                    # The merge step acrossfades these boundaries for real;
+                    # folding the halves here too would dip inside the cross.
+                    fold_between=not audio_crossfades,
                 )
                 segment_af = _segment_audio_filter(
                     segment_audio,
@@ -3340,10 +3769,14 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                     vf = ",".join(vf_parts) + fps_extra
 
                     matte_path: Path | None = None
-                    if masks:
+                    # Only THIS clip's masks. One flat list used to be applied
+                    # to every segment, so a mask drawn on clip 2 also blotted
+                    # clips 1 and 3 (plan §5.3 #7).
+                    segment_masks = _masks_for_segment(masks, start, end)
+                    if segment_masks:
                         try:
                             matte_path = render_matte_video(
-                                masks,
+                                segment_masks,
                                 duration=dur,
                                 fps=matte_fps,
                                 size=(scale_w, scale_h),
@@ -3401,10 +3834,16 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 row.result_data = _merge_result_payload(row.result_data, {"progress": progress})
                 db.commit()
 
-            wav_list = tmp_path / "list_wav.txt"
-            wav_list.write_text("".join(f"file '{p.as_posix()}'\n" for p in wav_parts), encoding="utf-8")
             merged_wav = tmp_path / "merged.wav"
-            _run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(wav_list), "-c", "copy", str(merged_wav)])
+            crossfade_command = _crossfade_wav_command(
+                wav_parts, audio_crossfades, merged_wav
+            )
+            if crossfade_command:
+                _run_ffmpeg(crossfade_command)
+            else:
+                wav_list = tmp_path / "list_wav.txt"
+                wav_list.write_text("".join(f"file '{p.as_posix()}'\n" for p in wav_parts), encoding="utf-8")
+                _run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(wav_list), "-c", "copy", str(merged_wav)])
 
             # Without a video pass there is no compositor to fold audio-lane
             # clips into, so they are mixed straight onto the merged A-roll --
@@ -3415,12 +3854,19 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                     base_audio=merged_wav,
                     chunks=audio_lane_chunks,
                     output=tmp_path / "merged_mixed.wav",
+                    duck=duck_music,
                 )
                 if mix_command:
                     _run_ffmpeg(mix_command)
                     merged_wav = tmp_path / "merged_mixed.wav"
 
             if fmt == "wav":
+                if loudness_target in _LOUDNESS_TARGETS:
+                    merged_wav, loudness_warnings = _apply_loudness_target(
+                        merged_wav, tmp_path, loudness_target,
+                        has_video=False, suffix="out.wav",
+                    )
+                    caption_warnings.extend(loudness_warnings)
                 final_path = merged_wav
                 public_hint = uuid.uuid4().hex[:12]
                 url = upload_local_path_to_cloudinary(
@@ -3439,6 +3885,10 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                         "format": fmt,
                         "burnInSkipped": burn_skipped,
                         "captionEntries": len(subtitle_entries),
+                        "loudnessTarget": loudness_target
+                        if loudness_target in _LOUDNESS_TARGETS
+                        else None,
+                        **({"warnings": caption_warnings} if caption_warnings else {}),
                     },
                 )
                 row.status = "completed"
@@ -3496,14 +3946,30 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                             crf=crf,
                             output=below_text_video,
                             base_has_audio=_ffprobe_has_audio(str(final_video)),
+                            duck=duck_music,
                         )
                     )
                     final_video = below_text_video
 
                 if include_captions and subtitle_entries:
-                    srt_path = tmp_path / "burnin.srt"
-                    _write_srt(srt_path, subtitle_entries)
-                    sub_path = _escape_subtitles_filter_path(srt_path)
+                    caption_file, caption_renderer, caption_warnings = (
+                        _build_caption_burn_file(
+                            tmp_path,
+                            plain_entries=subtitle_entries,
+                            worded_entries=subtitle_worded,
+                            layer_entries=subtitle_layer_entries,
+                            caption_style=caption_style,
+                            scale_w=scale_w,
+                            scale_h=scale_h,
+                        )
+                    )
+                    sub_path = _escape_subtitles_filter_path(caption_file)
+                    fonts_dir = (os.environ.get("CAPTION_FONTS_DIR") or "").strip()
+                    if fonts_dir and caption_renderer == "ass":
+                        sub_path += (
+                            ":fontsdir="
+                            + _escape_subtitles_filter_path(Path(fonts_dir))
+                        )
                     burned = tmp_path / "merged_burned.mp4"
                     _run_ffmpeg(
                         [
@@ -3617,6 +4083,14 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                     )
                     final_video = burned_overlays
 
+                if loudness_target in _LOUDNESS_TARGETS and _ffprobe_has_audio(
+                    str(final_video)
+                ):
+                    final_video, loudness_warnings = _apply_loudness_target(
+                        final_video, tmp_path, loudness_target,
+                        has_video=True, suffix="out.mp4",
+                    )
+                    caption_warnings.extend(loudness_warnings)
                 final_path = final_video
                 resource_type = "video"
                 url = upload_local_path_to_cloudinary(
@@ -3643,6 +4117,12 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                         str(mp4_out),
                     ]
                 )
+                if loudness_target in _LOUDNESS_TARGETS:
+                    mp4_out, loudness_warnings = _apply_loudness_target(
+                        mp4_out, tmp_path, loudness_target,
+                        has_video=False, suffix="audio.m4a",
+                    )
+                    caption_warnings.extend(loudness_warnings)
                 url = upload_local_path_to_cloudinary(
                     str(mp4_out),
                     resource_type="video",
@@ -3657,10 +4137,14 @@ def rough_cut_export_job(ai_result_id: int, register_as_version: bool = False) -
                 "format": "mp4",
                 "burnInSkipped": burn_skipped,
                 "captionEntries": len(subtitle_entries),
+                "captionRenderer": caption_renderer if subtitle_entries else None,
                 "timelineLayerChunks": len(timeline_chunks),
                 "shortsExport": shorts_export,
                 "burnInsApplied": len(burn_in_entries),
+                "loudnessTarget": loudness_target if loudness_target in _LOUDNESS_TARGETS else None,
             }
+            if caption_warnings:
+                meta["warnings"] = [*meta.get("warnings", []), *caption_warnings]
             if masks and mask_render_failed_for_segment:
                 # I11: masks were requested but at least one segment's matte
                 # failed to render, so this export shipped unmasked -- the UI

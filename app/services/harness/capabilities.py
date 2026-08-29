@@ -86,19 +86,17 @@ def probe_tracking() -> dict[str, Any]:
     checks the attribute itself and reports SAM2 propagation as the available
     substitute when torch+sam2 are installed.
     """
-    csrt = False
-    reason = None
+    backend: str | None = None
+    reason: str | None = None
     try:
-        import cv2  # noqa: PLC0415
+        # One source of truth with the job itself: whatever the probe reports
+        # is exactly what `mask_track_job` will decide when it runs.
+        from app.jobs.mask_track import tracker_availability
 
-        csrt = hasattr(cv2, "TrackerCSRT_create")
-        if not csrt:
-            reason = (
-                "OpenCV build has no CSRT tracker (contrib module not installed); "
-                "box tracking is disabled."
-            )
+        backend, reason = tracker_availability()
     except Exception:  # noqa: BLE001
         reason = "OpenCV is not importable in this environment."
+    csrt = backend == "csrt"
 
     propagate = False
     try:
@@ -109,13 +107,22 @@ def probe_tracking() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         propagate = False
 
-    available = csrt or propagate
+    available = backend is not None or propagate
+    provider = (
+        "opencv-csrt"
+        if csrt
+        else "opencv-mil"
+        if backend == "mil"
+        else "sam2-propagate"
+        if propagate
+        else None
+    )
     return _entry(
         "tracking",
         available,
         reason=None if available else (reason or "No tracking backend available."),
-        provider="opencv-csrt" if csrt else ("sam2-propagate" if propagate else None),
-        detail={"csrt": csrt, "maskPropagation": propagate},
+        provider=provider,
+        detail={"csrt": csrt, "boxTracker": backend, "maskPropagation": propagate},
     )
 
 
@@ -196,8 +203,27 @@ def probe_generation() -> dict[str, Any]:
         return _entry("media_generation", False, reason=f"Probe failed: {exc}")
 
 
+def _ffmpeg_has_filter(binary: str, name: str) -> bool:
+    import subprocess
+
+    try:
+        listing = subprocess.run(
+            [binary, "-hide_banner", "-filters"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+    except Exception:  # noqa: BLE001
+        return False
+    return any(line.split()[1:2] == [name] for line in listing.splitlines())
+
+
 def probe_export() -> dict[str, Any]:
-    ffmpeg = shutil.which(os.environ.get("FFMPEG_PATH") or "ffmpeg") is not None
+    binary = os.environ.get("FFMPEG_PATH") or "ffmpeg"
+    ffmpeg = shutil.which(binary) is not None
+    # Not every ffmpeg is the ffmpeg the exporter needs: Homebrew's default
+    # build ships WITHOUT libass, so caption burn-in fails at filter parse on
+    # a box where `ffmpeg -version` looks perfectly healthy. Probe the filter
+    # itself, not the binary's existence.
+    subtitles = _ffmpeg_has_filter(binary, "subtitles") if ffmpeg else False
     try:
         from app.utils.cloudinary import cloudinary_credentials_configured
 
@@ -214,7 +240,22 @@ def probe_export() -> dict[str, Any]:
         "export",
         available,
         reason=reason,
-        detail={"ffmpeg": ffmpeg, "cloudinary": cloudinary},
+        detail={
+            "ffmpeg": ffmpeg,
+            "cloudinary": cloudinary,
+            "subtitlesFilter": subtitles,
+            **(
+                {}
+                if subtitles or not ffmpeg
+                else {
+                    "subtitlesFilterNote": (
+                        "This ffmpeg build has no libass subtitles filter; "
+                        "caption burn-in will fail. Install an ffmpeg built "
+                        "with --enable-libass."
+                    )
+                }
+            ),
+        },
     )
 
 
