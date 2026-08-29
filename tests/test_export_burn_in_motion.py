@@ -331,6 +331,80 @@ class TestSampledForm:
         assert "alpha(X,Y)*" in command
 
 
+class TestRevealTrack:
+    REVEAL = {
+        "box": MOTION["box"],
+        "frame": MOTION["frame"],
+        "phases": [
+            {
+                "at": "in",
+                "duration": 0.42,
+                "tracks": {
+                    "reveal": [
+                        {"t": 0.0, "v": 0.0},
+                        {"t": 0.21, "v": 0.87},
+                        {"t": 0.42, "v": 1.0},
+                    ],
+                },
+            }
+        ],
+    }
+
+    def test_sanitize_keeps_reveal_and_needs_no_pivot(self):
+        skipped: list[str] = []
+        motion = _sanitize_burn_in_motion(
+            {"phases": self.REVEAL["phases"]}, 0, skipped
+        )
+        assert skipped == []
+        assert motion["phases"][0]["tracks"]["reveal"][1] == {"t": 0.21, "v": 0.87}
+
+    def test_the_wipe_is_an_alpha_gate_on_x(self, tmp_path: Path):
+        entries, _ = _sanitize_burn_ins(
+            [_entry(motion=dict(self.REVEAL))], tmp_path=tmp_path, output_duration=10.0
+        )
+        joined = " ".join(
+            _burn_in_overlay_command(
+                base_video=Path("in.mp4"),
+                burn_ins=entries,
+                width=640,
+                height=360,
+                frame_rate=30.0,
+                crf=23,
+                output=Path("out.mp4"),
+            )
+        )
+        assert "gte(W*(" in joined
+        # A pure reveal moves nothing: no rotate, no per-frame scale.
+        assert "rotate=" not in joined and "eval=frame" not in joined
+        # The box scopes the sweep to the block, not the frame.
+        assert "crop=200:80:100:60" in joined
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="no ffmpeg on this machine")
+    def test_the_wipe_graph_actually_renders(self, tmp_path: Path):
+        base = tmp_path / "base.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=640x360:d=2:r=30",
+                "-pix_fmt", "yuv420p", str(base),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        entries, _ = _sanitize_burn_ins(
+            [_entry(start=0.2, end=1.8, motion=dict(self.REVEAL))],
+            tmp_path=tmp_path,
+            output_duration=2.0,
+        )
+        output = tmp_path / "out.mp4"
+        command = _burn_in_overlay_command(
+            base_video=base, burn_ins=entries, width=640, height=360,
+            frame_rate=30.0, crf=28, output=output,
+        )
+        result = subprocess.run(command, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert output.exists() and output.stat().st_size > 0
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="no ffmpeg on this machine")
 def test_the_sampled_graph_actually_renders(tmp_path: Path):
     base = tmp_path / "base.mp4"

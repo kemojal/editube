@@ -3571,6 +3571,11 @@ _MOTION_TRACK_LIMITS: dict[str, tuple[float, float]] = {
     "scale": (0.01, 6.0),
     "rotation": (-3600.0, 3600.0),
     "opacity": (0.0, 1.5),
+    # 0..1 fraction revealed, left to right -- the alpha-gate answer to
+    # clip-path wipes (ffmpeg cannot animate a crop's SIZE per frame, but geq
+    # can gate alpha on X). Pivot-free: it works with or without a box, though
+    # a box scopes the sweep to the block instead of the whole frame.
+    "reveal": (0.0, 1.0),
 }
 _MOTION_PHASE_ANCHORS = {"in", "out", "loop"}
 _MOTION_MAX_SAMPLES = 120
@@ -3665,7 +3670,10 @@ def _text_motion_channels(
     """
     duration = float(motion["duration"])
     em = float(motion["em"])
-    settled = {"dx": "0", "dy": "0", "scale": "1", "scaleX": "1", "rot": "0", "opacity": "1"}
+    settled = {
+        "dx": "0", "dy": "0", "scale": "1", "scaleX": "1",
+        "rot": "0", "opacity": "1", "reveal": "1",
+    }
 
     def _enter() -> dict[str, str]:
         eased = _eased_out_cubic01(f"(({time_var})-{start:.6f})/{duration:.6f}")
@@ -3766,6 +3774,7 @@ _MOTION_TRACK_CHANNEL = {
     "scale": "scale",
     "rotation": "rot",
     "opacity": "opacity",
+    "reveal": "reveal",
 }
 
 
@@ -3780,7 +3789,10 @@ def _sampled_motion_channels(
     way the element engine's `merge` does: opacities and scales multiply,
     offsets and rotations add.
     """
-    settled = {"dx": "0", "dy": "0", "scale": "1", "scaleX": "1", "rot": "0", "opacity": "1"}
+    settled = {
+        "dx": "0", "dy": "0", "scale": "1", "scaleX": "1",
+        "rot": "0", "opacity": "1", "reveal": "1",
+    }
     result = dict(settled)
     for phase in motion.get("phases") or []:
         duration = float(phase["duration"])
@@ -3797,11 +3809,11 @@ def _sampled_motion_channels(
             active = None
         for key, samples in phase["tracks"].items():
             channel = _MOTION_TRACK_CHANNEL[key]
-            identity = "1" if channel in {"scale", "opacity"} else "0"
+            identity = "1" if channel in {"scale", "opacity", "reveal"} else "0"
             expression = _sampled_track_expression(samples, local)
             if active is not None:
                 expression = f"if({active},{expression},{identity})"
-            if channel in {"scale", "opacity"}:
+            if channel in {"scale", "opacity", "reveal"}:
                 result[channel] = (
                     expression
                     if result[channel] == "1"
@@ -3876,11 +3888,19 @@ def _append_motion_burn_in(
         centre_y = height / 2.0
         base_w, base_h = width, height
 
+    alpha_factors = []
     if channels["opacity"] != "1":
-        opacity_at_pixel_time = re.sub(r"\bt\b", "T", channels["opacity"])
+        alpha_factors.append(f"({re.sub(r'\bt\b', 'T', channels['opacity'])})")
+    if channels["reveal"] != "1":
+        # The wipe: alpha gated on X against the revealed fraction of the
+        # plane's width -- crop cannot change SIZE per frame, geq can gate.
+        reveal_at_pixel_time = re.sub(r"\bt\b", "T", channels["reveal"])
+        alpha_factors.append(f"gte(W*({reveal_at_pixel_time}),X)")
+    if alpha_factors:
+        joined_alpha = "*".join(alpha_factors)
         filters.append(
             "geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
-            f"a='alpha(X,Y)*({opacity_at_pixel_time})'"
+            f"a='alpha(X,Y)*{joined_alpha}'"
         )
 
     layer = f"burn_layer{index}"
