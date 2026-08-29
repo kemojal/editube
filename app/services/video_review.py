@@ -56,7 +56,13 @@ Return JSON:
  "strengths": [string],
  "improvements": [{"text": string, "fix": string, "start": seconds, \
 "end": seconds or null, "severity": "low"|"medium"|"high", \
-"category": one of hook|pacing|clarity|visuals|audio|structure}],
+"category": one of hook|pacing|clarity|visuals|audio|structure, \
+"fixAction": optional — ONLY when a bounded numeric correction would fix it: \
+for "visuals" {"adjust": {key: -100..100}} with keys \
+temp|tint|exposure|contrast|saturation|vibrance|highlight|shadow|brilliance|fade \
+(the editor's own slider scale, stay conservative: magnitudes under 35); \
+for "audio" {"audio": {"volume": dB -60..60, "fadeIn": seconds 0-10, \
+"fadeOut": seconds 0-10}}. Omit entirely when no numeric fix applies.}],
  "thumbnail_moments": [{"t": seconds, "reason": string max 8 words}]}
 
 """
@@ -129,6 +135,51 @@ def _harden_scores(raw: Any, overall: int) -> dict[str, int]:
     return scores
 
 
+def _harden_fix_action(raw: Any) -> dict[str, Any] | None:
+    """Clamp a model-proposed `fixAction` to what the harness can execute.
+
+    Same bounds as the harness's own operation schemas (visual.adjust /
+    audio.adjust): allow-listed adjust keys on the −100..100 slider scale,
+    volume ±60 dB, fades 0–10 s. Anything else is dropped — the panel never
+    crashes on a malformed field, and the machine block never smuggles a
+    value the compiler would reject anyway.
+    """
+    from app.services.harness.schemas import ADJUSTABLE_KEYS
+
+    if not isinstance(raw, dict):
+        return None
+    action: dict[str, Any] = {}
+
+    adjust = raw.get("adjust")
+    if isinstance(adjust, dict):
+        clamped = {}
+        for key, value in adjust.items():
+            if key not in ADJUSTABLE_KEYS:
+                continue
+            try:
+                clamped[key] = max(-100.0, min(100.0, float(value)))
+            except (TypeError, ValueError):
+                continue
+        if clamped:
+            action["adjust"] = clamped
+
+    audio = raw.get("audio")
+    if isinstance(audio, dict):
+        clamped_audio: dict[str, float] = {}
+        bounds = {"volume": (-60.0, 60.0), "fadeIn": (0.0, 10.0), "fadeOut": (0.0, 10.0)}
+        for key, (low, high) in bounds.items():
+            if key not in audio:
+                continue
+            try:
+                clamped_audio[key] = max(low, min(high, float(audio[key])))
+            except (TypeError, ValueError):
+                continue
+        if clamped_audio:
+            action["audio"] = clamped_audio
+
+    return action or None
+
+
 def _harden_notes(raw: Any, frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
     notes: list[dict[str, Any]] = []
     for item in (raw or [])[:_MAX_NOTES]:
@@ -149,6 +200,11 @@ def _harden_notes(raw: Any, frames: list[dict[str, Any]]) -> list[dict[str, Any]
         category = str(item.get("category") or "").lower()
         if category not in NOTE_CATEGORIES:
             category = "clarity"
+        fix_action = (
+            _harden_fix_action(item.get("fixAction"))
+            if category in {"visuals", "audio"}
+            else None
+        )
         notes.append(
             {
                 "text": text,
@@ -158,6 +214,7 @@ def _harden_notes(raw: Any, frames: list[dict[str, Any]]) -> list[dict[str, Any]
                 "severity": severity,
                 "category": category,
                 "frame_url": _nearest_frame_url(frames, start),
+                **({"fixAction": fix_action} if fix_action else {}),
             }
         )
     return notes

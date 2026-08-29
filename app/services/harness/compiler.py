@@ -30,6 +30,12 @@ RECIPES: dict[str, dict[str, Any]] = {
         "description": "Duplicate the subject above a title so the text passes behind them.",
         "requires": ["segmentation"],
     },
+    "review_fix": {
+        "version": 1,
+        "title": "Apply a review fix",
+        "description": "A bounded correction from an AI-review finding, on the clip it flagged.",
+        "requires": [],
+    },
 }
 
 
@@ -191,8 +197,89 @@ def compile_subject_behind_text(
     )
 
 
+class ReviewFixAudio(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    volume: float | None = Field(default=None, ge=-60, le=60)
+    fadeIn: float | None = Field(default=None, ge=0, le=10)
+    fadeOut: float | None = Field(default=None, ge=0, le=10)
+
+
+class ReviewFixParams(BaseModel):
+    """A hardened `fixAction` from an AI-review finding, plus its time range.
+
+    The review job already clamped the numbers (`_harden_fix_action`); this
+    model bounds them again because a plan's inputs are validated where they
+    are USED, not where they were produced.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    range: SourceRange
+    adjust: dict[str, float] | None = None
+    audio: ReviewFixAudio | None = None
+    #: The finding's own words, kept for the plan panel's row label.
+    note: str | None = Field(default=None, max_length=200)
+
+
+def compile_review_fix(
+    params: dict[str, Any],
+    *,
+    capability_snapshot: dict[str, Any],
+    video_duration: float,
+    draft: dict[str, Any] | None = None,
+) -> HarnessPlan:
+    parsed = ReviewFixParams.model_validate(params)
+    if not parsed.adjust and parsed.audio is None:
+        raise CompileError("empty_fix", "This finding carries no applicable fix.")
+    if video_duration and parsed.range.start > video_duration + 0.5:
+        raise CompileError("range_outside_media", "The finding points past the end of the video.")
+
+    base = _base_clip_for_range(draft, parsed.range)
+    if base is None:
+        raise CompileError(
+            "clip_not_found",
+            "The flagged moment has no addressable clip yet — open the editor, "
+            "let the draft save once, and try again.",
+        )
+    clip_key, fingerprint = base
+
+    operations: list[Any] = []
+    if parsed.adjust:
+        operations.append(
+            AdjustClipOp(
+                id="fix_adjust",
+                clipKey=clip_key,
+                fingerprint=fingerprint,
+                settings=parsed.adjust,
+                explanationKey="harness.op.review_adjust",
+            )
+        )
+    if parsed.audio is not None:
+        from app.services.harness.schemas import AudioClipOp
+
+        operations.append(
+            AudioClipOp(
+                id="fix_audio",
+                clipKey=clip_key,
+                fingerprint=fingerprint,
+                volume=parsed.audio.volume,
+                fadeIn=parsed.audio.fadeIn,
+                fadeOut=parsed.audio.fadeOut,
+                explanationKey="harness.op.review_audio",
+            )
+        )
+    return HarnessPlan(
+        recipe="review_fix",
+        recipeVersion=RECIPES["review_fix"]["version"],
+        operations=operations,
+        warnings=[],
+    )
+
+
 _COMPILERS = {
     "subject_behind_text": compile_subject_behind_text,
+    "review_fix": compile_review_fix,
 }
 
 
