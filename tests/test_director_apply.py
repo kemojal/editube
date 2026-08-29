@@ -185,7 +185,9 @@ class ApplyTests(_ApplyFixture):
         self.assertEqual(result.placed, 2)
         self.db.refresh(draft_row)
         ids = [item["id"] for item in draft_row.result_data["timelineMediaItems"]]
-        self.assertEqual(ids, ["dir%s-d1" % plan_row.id, "dir%s-d2" % plan_row.id])
+        # Ids are minted by the harness run now, not the DirectorPlan row.
+        run_id = plan_row.applied_manifest["harnessRunId"]
+        self.assertEqual(ids, [f"ehr{run_id}-shot_d1", f"ehr{run_id}-shot_d2"])
 
     def test_the_run_records_what_it_added(self) -> None:
         self._draft()

@@ -285,6 +285,67 @@ class TrackKeyframesOp(_OperationBase):
     offsetY: float = Field(default=0.0, ge=-60, le=60)
 
 
+class MediaAnimation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inPreset: Literal[*ANIMATION_PRESETS] = "none"
+    outPreset: Literal[*ANIMATION_PRESETS] = "none"
+    duration: float = Field(default=0.35, ge=0.12, le=1.5)
+    intensity: int = Field(default=100, ge=10, le=200)
+
+
+class PlaceMediaOp(_OperationBase):
+    """Place an already-generated media asset on the timeline.
+
+    The Director's B-roll placement, as a harness primitive: the asset exists
+    before the plan is applied (its generation has its own lifecycle), so
+    unlike `media.stage_label` there is no Phase A — this is pure commit.
+    """
+
+    type: Literal["timeline.place_media"] = "timeline.place_media"
+    name: str = Field(min_length=1, max_length=64)
+    kind: Literal["image", "video"] = "image"
+    sourceId: int = Field(gt=0)
+    sourceUrl: str = Field(min_length=1, max_length=2048)
+    assetDuration: float = Field(gt=0, le=3600)
+    #: Source-time span on the PRIMARY media the shot covers (the export
+    #: intersects it with the keep ranges, so it ripples with later cuts).
+    startSec: float = Field(ge=0)
+    endSec: float = Field(gt=0)
+    #: The intended on-screen length in cut time — the only record of intent
+    #: when a removed gap falls inside the source span.
+    playDuration: float = Field(gt=0, le=600)
+    trackLabel: str = Field(default="V2", min_length=1, max_length=8)
+    animation: MediaAnimation | None = None
+    keyframes: dict[str, list[Keyframe]] | None = Field(default=None)
+
+    @field_validator("endSec")
+    @classmethod
+    def _ordered_span(cls, value: float, info: Any) -> float:
+        start = info.data.get("startSec")
+        if start is not None and value <= float(start):
+            raise ValueError("endSec must be after startSec")
+        return value
+
+    @field_validator("keyframes")
+    @classmethod
+    def _exportable_channels(
+        cls, value: dict[str, list[Keyframe]] | None
+    ) -> dict[str, list[Keyframe]] | None:
+        if value is None:
+            return None
+        if len(value) > 8:
+            raise ValueError("too many keyframe channels")
+        for channel, track in value.items():
+            if not channel.startswith(KEYFRAME_CHANNEL_PREFIXES):
+                raise ValueError(
+                    f"channel {channel!r} has no server-side export path"
+                )
+            if not track or len(track) > 200:
+                raise ValueError(f"channel {channel!r} keyframe count out of range")
+        return value
+
+
 Operation = Annotated[
     Union[
         DuplicateLinkedOp,
@@ -298,6 +359,7 @@ Operation = Annotated[
         StageLabelOp,
         PlaceLabelOp,
         TrackKeyframesOp,
+        PlaceMediaOp,
     ],
     Field(discriminator="type"),
 ]

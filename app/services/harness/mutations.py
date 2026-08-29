@@ -33,6 +33,7 @@ from app.services.harness.schemas import (
     DuplicateLinkedOp,
     HarnessPlan,
     PlaceLabelOp,
+    PlaceMediaOp,
     SetKeyframesOp,
     SubjectMaskOp,
     TrackKeyframesOp,
@@ -448,7 +449,73 @@ def _apply_track_keyframes(
     _set_attribute(draft, clip_key, "keyframes", keyframes, result)
 
 
+def _apply_place_media(
+    draft: dict[str, Any], op: PlaceMediaOp, ctx: MutationContext, result: MutationResult
+) -> None:
+    item_id = entity_id(ctx.run_id, op.id)
+    items = [dict(i) for i in (draft.get("timelineMediaItems") or []) if isinstance(i, dict)]
+    if any(str(i.get("id")) == item_id for i in items):
+        draft["timelineMediaItems"] = items
+        return
+    track_id = _ensure_top_video_track(draft, op.trackLabel, ctx.run_id, result)
+    item = {
+        "id": item_id,
+        "trackId": track_id,
+        "track": "video",
+        "mediaKey": f"generated-{op.sourceId}",
+        "sourceKind": "generated",
+        "sourceId": int(op.sourceId),
+        "name": op.name,
+        "kind": op.kind,
+        "sourceUrl": op.sourceUrl,
+        "duration": round(float(op.assetDuration), 3),
+        "start": round(op.startSec, 3),
+        "end": round(op.endSec, 3),
+        "sourceStart": 0.0,
+        "playDuration": round(op.playDuration, 3),
+        # B-roll ships muted: the A-roll is still the programme.
+        "audioEnabled": False,
+        "groupId": group_id(ctx.run_id),
+        "linkId": f"link-ehr{ctx.run_id}-{op.id}",
+        "semanticRole": "background",
+        "createdByRunId": ctx.run_id,
+    }
+    items.append(item)
+    draft["timelineMediaItems"] = items
+    result.created_item_ids.append(item_id)
+    result.inverse.append({"op": "remove_timeline_item", "id": item_id})
+
+    clip_key = f"media:{item_id}"
+    if op.animation is not None and (
+        op.animation.inPreset != "none" or op.animation.outPreset != "none"
+    ):
+        _set_attribute(
+            draft, clip_key, "animation",
+            {
+                "inPreset": op.animation.inPreset,
+                "outPreset": op.animation.outPreset,
+                "duration": round(op.animation.duration, 3),
+                "intensity": int(op.animation.intensity),
+            },
+            result,
+        )
+    if op.keyframes:
+        _set_attribute(
+            draft, clip_key, "keyframes",
+            {
+                channel: [
+                    {"t": round(kf.t, 3), "v": kf.v,
+                     **({"easing": kf.easing} if kf.easing else {})}
+                    for kf in track
+                ]
+                for channel, track in op.keyframes.items()
+            },
+            result,
+        )
+
+
 _APPLIERS = {
+    "timeline.place_media": _apply_place_media,
     "timeline.duplicate_linked": _apply_duplicate,
     "visual.apply_subject_mask": _apply_subject_mask,
     "overlay.create_text": _apply_create_text,

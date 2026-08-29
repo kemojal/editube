@@ -157,6 +157,135 @@ def _clip_name(directive: dict[str, Any]) -> str:
     return text if len(text) <= 48 else f"{text[:47]}…"
 
 
+@dataclass
+class Placement:
+    """One resolved shot: everything a mutation engine needs, no draft touched."""
+
+    directive_id: str
+    name: str
+    kind: str  # image|video
+    asset_id: int
+    asset_url: str
+    asset_duration: float
+    source_start: float
+    source_end: float
+    play_duration: float
+    animation: dict[str, Any] | None
+    keyframes: dict[str, list[dict[str, Any]]]
+
+
+def resolve_placements(
+    plan: dict[str, Any],
+    *,
+    context: DirectorContext,
+    assets_by_directive: dict[str, Any],
+) -> tuple[list[Placement], list[str]]:
+    """Resolve every directive with a finished asset into a `Placement`.
+
+    Pure resolution — anchors, cut-time spans, animation and Ken Burns — with
+    no draft in sight. Both mutation engines consume this: the legacy
+    `compile_plan` (kept fixture-identical) and the harness's
+    `timeline.place_media` path the Director now applies through.
+
+    A directive whose asset failed or is still generating is skipped with a
+    warning, never placed empty — an empty clip on the timeline is worse than
+    an uninterrupted stretch of the speaker's face, because the user has to
+    find it and remove it.
+    """
+    placements: list[Placement] = []
+    warnings: list[str] = []
+
+    for directive in plan.get("directives") or []:
+        if not isinstance(directive, dict):
+            continue
+        directive_id = str(directive.get("id") or "")
+        asset = assets_by_directive.get(directive_id)
+        if asset is None or getattr(asset, "status", "") != "ready" or not getattr(asset, "url", ""):
+            warnings.append(
+                f"No usable shot for {_clip_name(directive)!r}; left the A-roll running."
+            )
+            continue
+
+        anchor = directive.get("anchor") if isinstance(directive.get("anchor"), dict) else {}
+        try:
+            director_start = float(directive.get("start", 0.0))
+            director_end = float(directive.get("end", 0.0))
+        except (TypeError, ValueError):
+            warnings.append(f"Unreadable timing on {_clip_name(directive)!r}; skipped.")
+            continue
+        span = max(0.1, director_end - director_start)
+
+        resolved = resolve_anchor(
+            context,
+            segment_id=str(anchor.get("segmentId") or ""),
+            quote=str(anchor.get("quote") or ""),
+            fallback_director_start=director_start,
+            fallback_director_end=director_end,
+        )
+        if not resolved.exact:
+            # Two very different situations, and the user can act on one of
+            # them: footage they cut can be brought back, words nobody said
+            # cannot. Saying "could not find" for both would send them looking
+            # through a transcript for a line that is right there.
+            quote = str(anchor.get("quote") or "")
+            if context.was_cut(quote):
+                warnings.append(
+                    f"{_clip_name(directive)!r} was anchored to a line that has since been cut; skipped."
+                )
+            else:
+                warnings.append(
+                    f"Could not find the words {_clip_name(directive)!r} was anchored to; skipped."
+                )
+            continue
+
+        # Source time, via the cut. The shot starts on the anchored word and
+        # runs for the length the director asked for *in the cut* — so if a
+        # removed gap falls inside it, the source range spans the gap and the
+        # export's own intersection splits the clip around it.
+        source_start = resolved.start
+        anchor_in_cut = context.cut_map.to_director(source_start)
+        if anchor_in_cut is None:
+            # Defensive: the anchor resolved against surviving words, so it is
+            # inside a kept range by construction.
+            warnings.append(
+                f"{_clip_name(directive)!r} anchors to footage that was cut; skipped."
+            )
+            continue
+        source_end = context.cut_map.to_source(anchor_in_cut + span)
+        if source_end <= source_start:
+            source_end = source_start + span
+
+        kind = "video" if getattr(asset, "kind", "image") == "video" else "image"
+        in_preset, in_duration = _animation(directive.get("animationIn"), "preset")
+        out_preset, out_duration = _animation(directive.get("animationOut"), "preset")
+        animation: dict[str, Any] | None = None
+        if in_preset != "none" or out_preset != "none":
+            animation = {
+                "inPreset": in_preset,
+                "outPreset": out_preset,
+                "duration": round(max(in_duration, out_duration), 3),
+                "intensity": 100,
+            }
+
+        placements.append(
+            Placement(
+                directive_id=directive_id,
+                name=_clip_name(directive),
+                kind=kind,
+                asset_id=int(asset.id),
+                asset_url=str(asset.url),
+                asset_duration=float(getattr(asset, "duration_seconds", None) or span),
+                source_start=round(source_start, 3),
+                source_end=round(source_end, 3),
+                play_duration=round(span, 3),
+                animation=animation,
+                keyframes=_ken_burns_keyframes(directive.get("framing"), span),
+            )
+        )
+
+    return placements, warnings
+
+
 def compile_plan(
     draft: dict[str, Any],
     plan: dict[str, Any],
@@ -166,12 +295,11 @@ def compile_plan(
     plan_id: int,
     applied_at: str,
 ) -> CompiledPlan:
-    """Place every shot with a finished asset onto the draft.
+    """Place every resolved shot onto the draft (the legacy mutation engine).
 
-    A directive whose asset failed or is still generating is skipped with a
-    warning, never placed empty — an empty clip on the timeline is worse than
-    an uninterrupted stretch of the speaker's face, because the user has to find
-    it and remove it.
+    Kept fixture-identical for the editor's future TypeScript replay and for
+    reverting pre-migration manifests; NEW Director applies go through the
+    harness's `timeline.place_media` instead (`director_apply.apply_plan`).
     """
     result = CompiledPlan(draft=dict(draft))
     tracks = list(result.draft.get("timelineTracks") or [])
@@ -193,97 +321,37 @@ def compile_plan(
     created_items: list[str] = []
     created_keys: list[str] = []
 
-    for directive in plan.get("directives") or []:
-        if not isinstance(directive, dict):
-            continue
-        directive_id = str(directive.get("id") or "")
-        asset = assets_by_directive.get(directive_id)
-        if asset is None or getattr(asset, "status", "") != "ready" or not getattr(asset, "url", ""):
-            result.warnings.append(
-                f"No usable shot for {_clip_name(directive)!r}; left the A-roll running."
-            )
-            continue
-
+    placements, result.warnings = resolve_placements(
+        plan, context=context, assets_by_directive=assets_by_directive
+    )
+    for placement in placements:
         # Ids are derived from the plan, not minted: re-applying the same plan
         # must be a no-op rather than a second copy of every clip.
-        item_id = f"dir{plan_id}-{directive_id}"
+        item_id = f"dir{plan_id}-{placement.directive_id}"
         if item_id in existing_ids:
             continue
-
-        anchor = directive.get("anchor") if isinstance(directive.get("anchor"), dict) else {}
-        try:
-            director_start = float(directive.get("start", 0.0))
-            director_end = float(directive.get("end", 0.0))
-        except (TypeError, ValueError):
-            result.warnings.append(f"Unreadable timing on {_clip_name(directive)!r}; skipped.")
-            continue
-        span = max(0.1, director_end - director_start)
-
-        resolved = resolve_anchor(
-            context,
-            segment_id=str(anchor.get("segmentId") or ""),
-            quote=str(anchor.get("quote") or ""),
-            fallback_director_start=director_start,
-            fallback_director_end=director_end,
-        )
-        if not resolved.exact:
-            # Two very different situations, and the user can act on one of
-            # them: footage they cut can be brought back, words nobody said
-            # cannot. Saying "could not find" for both would send them looking
-            # through a transcript for a line that is right there.
-            quote = str(anchor.get("quote") or "")
-            if context.was_cut(quote):
-                result.warnings.append(
-                    f"{_clip_name(directive)!r} was anchored to a line that has since been cut; skipped."
-                )
-            else:
-                result.warnings.append(
-                    f"Could not find the words {_clip_name(directive)!r} was anchored to; skipped."
-                )
-            continue
-
-        # Source time, via the cut. The shot starts on the anchored word and
-        # runs for the length the director asked for *in the cut* — so if a
-        # removed gap falls inside it, the source range spans the gap and the
-        # export's own intersection splits the clip around it.
-        source_start = resolved.start
-        anchor_in_cut = context.cut_map.to_director(source_start)
-        if anchor_in_cut is None:
-            # Defensive: the anchor resolved against surviving words, so it is
-            # inside a kept range by construction.
-            result.warnings.append(
-                f"{_clip_name(directive)!r} anchors to footage that was cut; skipped."
-            )
-            continue
-        source_end = context.cut_map.to_source(anchor_in_cut + span)
-        if source_end <= source_start:
-            source_end = source_start + span
-
-        kind = "video" if getattr(asset, "kind", "image") == "video" else "image"
-        in_preset, in_duration = _animation(directive.get("animationIn"), "preset")
-        out_preset, out_duration = _animation(directive.get("animationOut"), "preset")
 
         items.append(
             {
                 "id": item_id,
                 "trackId": broll_track_id,
                 "track": "video",
-                "mediaKey": f"generated-{asset.id}",
+                "mediaKey": f"generated-{placement.asset_id}",
                 # The discriminator that stops the render resolving this to the
                 # primary video and compositing the A-roll in its place (G2).
                 "sourceKind": "generated",
-                "sourceId": int(asset.id),
-                "name": _clip_name(directive),
-                "kind": kind,
-                "sourceUrl": str(asset.url),
-                "duration": float(getattr(asset, "duration_seconds", None) or span),
-                "start": round(source_start, 3),
-                "end": round(source_end, 3),
+                "sourceId": placement.asset_id,
+                "name": placement.name,
+                "kind": placement.kind,
+                "sourceUrl": placement.asset_url,
+                "duration": placement.asset_duration,
+                "start": placement.source_start,
+                "end": placement.source_end,
                 "sourceStart": 0.0,
                 # How long the shot is *meant* to be on screen. The source span
                 # above can be longer when a cut falls inside it, so this is the
                 # only record of the director's actual intent.
-                "playDuration": round(span, 3),
+                "playDuration": placement.play_duration,
                 # B-roll ships muted: the A-roll is still the programme.
                 "audioEnabled": False,
             }
@@ -293,16 +361,10 @@ def compile_plan(
 
         clip_key = f"media:{item_id}"
         clip_attrs: dict[str, Any] = {}
-        if in_preset != "none" or out_preset != "none":
-            clip_attrs["animation"] = {
-                "inPreset": in_preset,
-                "outPreset": out_preset,
-                "duration": round(max(in_duration, out_duration), 3),
-                "intensity": 100,
-            }
-        keyframes = _ken_burns_keyframes(directive.get("framing"), span)
-        if keyframes:
-            clip_attrs["keyframes"] = keyframes
+        if placement.animation:
+            clip_attrs["animation"] = dict(placement.animation)
+        if placement.keyframes:
+            clip_attrs["keyframes"] = placement.keyframes
         if clip_attrs:
             attributes[clip_key] = clip_attrs
             created_keys.append(clip_key)
