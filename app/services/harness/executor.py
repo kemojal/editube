@@ -157,6 +157,7 @@ def create_run(
     )
 
     plan_params = dict(params or {})
+    used_planner = False
     if not plan_params and intent:
         from app.services.harness.planner import (
             PROMPT_VERSION,
@@ -183,6 +184,7 @@ def create_run(
             db.commit()
             return run
         plan_params = planned.params
+        used_planner = True
         run.params = plan_params
         run.model_provider = (
             "anthropic" if "claude" in planned.model.lower() else "openrouter"
@@ -211,17 +213,65 @@ def create_run(
         plan_params = {**plan_params, **filled}
         run.params = plan_params
 
-    try:
-        plan = compile_recipe(
-            recipe_id,
+    planner_report: dict[str, Any] | None = None
+    if used_planner:
+        # Plan ranking + deterministic fallbacks (Phase 5): a model proposal
+        # that fails to compile gets mechanical repairs (re-anchor to the
+        # selection, clamp the range) before the run gives up — and when
+        # several candidates compile, a fixed, inspectable score picks one.
+        # Explicit user params never take this path: a typed mistake should
+        # surface as its own error, not be silently repaired.
+        from app.services.harness import ranking
+
+        seg = caps.capability(snapshot, "segmentation")
+        variants = ranking.candidate_variants(
             plan_params,
+            selection=selection,
+            video_duration=video_duration,
+            max_clip_seconds=float(
+                (seg.get("limits") or {}).get("maxClipSeconds") or 120
+            ),
+        )
+        chosen, plan, planner_report = ranking.choose_candidate(
+            recipe_id,
+            variants,
             capability_snapshot=snapshot,
             video_duration=video_duration,
             draft=view.payload,
+            learned=learned,
         )
-    except CompileError as exc:
-        _fail(db, run, exc.code, str(exc))
-        return run
+        if plan is None or chosen is None:
+            # Nothing compiled, repairs included — surface the MODEL
+            # candidate's own error; the repairs failing too is detail.
+            try:
+                compile_recipe(
+                    recipe_id,
+                    plan_params,
+                    capability_snapshot=snapshot,
+                    video_duration=video_duration,
+                    draft=view.payload,
+                )
+            except CompileError as exc:
+                _fail(db, run, exc.code, str(exc))
+                return run
+            except Exception as exc:  # pydantic ValidationError and kin
+                _fail(db, run, "invalid_params", str(exc))
+                return run
+            raise RuntimeError("ranking rejected a plan that compiles")  # pragma: no cover
+        plan_params = chosen
+        run.params = plan_params
+    else:
+        try:
+            plan = compile_recipe(
+                recipe_id,
+                plan_params,
+                capability_snapshot=snapshot,
+                video_duration=video_duration,
+                draft=view.payload,
+            )
+        except CompileError as exc:
+            _fail(db, run, exc.code, str(exc))
+            return run
 
     # Simulate against the base revision — the diff the user reviews.
     ctx = _mutation_context(db, run)
@@ -233,11 +283,20 @@ def create_run(
     run.base_draft_revision = view.revision
     run.base_checksum = view.checksum
     run.warnings = list(plan.warnings)
+    if planner_report is not None and planner_report.get("chosen") != "model":
+        run.warnings = [
+            *run.warnings,
+            f"The description's plan needed a repair ({planner_report['chosen']}) "
+            "to compile; check the affected range.",
+        ]
     run.estimates = estimate_plan(plan)
     run.diff = {
         "manifest": simulated.manifest,
         "warnings": simulated.warnings,
         "operationCount": len(plan.operations),
+        # The ranking trail (intent runs only): every candidate considered,
+        # its outcome, and which one won -- inspectable, never vibes.
+        **({"planner": planner_report} if planner_report is not None else {}),
     }
     run.state = "planned"
     run.stage = f"Planned — {len(plan.operations)} step(s)"

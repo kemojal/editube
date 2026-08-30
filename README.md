@@ -143,14 +143,20 @@ The migration creates `log.api_requests`, `log.api_payloads`, `log.access_events
 Grant an existing internal administrator access only after the account has an internal role and verified MFA:
 
 ```bash
-.venv/bin/python scripts/manage_request_log_admin.py grant \
+export DATABASE_URL='postgresql://<primary-role>:<password>@<primary-host>/editube?sslmode=require'
+export LOG_MIGRATION_DATABASE_URL='postgresql://<log-owner>:<password>@<log-host>/neondb?sslmode=require'
+
+.venv/bin/python -m scripts.manage_request_log_admin grant \
   --email incident-admin@example.com \
   --granted-by security-owner@example.com \
   --reason 'Approved for production incident response' \
   --expires-days 90
 ```
 
-Use the same script’s `revoke` and `list` commands for lifecycle management. Grant and revoke actions are written to `log.access_events`.
+`DATABASE_URL` is used only to validate the account's role and verified MFA in
+the primary database. Grants and audit rows are written through
+`LOG_MIGRATION_DATABASE_URL` to the separate log database. Use the same
+script’s `revoke` and `list` commands for lifecycle management.
 
 ### Deploy the two processes
 
@@ -173,8 +179,17 @@ The internal service intentionally disables OpenAPI and documentation routes. It
 
 1. `POST /internal/request-logs/mfa-step-up` with the current TOTP code.
 2. Send the returned token as `X-Log-Step-Up-Token` and a meaningful `X-Log-Access-Reason` on every privileged request.
+
 3. Search `GET /internal/request-logs`, decrypt `GET /internal/request-logs/{id}/payload`, build a safe manifest with `GET /internal/request-logs/{id}/reproduction`, or inspect privileged activity through `GET /internal/request-logs/access-events`.
 4. Check database visibility and the latest captured request through `GET /internal/request-logs/health` using the same privileged headers.
+
+### Internal monitoring console
+
+The separate `../editube-admin` TanStack Start application provides the human-facing log console. It uses TanStack Query for live overview/request/audit data and Better Auth for an HttpOnly dashboard session, while preserving this backend as the authority for roles, explicit grants, MFA step-up, payload decryption, and access auditing. Editube bearer and step-up tokens are encrypted in the console's dedicated `admin_auth` database schema and are never stored in browser storage.
+
+The live `GET /internal/request-logs/analytics/timeline` endpoint supports bounded minute (up to 24 hours), hour (up to 31 days), and day (up to 31 days) aggregation from retained metadata. It returns request/failure totals, average and p95 latency, status-class buckets, transfer sizes, and top routes. The request search endpoint also accepts an exact `environment` filter. Longer historical reporting should continue to use the retained daily rollups.
+
+See `../editube-admin/README.md` for database bootstrap, secret generation, deployment, first-administrator access, and validation commands.
 
 Monitor `GET /health/request-logging` on the public API for queue depth, payload shedding, dropped records, failed writes, and writer-thread health. It returns HTTP 503 when capture is degraded without exposing database errors or secrets.
 

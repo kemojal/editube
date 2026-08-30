@@ -20,10 +20,17 @@ from app.db.models import User, UserMFAMethod
 INTERNAL_ROLES = {"admin", "internal_admin", "super_admin"}
 
 
-def _database_url() -> str:
-    url = (os.getenv("LOG_MIGRATION_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
+def _primary_database_url() -> str:
+    url = (os.getenv("DATABASE_URL") or "").strip()
     if not url:
-        raise SystemExit("Set LOG_MIGRATION_DATABASE_URL (preferred) or DATABASE_URL")
+        raise SystemExit("Set DATABASE_URL for the Editube primary database")
+    return url
+
+
+def _log_database_url() -> str:
+    url = (os.getenv("LOG_MIGRATION_DATABASE_URL") or "").strip()
+    if not url:
+        raise SystemExit("Set LOG_MIGRATION_DATABASE_URL for the request-log database")
     return url
 
 
@@ -71,15 +78,19 @@ def main() -> int:
     if args.command == "grant" and not 1 <= args.expires_days <= 365:
         raise SystemExit("--expires-days must be between 1 and 365")
 
-    engine = create_engine(_database_url(), connect_args=connect_args_for(_database_url()))
-    db = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
+    primary_url = _primary_database_url()
+    log_url = _log_database_url()
+    primary_engine = create_engine(primary_url, connect_args=connect_args_for(primary_url))
+    log_engine = create_engine(log_url, connect_args=connect_args_for(log_url))
+    primary_db = sessionmaker(bind=primary_engine, autocommit=False, autoflush=False)()
+    log_db = sessionmaker(bind=log_engine, autocommit=False, autoflush=False)()
     try:
         if args.command == "grant":
-            target = _user(db, args.email)
-            actor = _user(db, args.granted_by)
+            target = _user(primary_db, args.email)
+            actor = _user(primary_db, args.granted_by)
             now = datetime.now(timezone.utc)
             for existing in (
-                db.query(LogAdminAccessGrant)
+                log_db.query(LogAdminAccessGrant)
                 .filter(
                     LogAdminAccessGrant.user_id == target.id,
                     LogAdminAccessGrant.revoked_at.is_(None),
@@ -98,8 +109,8 @@ def main() -> int:
                 grant_reason=args.reason.strip(),
                 expires_at=now + timedelta(days=args.expires_days),
             )
-            db.add(row)
-            db.add(
+            log_db.add(row)
+            log_db.add(
                 LogAccessEvent(
                     id=uuid.uuid4(),
                     actor_user_id=actor.id,
@@ -113,13 +124,13 @@ def main() -> int:
                     },
                 )
             )
-            db.commit()
+            log_db.commit()
             print(f"Granted request-log access to user_id={target.id}; expires={row.expires_at.isoformat()}")
         elif args.command == "revoke":
-            target = _user(db, args.email)
-            actor = _user(db, args.revoked_by)
+            target = _user(primary_db, args.email)
+            actor = _user(primary_db, args.revoked_by)
             rows = (
-                db.query(LogAdminAccessGrant)
+                log_db.query(LogAdminAccessGrant)
                 .filter(
                     LogAdminAccessGrant.user_id == target.id,
                     LogAdminAccessGrant.revoked_at.is_(None),
@@ -131,7 +142,7 @@ def main() -> int:
                 row.revoked_at = now
                 row.revoked_by_user_id = actor.id
                 row.revoke_reason = args.reason.strip()
-            db.add(
+            log_db.add(
                 LogAccessEvent(
                     id=uuid.uuid4(),
                     actor_user_id=actor.id,
@@ -141,10 +152,14 @@ def main() -> int:
                     details={"target_user_id": target.id, "grants_revoked": len(rows)},
                 )
             )
-            db.commit()
+            log_db.commit()
             print(f"Revoked {len(rows)} request-log grant(s) for user_id={target.id}")
         else:
-            rows = db.query(LogAdminAccessGrant).order_by(LogAdminAccessGrant.created_at.desc()).all()
+            rows = (
+                log_db.query(LogAdminAccessGrant)
+                .order_by(LogAdminAccessGrant.created_at.desc())
+                .all()
+            )
             for row in rows:
                 state = "revoked" if row.revoked_at else "active"
                 print(
@@ -152,8 +167,10 @@ def main() -> int:
                     f"decrypt={row.can_decrypt} expires={row.expires_at}"
                 )
     finally:
-        db.close()
-        engine.dispose()
+        primary_db.close()
+        log_db.close()
+        primary_engine.dispose()
+        log_engine.dispose()
     return 0
 
 

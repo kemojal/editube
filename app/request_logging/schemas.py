@@ -11,6 +11,7 @@ class LogMFAStepUpRequest(BaseModel):
 
 class LogSearchFilters(BaseModel):
     request_id: str | None = None
+    environment: str | None = None
     method: str | None = None
     route: str | None = None
     status_code: int | None = None

@@ -11,7 +11,19 @@ from __future__ import annotations
 import pytest
 
 from app.db.models import HarnessRecipeTemplate, HarnessRun
+from app.services.harness import executor as executor_module
 from app.services.harness import preferences
+
+CAPS = {
+    "capabilities": {
+        "segmentation": {
+            "key": "segmentation",
+            "available": True,
+            "limits": {"maxClipSeconds": 120},
+            "detail": {"autoMatte": True},
+        },
+    }
+}
 
 
 @pytest.fixture(autouse=True)
@@ -19,6 +31,7 @@ def no_real_queue(monkeypatch):
     monkeypatch.setattr(
         "app.api.routes.harness.enqueue_harness_apply_job", lambda *a, **k: None
     )
+    monkeypatch.setattr(executor_module.caps, "snapshot", lambda: CAPS)
 
 
 @pytest.fixture()
@@ -40,12 +53,12 @@ class TestTemplateCrud:
         _, _, video = seeded
         body = api_client.put(
             f"/videos/{video.id}/editing/recipe_templates",
-            json={"recipe_id": "subject_behind_text", "params": {"templateId": "bold"}},
+            json={"recipe_id": "subject_behind_text", "params": {"templateId": "glass"}},
         ).json()
-        assert body["templates"]["subject_behind_text"] == {"templateId": "bold"}
+        assert body["templates"]["subject_behind_text"] == {"templateId": "glass"}
 
         listed = api_client.get(f"/videos/{video.id}/editing/recipe_templates").json()
-        assert listed["templates"]["subject_behind_text"] == {"templateId": "bold"}
+        assert listed["templates"]["subject_behind_text"] == {"templateId": "glass"}
 
         cleared = api_client.put(
             f"/videos/{video.id}/editing/recipe_templates",
@@ -59,7 +72,7 @@ class TestTemplateCrud:
             f"/videos/{video.id}/editing/recipe_templates",
             json={
                 "recipe_id": "subject_behind_text",
-                "params": {"text": "HOUSE TITLE", "templateId": "bold"},
+                "params": {"text": "HOUSE TITLE", "templateId": "glass"},
             },
         )
         assert response.status_code == 422
@@ -98,7 +111,7 @@ class TestPrecedence:
 
     def test_team_template_fills_unset_keys(self, db_session, api_client, seeded):
         _, project, video = seeded
-        self._template(db_session, project, {"templateId": "bold", "maskQuality": "better"})
+        self._template(db_session, project, {"templateId": "glass", "maskQuality": "better"})
         run = api_client.post(
             f"/videos/{video.id}/editing/runs",
             json={
@@ -106,12 +119,13 @@ class TestPrecedence:
                 "params": {"range": {"start": 1.0, "end": 5.0}, "text": "HI"},
             },
         ).json()
-        assert run["params"]["templateId"] == "bold"
+        assert run["state"] == "planned", run.get("error_detail")
+        assert run["params"]["templateId"] == "glass"
         assert run["params"]["maskQuality"] == "better"
 
     def test_the_users_own_learning_beats_the_team(self, db_session, api_client, seeded):
         user, project, video = seeded
-        self._template(db_session, project, {"templateId": "bold"})
+        self._template(db_session, project, {"templateId": "glass"})
         for _ in range(3):
             db_session.add(
                 HarnessRun(
@@ -128,11 +142,12 @@ class TestPrecedence:
                 "params": {"range": {"start": 1.0, "end": 5.0}, "text": "HI"},
             },
         ).json()
+        assert run["state"] == "planned", run.get("error_detail")
         assert run["params"]["templateId"] == "minimal"
 
     def test_explicit_params_beat_everything(self, db_session, api_client, seeded):
         _, project, video = seeded
-        self._template(db_session, project, {"templateId": "bold"})
+        self._template(db_session, project, {"templateId": "glass"})
         run = api_client.post(
             f"/videos/{video.id}/editing/runs",
             json={
@@ -140,11 +155,12 @@ class TestPrecedence:
                 "params": {
                     "range": {"start": 1.0, "end": 5.0},
                     "text": "HI",
-                    "templateId": "kinetic",
+                    "templateId": "mono",
                 },
             },
         ).json()
-        assert run["params"]["templateId"] == "kinetic"
+        assert run["state"] == "planned", run.get("error_detail")
+        assert run["params"]["templateId"] == "mono"
 
     def test_a_stale_whitelisted_key_never_resurfaces(self, db_session, seeded):
         """A key later removed from the whitelist is filtered on read."""
@@ -152,11 +168,11 @@ class TestPrecedence:
         row = HarnessRecipeTemplate(
             workspace_id=project.workspace_id,
             recipe_id="subject_behind_text",
-            params={"templateId": "bold", "retiredKey": "x"},
+            params={"templateId": "glass", "retiredKey": "x"},
         )
         db_session.add(row)
         db_session.commit()
         defaults = preferences.team_defaults(
             db_session, project.workspace_id, "subject_behind_text"
         )
-        assert defaults == {"templateId": "bold"}
+        assert defaults == {"templateId": "glass"}

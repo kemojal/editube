@@ -177,6 +177,10 @@ class TestIntentRuns:
     def test_model_proposed_params_still_hit_compile_validation(
         self, editor, monkeypatch
     ):
+        """The proposal fails compile as before — but a mechanical range
+        error is now REPAIRED (plan ranking, Phase 5) instead of ending the
+        run: the clamped candidate plans, the warning says a repair
+        happened, and the trail records the original failure."""
         client, video = editor
         bad = PlannerResult(
             recipe_id="subject_behind_text",
@@ -192,8 +196,12 @@ class TestIntentRuns:
             json={"recipe_id": "subject_behind_text", "intent": "everything"},
         )
         body = response.json()
-        assert body["state"] == "failed"
-        assert body["error_code"] == "range_too_long"
+        assert body["state"] == "planned"
+        # Clamped to the 30s video, well under the 120s capability cap.
+        assert body["params"]["range"] == {"start": 0.0, "end": 30.0}
+        assert any("repair" in w for w in body["warnings"])
+        assert body["diff"]["planner"]["chosen"] == "clamped-range"
+        assert body["diff"]["planner"]["considered"][0]["outcome"] == "range_too_long"
 
 
 class TestPlannerProbe:

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -24,6 +24,50 @@ from .schemas import LogMFAStepUpRequest
 
 
 router = APIRouter(prefix="/internal/request-logs", tags=["Internal Request Logs"])
+
+
+_ANALYTICS_MAX_WINDOWS = {
+    "minute": timedelta(hours=24),
+    "hour": timedelta(days=31),
+    "day": timedelta(days=31),
+}
+
+
+def _validate_analytics_window(bucket: str, from_ts: datetime, to_ts: datetime) -> None:
+    if bucket not in _ANALYTICS_MAX_WINDOWS:
+        raise HTTPException(status_code=422, detail="Unsupported analytics bucket")
+    if from_ts.tzinfo is None or to_ts.tzinfo is None:
+        raise HTTPException(status_code=422, detail="Analytics timestamps must include a timezone")
+    if from_ts >= to_ts:
+        raise HTTPException(status_code=422, detail="from_ts must be earlier than to_ts")
+    max_window = _ANALYTICS_MAX_WINDOWS[bucket]
+    if to_ts - from_ts > max_window:
+        raise HTTPException(
+            status_code=422,
+            detail=f"The maximum {bucket} analytics window is {max_window}",
+        )
+
+
+def _apply_request_filters(
+    query,
+    *,
+    from_ts: datetime,
+    to_ts: datetime,
+    environment: str | None,
+    method: str | None,
+    route: str | None,
+):
+    query = query.filter(
+        ApiRequestLog.occurred_at >= from_ts,
+        ApiRequestLog.occurred_at < to_ts,
+    )
+    if environment:
+        query = query.filter(ApiRequestLog.environment == environment)
+    if method:
+        query = query.filter(ApiRequestLog.method == method.upper())
+    if route:
+        query = query.filter(ApiRequestLog.route_template.ilike(f"%{route}%"))
+    return query
 
 
 def _serialize_request(row: ApiRequestLog) -> dict:
@@ -168,6 +212,168 @@ def request_log_daily_analytics(
     return {"items": result}
 
 
+@router.get("/analytics/timeline")
+def request_log_timeline_analytics(
+    request: Request,
+    from_ts: datetime = Query(...),
+    to_ts: datetime = Query(...),
+    bucket: str = Query(default="hour", pattern="^(minute|hour|day)$"),
+    environment: str | None = Query(default=None, max_length=32),
+    method: str | None = Query(default=None, max_length=16),
+    route: str | None = Query(default=None, max_length=256),
+    top_route_limit: int = Query(default=8, ge=1, le=25),
+    x_log_step_up_token: str | None = Header(default=None, alias="X-Log-Step-Up-Token"),
+    x_log_access_reason: str | None = Header(default=None, alias="X-Log-Access-Reason"),
+    log_db: Session = Depends(get_log_read_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return bounded, live analytics from retained request metadata.
+
+    Raw metadata is intentionally used here so the current minute/hour/day is
+    visible before the daily retention job creates rollups. Longer historical
+    analysis belongs to the daily rollup endpoint.
+    """
+    access = _authorize(
+        request, current_user, log_db, x_log_step_up_token, x_log_access_reason, decrypt=False
+    )
+    _validate_analytics_window(bucket, from_ts, to_ts)
+
+    bucket_start = func.date_trunc(bucket, ApiRequestLog.occurred_at).label("bucket_start")
+    failure_count = func.sum(
+        case((ApiRequestLog.status_code >= 400, 1), else_=0)
+    ).label("failure_count")
+
+    timeline_query = log_db.query(
+        bucket_start,
+        func.count(ApiRequestLog.id).label("request_count"),
+        failure_count,
+        func.avg(ApiRequestLog.duration_ms).label("average_duration_ms"),
+        func.percentile_cont(0.95)
+        .within_group(ApiRequestLog.duration_ms)
+        .label("p95_duration_ms"),
+        func.sum(case((ApiRequestLog.status_code.between(200, 299), 1), else_=0)).label(
+            "status_2xx"
+        ),
+        func.sum(case((ApiRequestLog.status_code.between(300, 399), 1), else_=0)).label(
+            "status_3xx"
+        ),
+        func.sum(case((ApiRequestLog.status_code.between(400, 499), 1), else_=0)).label(
+            "status_4xx"
+        ),
+        func.sum(case((ApiRequestLog.status_code.between(500, 599), 1), else_=0)).label(
+            "status_5xx"
+        ),
+    )
+    timeline_query = _apply_request_filters(
+        timeline_query,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        environment=environment,
+        method=method,
+        route=route,
+    )
+    timeline_rows = timeline_query.group_by(bucket_start).order_by(bucket_start).all()
+
+    summary_query = log_db.query(
+        func.count(ApiRequestLog.id).label("request_count"),
+        failure_count,
+        func.avg(ApiRequestLog.duration_ms).label("average_duration_ms"),
+        func.percentile_cont(0.95)
+        .within_group(ApiRequestLog.duration_ms)
+        .label("p95_duration_ms"),
+        func.sum(ApiRequestLog.request_size_bytes).label("request_bytes"),
+        func.sum(ApiRequestLog.response_size_bytes).label("response_bytes"),
+    )
+    summary = _apply_request_filters(
+        summary_query,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        environment=environment,
+        method=method,
+        route=route,
+    ).one()
+
+    route_name = func.coalesce(ApiRequestLog.route_template, "<unmatched>").label("route")
+    top_routes_query = log_db.query(
+        route_name,
+        ApiRequestLog.method,
+        func.count(ApiRequestLog.id).label("request_count"),
+        failure_count,
+        func.avg(ApiRequestLog.duration_ms).label("average_duration_ms"),
+    )
+    top_routes = (
+        _apply_request_filters(
+            top_routes_query,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            environment=environment,
+            method=method,
+            route=route,
+        )
+        .group_by(route_name, ApiRequestLog.method)
+        .order_by(func.count(ApiRequestLog.id).desc())
+        .limit(top_route_limit)
+        .all()
+    )
+
+    total = int(summary.request_count or 0)
+    failures = int(summary.failure_count or 0)
+    result = {
+        "bucket": bucket,
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "summary": {
+            "request_count": total,
+            "failure_count": failures,
+            "error_rate": failures / total if total else 0.0,
+            "average_duration_ms": float(summary.average_duration_ms or 0),
+            "p95_duration_ms": float(summary.p95_duration_ms or 0),
+            "request_bytes": int(summary.request_bytes or 0),
+            "response_bytes": int(summary.response_bytes or 0),
+        },
+        "buckets": [
+            {
+                "start": row.bucket_start,
+                "request_count": int(row.request_count or 0),
+                "failure_count": int(row.failure_count or 0),
+                "average_duration_ms": float(row.average_duration_ms or 0),
+                "p95_duration_ms": float(row.p95_duration_ms or 0),
+                "status_2xx": int(row.status_2xx or 0),
+                "status_3xx": int(row.status_3xx or 0),
+                "status_4xx": int(row.status_4xx or 0),
+                "status_5xx": int(row.status_5xx or 0),
+            }
+            for row in timeline_rows
+        ],
+        "top_routes": [
+            {
+                "route": row.route,
+                "method": row.method,
+                "request_count": int(row.request_count or 0),
+                "failure_count": int(row.failure_count or 0),
+                "average_duration_ms": float(row.average_duration_ms or 0),
+            }
+            for row in top_routes
+        ],
+    }
+    record_log_access(
+        log_db,
+        request,
+        actor_user_id=current_user.id,
+        action="analytics_timeline",
+        outcome="success",
+        reason=access.reason,
+        details={
+            "bucket": bucket,
+            "rows": len(result["buckets"]),
+            "environment": environment,
+            "method": method.upper() if method else None,
+            "route_filter_present": bool(route),
+        },
+    )
+    return result
+
+
 @router.get("/access-events")
 def list_request_log_access_events(
     request: Request,
@@ -230,6 +436,7 @@ def search_request_logs(
     request_id: str | None = Query(default=None, max_length=128),
     method: str | None = Query(default=None, max_length=16),
     route: str | None = Query(default=None, max_length=256),
+    environment: str | None = Query(default=None, max_length=32),
     status_code: int | None = Query(default=None, ge=100, le=599),
     only_errors: bool = Query(default=False),
     user_id: int | None = Query(default=None),
@@ -253,6 +460,8 @@ def search_request_logs(
         query = query.filter(ApiRequestLog.method == method.upper())
     if route:
         query = query.filter(ApiRequestLog.route_template.ilike(f"%{route}%"))
+    if environment:
+        query = query.filter(ApiRequestLog.environment == environment)
     if status_code is not None:
         query = query.filter(ApiRequestLog.status_code == status_code)
     if only_errors:
