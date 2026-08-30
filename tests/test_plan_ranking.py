@@ -205,3 +205,76 @@ class TestThroughTheRun:
         ).json()
         assert run["state"] == "failed"
         assert run["error_code"] == "range_outside_media"
+
+
+class TestConversationMemory:
+    """The planner sees this video's earlier exchanges (chat memory)."""
+
+    @pytest.fixture(autouse=True)
+    def fakes(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.api.routes.harness.enqueue_harness_apply_job", lambda *a, **k: None
+        )
+        monkeypatch.setattr(executor_module.caps, "snapshot", lambda: CAPS)
+
+    def test_prior_runs_reach_the_planner_oldest_first(
+        self, db_session, api_client, make_user, make_project, make_video, monkeypatch
+    ):
+        from app.db.models import HarnessRun
+
+        user = make_user()
+        project = make_project(creator=user)
+        video = make_video(project=project, duration=30)
+        db_session.commit()
+        api_client.login(user)
+
+        for intent, state in [("first title", "reverted"), ("second title", "ready")]:
+            db_session.add(
+                HarnessRun(
+                    project_id=project.id, video_id=video.id, created_by=user.id,
+                    state=state, recipe_id="subject_behind_text", intent=intent,
+                )
+            )
+        db_session.commit()
+
+        captured: dict = {}
+
+        def _capture(intent, **kwargs):
+            captured.update(kwargs, intent=intent)
+            return PlannerResult(
+                recipe_id="subject_behind_text", params=dict(GOOD),
+                model="test/model", usage={},
+            )
+
+        monkeypatch.setattr(
+            "app.services.harness.planner.plan_recipe_params", _capture
+        )
+        run = api_client.post(
+            f"/videos/{video.id}/editing/runs",
+            json={"recipe_id": "subject_behind_text", "intent": "make it bigger"},
+        ).json()
+        assert run["state"] == "planned"
+        history = captured["history"]
+        assert [item["intent"] for item in history] == ["first title", "second title"]
+        # Outcomes ride along — a reverted run is a preference signal.
+        assert history[0]["state"] == "reverted"
+
+    def test_the_runs_list_carries_the_words(
+        self, db_session, api_client, make_user, make_project, make_video
+    ):
+        from app.db.models import HarnessRun
+
+        user = make_user()
+        project = make_project(creator=user)
+        video = make_video(project=project, duration=30)
+        db_session.commit()
+        api_client.login(user)
+        db_session.add(
+            HarnessRun(
+                project_id=project.id, video_id=video.id, created_by=user.id,
+                state="ready", recipe_id="subject_behind_text", intent="hello title",
+            )
+        )
+        db_session.commit()
+        listed = api_client.get(f"/videos/{video.id}/editing/runs").json()
+        assert listed["runs"][0]["intent"] == "hello title"

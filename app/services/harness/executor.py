@@ -169,12 +169,28 @@ def create_run(
         max_clip = float((seg.get("limits") or {}).get("maxClipSeconds") or 120)
         run.stage = "Reading the request"
         db.commit()
+        # The conversation so far: this video's earlier runs (their words and
+        # what became of them), so a follow-up like "make the title bigger"
+        # has something to be bigger THAN. Outcomes ride along -- a reverted
+        # run is a preference signal.
+        prior = (
+            db.query(HarnessRun)
+            .filter(HarnessRun.video_id == video.id, HarnessRun.id != run.id)
+            .order_by(HarnessRun.created_at.desc(), HarnessRun.id.desc())
+            .limit(5)
+            .all()
+        )
+        conversation = [
+            {"intent": row.intent, "recipe_id": row.recipe_id, "state": row.state}
+            for row in reversed(prior)
+        ]
         try:
             planned = plan_recipe_params(
                 intent,
                 video_duration=video_duration,
                 max_clip_seconds=max_clip,
                 selection=selection,
+                history=conversation,
             )
         except PlannerError as exc:
             run.state = "needs_input"

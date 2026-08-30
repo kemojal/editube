@@ -259,6 +259,8 @@ def list_runs(
                 "state": run.state,
                 "stage": run.stage,
                 "recipe_id": run.recipe_id,
+                "intent": run.intent,
+                "auto_applied": bool(run.auto_applied),
                 "created_at": run.created_at,
             }
             for run in runs
