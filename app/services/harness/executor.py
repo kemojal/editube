@@ -191,6 +191,22 @@ def create_run(
         run.prompt_version = PROMPT_VERSION
         run.token_usage = planned.usage
 
+    # Learned defaults (plan Phase 5): fill ONLY whitelisted style keys the
+    # caller (or the planner) left unset, from the user's own kept runs.
+    # Explicit values always win, and the merged params land on the run row
+    # so what compiled is what is shown.
+    if user_id is not None:
+        from app.services.harness import preferences
+
+        if preferences.learning_enabled(db, user_id):
+            learned = preferences.learned_defaults(db, user_id, recipe_id)
+            filled = {
+                key: value for key, value in learned.items() if key not in plan_params
+            }
+            if filled:
+                plan_params = {**plan_params, **filled}
+                run.params = plan_params
+
     try:
         plan = compile_recipe(
             recipe_id,
@@ -301,6 +317,14 @@ def try_auto_apply(db: Session, run: HarnessRun, grant: Any) -> tuple[HarnessRun
     for op in plan.operations:
         if op.enabled and op.risk not in AUTO_APPLY_RISKS:
             return run, f"step {op.id!r} is {op.risk}; that always needs a review"
+
+    # The measured-revert-rate gate (plan Phase 5 exit criterion): a user who
+    # keeps taking this recipe's results back off gets the review step back.
+    from app.services.harness import preferences
+
+    gated = preferences.auto_apply_gate(db, run.created_by, run.recipe_id)
+    if gated:
+        return run, gated
 
     grant.spent_at = _now()
     grant.spent_run_id = run.id

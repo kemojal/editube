@@ -153,6 +153,10 @@ class UserSettings(Base):
     # Per-capability default AI model choices, e.g. {"transcription": "base",
     # "editing": "gemini-3-flash-preview", "image": "...", "video": "..."}.
     ai_model_preferences = Column(JSONB, nullable=True)
+    # Editing-harness preference learning (plan Phase 5): {"learningEnabled":
+    # bool, "resetAt": iso}. The learned values themselves are never stored --
+    # they are recomputed from run history, so inspect/reset stay honest.
+    harness_preferences = Column(JSONB, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
 

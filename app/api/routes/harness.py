@@ -32,6 +32,7 @@ from app.services.project_access import assert_write_project_content, can_access
 
 router = APIRouter(prefix="/videos", tags=["Editing Harness"])
 runs_router = APIRouter(prefix="/editing/runs", tags=["Editing Harness"])
+preferences_router = APIRouter(prefix="/editing/preferences", tags=["Editing Harness"])
 
 
 def _video_and_project(
@@ -403,3 +404,51 @@ def get_diff(
             run.base_draft_revision is not None and view.revision != run.base_draft_revision
         ),
     }
+
+
+# -- learned preferences (plan Phase 5): inspect, disable, reset --------------
+
+
+class PreferencesPatchBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    learning_enabled: bool
+
+
+@preferences_router.get("")
+def get_preferences(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Everything the learner knows about this user, and why.
+
+    Learned values are recomputed from run history on every read — nothing
+    is stored — so what this returns IS the learner, not a cache of it.
+    """
+    from app.services.harness import preferences
+
+    return preferences.snapshot(db, current_user.id)
+
+
+@preferences_router.patch("")
+def patch_preferences(
+    body: PreferencesPatchBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.harness import preferences
+
+    preferences.set_learning_enabled(db, current_user.id, body.learning_enabled)
+    return preferences.snapshot(db, current_user.id)
+
+
+@preferences_router.post("/reset")
+def reset_preferences(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Forget everything learned so far — by cutoff, not deletion."""
+    from app.services.harness import preferences
+
+    preferences.reset(db, current_user.id)
+    return preferences.snapshot(db, current_user.id)
