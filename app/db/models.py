@@ -2750,6 +2750,10 @@ class HarnessRun(Base):
     recipe_id = Column(String, nullable=True, index=True)
     recipe_version = Column(Integer, nullable=False, default=1, server_default="1")
     params = Column(JSONB, nullable=True)
+    #: True when the run applied without a human approve click, under a spent
+    #: auto-apply grant (plan Phase 5). Auto-applied runs that fail
+    #: verification are reverted automatically -- nobody reviewed them.
+    auto_applied = Column(Boolean, nullable=False, default=False, server_default="false")
 
     base_draft_revision = Column(Integer, nullable=True)
     applied_draft_revision = Column(Integer, nullable=True)
@@ -2845,6 +2849,39 @@ class HarnessOperation(Base):
     completed_at = Column(TIMESTAMP, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class HarnessAutoApplyGrant(Base):
+    """One-shot consent to auto-apply a harness recipe (plan Phase 5).
+
+    Auto-edit-gate semantics: the user grants once, the server spends the
+    grant exactly once inside the same transaction that approves the run --
+    a replayed create request cannot auto-apply twice. A plan that turns out
+    ineligible (destructive risk, needs input) leaves the grant UNSPENT: the
+    consent was for a safe automatic apply, and that is not what compiled.
+    """
+
+    __tablename__ = "editing_harness_auto_apply_grants"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(
+        Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    video_id = Column(
+        Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    recipe_id = Column(String, nullable=False)
+
+    spent_at = Column(TIMESTAMP, nullable=True)
+    spent_run_id = Column(
+        Integer,
+        ForeignKey("editing_harness_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
 
 class UgcProduct(Base):

@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.db.models import HarnessOperation, HarnessRun, Project, User, Video
+from app.db.models import HarnessAutoApplyGrant, HarnessOperation, HarnessRun, Project, User, Video
 from app.jobs.queue import enqueue_harness_apply_job
 from app.services import draft_store
 from app.services.harness import capabilities as caps
@@ -103,6 +103,7 @@ def _serialize_run(db: Session, run: HarnessRun) -> dict[str, Any]:
         "intent": run.intent,
         "recipe_id": run.recipe_id,
         "recipe_version": run.recipe_version,
+        "auto_applied": bool(run.auto_applied),
         "params": run.params,
         "plan": run.plan,
         "plan_checksum": run.plan_checksum,
@@ -150,6 +151,11 @@ class CreateRunBody(BaseModel):
     intent: str | None = Field(default=None, max_length=2000)
     #: The user's current selection, source seconds — the planner prefers it.
     selection: SelectionBody | None = None
+    #: A one-shot auto-apply consent (plan Phase 5). When the compiled plan
+    #: qualifies (reversible steps only), the run approves and applies with no
+    #: further click and the grant is spent; otherwise the run stays planned,
+    #: the grant stays unspent, and a warning says why.
+    auto_apply_grant_id: int | None = Field(default=None, gt=0)
 
 
 @router.post("/{video_id}/editing/runs")
@@ -172,7 +178,63 @@ def create_run(
         intent=body.intent,
         selection=body.selection.model_dump() if body.selection else None,
     )
+    if body.auto_apply_grant_id:
+        grant = (
+            db.query(HarnessAutoApplyGrant)
+            .filter(
+                HarnessAutoApplyGrant.id == body.auto_apply_grant_id,
+                HarnessAutoApplyGrant.project_id == project.id,
+                HarnessAutoApplyGrant.user_id == current_user.id,
+            )
+            .first()
+        )
+        if grant is None:
+            raise HTTPException(status_code=404, detail="Auto-apply consent not found")
+        run, declined = executor.try_auto_apply(db, run, grant)
+        if declined:
+            run.warnings = list(run.warnings or []) + [
+                f"Not applied automatically: {declined}. Review the plan and apply it yourself."
+            ]
+            db.commit()
+        else:
+            job_id = enqueue_harness_apply_job(run.id, run.plan_checksum)
+            if job_id is None:
+                executor.execute_apply(db, run.id)
+                db.refresh(run)
     return _serialize_run(db, run)
+
+
+class AutoApplyGrantBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    recipe_id: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/{video_id}/editing/auto_apply_grants")
+def create_auto_apply_grant(
+    video_id: int,
+    body: AutoApplyGrantBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """One-shot consent to auto-apply a recipe on this video.
+
+    The grant is spent server-side the moment a qualifying run applies under
+    it — a replayed create request cannot auto-apply twice on one consent.
+    """
+    video, project = _video_and_project(video_id, db, current_user, write=True)
+    if body.recipe_id not in RECIPES:
+        raise HTTPException(status_code=404, detail=f"Unknown recipe {body.recipe_id!r}")
+    grant = HarnessAutoApplyGrant(
+        project_id=project.id,
+        video_id=video.id,
+        user_id=current_user.id,
+        recipe_id=body.recipe_id,
+    )
+    db.add(grant)
+    db.commit()
+    db.refresh(grant)
+    return {"id": grant.id, "recipe_id": grant.recipe_id, "created_at": grant.created_at}
 
 
 @router.get("/{video_id}/editing/runs")

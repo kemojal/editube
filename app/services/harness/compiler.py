@@ -388,6 +388,17 @@ _COMPILERS = {
     "tracked_callout": compile_tracked_callout,
 }
 
+#: Historical compilers, by version. Every version a recipe has ever shipped
+#: keeps its callable registered here (the current one included), so a run
+#: that recorded `recipe_version=N` recompiles as exactly what it was. When
+#: changing a recipe's behaviour: copy the old function under its old number,
+#: bump `RECIPES[id]["version"]`, and point `_COMPILERS` at the new one.
+_COMPILER_VERSIONS: dict[str, dict[int, Any]] = {
+    "subject_behind_text": {1: compile_subject_behind_text},
+    "review_fix": {1: compile_review_fix},
+    "tracked_callout": {1: compile_tracked_callout},
+}
+
 
 def compile_recipe(
     recipe_id: str,
@@ -396,10 +407,35 @@ def compile_recipe(
     capability_snapshot: dict[str, Any],
     video_duration: float,
     draft: dict[str, Any] | None = None,
+    version: int | None = None,
 ) -> HarnessPlan:
-    compiler = _COMPILERS.get(recipe_id)
-    if compiler is None:
+    """Compile a recipe — by default at its current version.
+
+    `version` pins a historical compiler (plan Phase 4 exit criterion:
+    recipe versions reproduce historical runs). When a recipe's compiler
+    changes behaviour, the old callable stays registered in
+    `_COMPILER_VERSIONS` under its old number and the `RECIPES` entry's
+    `version` is bumped — so a run that recorded `recipe_version=1` can be
+    recompiled byte-for-byte long after v2 ships. An unpinned call always
+    gets the current version; a pinned call for a version that was never
+    registered (or has been retired) fails loudly instead of silently
+    compiling something the run never was.
+    """
+    if recipe_id not in _COMPILERS:
         raise CompileError("unknown_recipe", f"Unknown recipe {recipe_id!r}.")
+    current = int(RECIPES[recipe_id]["version"])
+    wanted = current if version is None else int(version)
+    compiler = (
+        _COMPILERS[recipe_id]
+        if wanted == current
+        else _COMPILER_VERSIONS.get(recipe_id, {}).get(wanted)
+    )
+    if compiler is None:
+        raise CompileError(
+            "version_unavailable",
+            f"Recipe {recipe_id!r} has no registered compiler for version {wanted} "
+            f"(current is {current}).",
+        )
     return compiler(
         params,
         capability_snapshot=capability_snapshot,

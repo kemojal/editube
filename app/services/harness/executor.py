@@ -273,6 +273,44 @@ def set_operation_enabled(
     return run
 
 
+#: Risks an automatic apply may carry (plan Phase 5): reversible only.
+#: Anything destructive always waits for a human, whatever was granted.
+AUTO_APPLY_RISKS = {"non_destructive", "reversible"}
+
+
+def try_auto_apply(db: Session, run: HarnessRun, grant: Any) -> tuple[HarnessRun, str | None]:
+    """Spend a one-shot grant and apply without the approve click.
+
+    Returns `(run, declined_reason)`. The grant is spent ONLY when the run
+    actually auto-applies -- a plan that turns out ineligible (needs input,
+    failed to compile, carries a destructive step) leaves the consent
+    unspent, because what the user consented to was a safe automatic apply
+    and that is not what compiled. Spend, mark and approve ride one commit,
+    so a replayed request finds the grant already spent.
+    """
+    if grant.spent_at is not None:
+        return run, "this consent was already used"
+    if (grant.recipe_id or "") != (run.recipe_id or ""):
+        return run, "the consent names a different recipe"
+    if run.state != "planned":
+        return run, f"the plan is {run.state}, not ready to apply"
+    try:
+        plan = HarnessPlan.model_validate(run.plan)
+    except Exception:
+        return run, "the stored plan could not be read"
+    for op in plan.operations:
+        if op.enabled and op.risk not in AUTO_APPLY_RISKS:
+            return run, f"step {op.id!r} is {op.risk}; that always needs a review"
+
+    grant.spent_at = _now()
+    grant.spent_run_id = run.id
+    run.auto_applied = True
+    db.commit()
+    approve_run(db, run, reviewed_checksum=run.plan_checksum)
+    request_apply(db, run, expected_revision=None)
+    return run, None
+
+
 def approve_run(db: Session, run: HarnessRun, *, reviewed_checksum: str) -> HarnessRun:
     if run.state != "planned":
         raise HarnessError("not_approvable", f"A {run.state} run cannot be approved.")
@@ -624,6 +662,17 @@ def execute_apply(db: Session, run_id: int) -> None:
         run.state = "ready"
         run.stage = "On the timeline"
     db.commit()
+
+    if run.auto_applied and run.state == "failed" and run.inverse_manifest:
+        # Nobody reviewed this apply, so a failed verification must not leave
+        # anything on the timeline (plan Phase 5: auto-apply is limited to
+        # verified operations). The inverse survives as the audit trail.
+        revert_run(db, run)
+        run.stage = "Auto-applied, but verification failed — taken back off automatically"
+        run.warnings = list(run.warnings or []) + [
+            "Verification failed after the automatic apply; the run was reverted automatically."
+        ]
+        db.commit()
 
 
 # -- revert / cancel / reconcile ----------------------------------------------
