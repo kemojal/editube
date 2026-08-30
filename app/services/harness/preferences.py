@@ -19,7 +19,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.db.models import HarnessRun, UserSettings
+from app.db.models import HarnessRecipeTemplate, HarnessRun, UserSettings
 
 #: Parameter keys a recipe may learn defaults for. Deliberately a whitelist
 #: of STYLE choices — never content (text, labels, ranges, boxes are about
@@ -165,6 +165,90 @@ def auto_apply_gate(db: Session, user_id: int | None, recipe_id: str | None) -> 
             f"{recipe_id} runs back off, so this one waits for your review"
         )
     return None
+
+
+class TemplateError(ValueError):
+    """A team template carried keys or values the whitelist refuses."""
+
+
+def team_defaults(db: Session, workspace_id: int | None, recipe_id: str) -> dict[str, Any]:
+    """The workspace's house-style defaults for one recipe, or {}."""
+    if not workspace_id:
+        return {}
+    row = (
+        db.query(HarnessRecipeTemplate)
+        .filter(
+            HarnessRecipeTemplate.workspace_id == workspace_id,
+            HarnessRecipeTemplate.recipe_id == recipe_id,
+        )
+        .first()
+    )
+    params = row.params if row and isinstance(row.params, dict) else {}
+    allowed = set(LEARNABLE_PARAMS.get(recipe_id, ()))
+    # Defensive re-filter on read: the whitelist may have narrowed since the
+    # template was written, and a stale key must not resurface.
+    return {key: value for key, value in params.items() if key in allowed}
+
+
+def set_team_template(
+    db: Session,
+    *,
+    workspace_id: int,
+    recipe_id: str,
+    params: dict[str, Any],
+    user_id: int | None,
+) -> HarnessRecipeTemplate | None:
+    """Upsert one workspace template; empty params delete it.
+
+    Validation mirrors the learner's own limits: whitelisted style keys only,
+    scalar values only. Content (text, ranges, boxes) can never become house
+    style -- it is about a video, not about how the team likes things done.
+    """
+    allowed = set(LEARNABLE_PARAMS.get(recipe_id, ()))
+    unknown = [key for key in params if key not in allowed]
+    if unknown:
+        raise TemplateError(
+            f"Not templatable for {recipe_id}: {', '.join(sorted(unknown))}. "
+            f"Allowed keys: {', '.join(sorted(allowed)) or '(none)'}."
+        )
+    for key, value in params.items():
+        if not isinstance(value, (str, int, float, bool)):
+            raise TemplateError(f"{key} must be a plain value, not {type(value).__name__}.")
+
+    row = (
+        db.query(HarnessRecipeTemplate)
+        .filter(
+            HarnessRecipeTemplate.workspace_id == workspace_id,
+            HarnessRecipeTemplate.recipe_id == recipe_id,
+        )
+        .first()
+    )
+    if not params:
+        if row is not None:
+            db.delete(row)
+            db.commit()
+        return None
+    if row is None:
+        row = HarnessRecipeTemplate(workspace_id=workspace_id, recipe_id=recipe_id)
+        db.add(row)
+    row.params = dict(params)
+    row.updated_by = user_id
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def list_team_templates(db: Session, workspace_id: int | None) -> dict[str, dict[str, Any]]:
+    if not workspace_id:
+        return {}
+    rows = (
+        db.query(HarnessRecipeTemplate)
+        .filter(HarnessRecipeTemplate.workspace_id == workspace_id)
+        .all()
+    )
+    return {
+        row.recipe_id: team_defaults(db, workspace_id, row.recipe_id) for row in rows
+    }
 
 
 def snapshot(db: Session, user_id: int) -> dict[str, Any]:

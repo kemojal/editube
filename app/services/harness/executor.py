@@ -191,21 +191,25 @@ def create_run(
         run.prompt_version = PROMPT_VERSION
         run.token_usage = planned.usage
 
-    # Learned defaults (plan Phase 5): fill ONLY whitelisted style keys the
-    # caller (or the planner) left unset, from the user's own kept runs.
-    # Explicit values always win, and the merged params land on the run row
+    # Style defaults, filled in precedence order (plan Phases 4/5): explicit
+    # params > the user's own learned defaults > the workspace's team
+    # template > the recipe's built-in defaults. Each layer fills ONLY what
+    # the layer above left unset, and the merged params land on the run row
     # so what compiled is what is shown.
-    if user_id is not None:
-        from app.services.harness import preferences
+    from app.services.harness import preferences
 
-        if preferences.learning_enabled(db, user_id):
-            learned = preferences.learned_defaults(db, user_id, recipe_id)
-            filled = {
-                key: value for key, value in learned.items() if key not in plan_params
-            }
-            if filled:
-                plan_params = {**plan_params, **filled}
-                run.params = plan_params
+    learned: dict[str, Any] = {}
+    if user_id is not None and preferences.learning_enabled(db, user_id):
+        learned = preferences.learned_defaults(db, user_id, recipe_id)
+    team = preferences.team_defaults(db, project.workspace_id, recipe_id)
+    filled = {
+        key: value
+        for key, value in {**team, **learned}.items()
+        if key not in plan_params
+    }
+    if filled:
+        plan_params = {**plan_params, **filled}
+        run.params = plan_params
 
     try:
         plan = compile_recipe(

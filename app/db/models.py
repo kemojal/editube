@@ -2888,6 +2888,31 @@ class HarnessAutoApplyGrant(Base):
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
 
 
+class HarnessRecipeTemplate(Base):
+    """A workspace's house-style defaults for one recipe (plan Phase 4/5).
+
+    Same whitelist as preference learning -- style keys only, never content.
+    Precedence at planning time: explicit params > the user's own learned
+    defaults > the team template > the recipe's built-in defaults, each
+    filling only what the layer above left unset.
+    """
+
+    __tablename__ = "editing_harness_recipe_templates"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "recipe_id", name="uq_harness_recipe_template"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(
+        Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    recipe_id = Column(String, nullable=False)
+    params = Column(JSONB, nullable=False, default=dict)
+    updated_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
 class UgcProduct(Base):
     """A product/app scraped from a URL, normalized for ad generation."""
 

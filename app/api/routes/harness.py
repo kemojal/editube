@@ -452,3 +452,60 @@ def reset_preferences(
 
     preferences.reset(db, current_user.id)
     return preferences.snapshot(db, current_user.id)
+
+
+# -- team recipe templates (workspace house style) ----------------------------
+
+
+class RecipeTemplateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    recipe_id: str = Field(min_length=1, max_length=64)
+    #: Whitelisted style keys only; an empty dict deletes the template.
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.get("/{video_id}/editing/recipe_templates")
+def list_recipe_templates(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """The workspace's house-style defaults, per recipe.
+
+    These fill parameter keys a run's creator left unset — under the user's
+    own learned defaults, over the recipe's built-ins.
+    """
+    from app.services.harness import preferences
+
+    _, project = _video_and_project(video_id, db, current_user, write=False)
+    return {"templates": preferences.list_team_templates(db, project.workspace_id)}
+
+
+@router.put("/{video_id}/editing/recipe_templates")
+def put_recipe_template(
+    video_id: int,
+    body: RecipeTemplateBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.harness import preferences
+
+    _, project = _video_and_project(video_id, db, current_user, write=True)
+    if body.recipe_id not in RECIPES:
+        raise HTTPException(status_code=404, detail=f"Unknown recipe {body.recipe_id!r}")
+    if not project.workspace_id:
+        raise HTTPException(
+            status_code=409, detail="This project has no workspace to hold a template."
+        )
+    try:
+        preferences.set_team_template(
+            db,
+            workspace_id=project.workspace_id,
+            recipe_id=body.recipe_id,
+            params=body.params,
+            user_id=current_user.id,
+        )
+    except preferences.TemplateError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"templates": preferences.list_team_templates(db, project.workspace_id)}
