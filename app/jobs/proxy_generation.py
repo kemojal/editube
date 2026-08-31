@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 import urllib.request
@@ -19,6 +20,15 @@ logger = logging.getLogger(__name__)
 
 _FFMPEG = os.getenv("FFMPEG_PATH", "ffmpeg").strip()
 _FFPROBE = os.getenv("FFPROBE_PATH", "ffprobe").strip()
+
+# Cloudflare R2's public r2.dev endpoint answers urllib's default
+# "Python-urllib/x.y" agent with 403, so every proxy built from object storage
+# failed on the download before ffmpeg ever ran. Any ordinary agent is served.
+_DOWNLOAD_USER_AGENT = os.getenv(
+    "PROXY_DOWNLOAD_USER_AGENT",
+    "Mozilla/5.0 (compatible; EditubeProxyBot/1.0)",
+).strip()
+_DOWNLOAD_TIMEOUT_SEC = int(os.getenv("PROXY_DOWNLOAD_TIMEOUT_SEC", "600") or "600")
 
 PROXY_PROFILES = {
     "540p_h264": {
@@ -48,14 +58,20 @@ PROXY_PROFILES = {
 def _download_to_temp(url: str, suffix: str = ".mp4") -> str:
     """Download a URL to a named temp file, return the path."""
     fd, path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
     try:
-        urllib.request.urlretrieve(url, path)
+        request = urllib.request.Request(
+            url, headers={"User-Agent": _DOWNLOAD_USER_AGENT}
+        )
+        with urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SEC) as response:
+            with open(path, "wb") as out:
+                shutil.copyfileobj(response, out)
     except Exception:
-        os.close(fd)
-        os.unlink(path)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
         raise
-    else:
-        os.close(fd)
     return path
 
 
