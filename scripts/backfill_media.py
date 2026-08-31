@@ -41,6 +41,17 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("backfill")
 
 
+# Imported stills live in the videos table too (imported as "Rough cut
+# asset"). They have no audio track to draw a waveform from and nothing to
+# transcode, so counting them as work left to do — or queueing a proxy
+# transcode of a PNG — is just noise.
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic", ".avif")
+
+
+def _is_image(file_path: str | None) -> bool:
+    return (file_path or "").split("?")[0].lower().endswith(_IMAGE_SUFFIXES)
+
+
 def _selected_video_ids(args: argparse.Namespace) -> list[int] | None:
     if args.video_ids:
         return [int(v) for v in args.video_ids.split(",") if v.strip()]
@@ -57,29 +68,61 @@ def _apply_scope(query, args: argparse.Namespace):
 
 
 def cmd_status(db: Session, args: argparse.Namespace) -> int:
-    total = _apply_scope(db.query(Video), args).count()
+    rows = _apply_scope(db.query(Video.id, Video.file_path), args).all()
+    media_ids = {vid for vid, path in rows if not _is_image(path)}
+    images = len(rows) - len(media_ids)
+    if not media_ids:
+        logger.info("No audio/video in scope (%d image asset(s)).", images)
+        return 0
+
     with_proxy = (
-        _apply_scope(
-            db.query(Video).join(VideoProxy, VideoProxy.video_id == Video.id), args
-        )
-        .filter(VideoProxy.status == "completed")
+        db.query(VideoProxy.video_id)
+        .filter(VideoProxy.video_id.in_(media_ids), VideoProxy.status == "completed")
         .distinct()
         .count()
     )
     with_peaks = (
-        _apply_scope(
-            db.query(Video).join(
-                VideoTranscription, VideoTranscription.video_id == Video.id
-            ),
-            args,
+        db.query(VideoTranscription.video_id)
+        .filter(
+            VideoTranscription.video_id.in_(media_ids),
+            VideoTranscription.audio_analysis.has_key("peaks"),  # noqa: W601
         )
-        .filter(VideoTranscription.audio_analysis.has_key("peaks"))  # noqa: W601
         .count()
     )
-    logger.info("videos:            %d", total)
+    total = len(media_ids)
+    logger.info("audio/video:       %d  (plus %d image asset(s), not applicable)", total, images)
     logger.info("with proxy:        %d  (missing %d)", with_proxy, total - with_proxy)
     logger.info("with peaks:        %d  (missing %d)", with_peaks, total - with_peaks)
     return 0
+
+
+def _describe_source_failure(exc: Exception, file_path: str | None) -> str:
+    """Say why a source could not be read, rather than echoing the ffmpeg call.
+
+    The two failures that actually occur are a YouTube stream URL that has
+    expired and a local path that no longer exists, and both are worth naming:
+    the first is fixable by refreshing the stream, the second never will be.
+    """
+    import subprocess
+
+    src = file_path or ""
+    if src.startswith("/") and not Path(src).exists():
+        return f"source file is gone ({src})"
+    if "googlevideo.com" in src:
+        return "YouTube stream URL has expired — refresh the stream, then re-run"
+    if isinstance(exc, subprocess.CalledProcessError):
+        from app.jobs.transcription import _ffmpeg_stderr_suggests_no_audio
+
+        stderr = exc.stderr or ""
+        # With -vn the output only fails to open when the demuxed input left
+        # nothing to write, i.e. the source carries no audio stream at all.
+        if _ffmpeg_stderr_suggests_no_audio(stderr) or "opening output" in stderr.lower():
+            return "no audio track — nothing to draw a waveform from"
+        lines = stderr.strip().splitlines()
+        return lines[-1][:160] if lines else "ffmpeg could not read the source"
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "ffmpeg timed out reading the source"
+    return str(exc)[:160]
 
 
 def cmd_peaks(db: Session, args: argparse.Namespace) -> int:
@@ -103,6 +146,10 @@ def cmd_peaks(db: Session, args: argparse.Namespace) -> int:
     if args.limit:
         query = query.limit(args.limit)
     targets = query.all()
+    images = sum(1 for _, _, path in targets if _is_image(path))
+    targets = [row for row in targets if not _is_image(row[2])]
+    if images:
+        logger.info("Ignoring %d image asset(s) — no audio to analyse.", images)
 
     if not targets:
         logger.info("Nothing to do — every selected video already has peaks.")
@@ -148,10 +195,12 @@ def cmd_peaks(db: Session, args: argparse.Namespace) -> int:
             done += 1
         except Exception as exc:  # noqa: BLE001 — one bad file must not stop the batch
             db.rollback()
-            logger.warning("  failed: %s", str(exc)[:200])
+            logger.warning("  skipped: %s", _describe_source_failure(exc, file_path))
             failed += 1
 
-    logger.info("peaks backfill complete: %d done, %d failed", done, failed)
+    logger.info("peaks backfill complete: %d done, %d skipped", done, failed)
+    if failed:
+        logger.info("Skipped sources are unreadable, not errors here — see the reasons above.")
     return 0
 
 
@@ -168,7 +217,7 @@ def cmd_proxies(db: Session, args: argparse.Namespace) -> int:
         .all()
     }
     query = _apply_scope(
-        db.query(Video.id, Video.name), args
+        db.query(Video.id, Video.name, Video.file_path), args
     ).filter(Video.file_path.isnot(None))
     if not args.force and have:
         query = query.filter(~Video.id.in_(have))
@@ -176,6 +225,10 @@ def cmd_proxies(db: Session, args: argparse.Namespace) -> int:
     if args.limit:
         query = query.limit(args.limit)
     targets = query.all()
+    images = sum(1 for _, _, path in targets if _is_image(path))
+    targets = [(vid, name) for vid, name, path in targets if not _is_image(path)]
+    if images:
+        logger.info("Ignoring %d image asset(s) — nothing to transcode.", images)
 
     if not targets:
         logger.info("Nothing to do — every selected video already has a proxy.")
