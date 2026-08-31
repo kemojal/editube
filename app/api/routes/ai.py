@@ -7,7 +7,7 @@ import uuid
 from copy import deepcopy
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -1817,11 +1817,25 @@ def generate_broll_image_endpoint(
 @router.get("/{video_id}/ai/results")
 def list_ai_results(
     video_id: int,
+    result_type: str | None = Query(
+        None,
+        description=(
+            "Comma-separated result types to return (e.g. 'chapters,captions'). "
+            "Omit for every type — note that includes rough_cut_draft, which is "
+            "the entire editor timeline."
+        ),
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     _check_video_access(video_id, db, current_user)
-    rows = db.query(AiResult).filter(AiResult.video_id == video_id).order_by(AiResult.created_at.desc()).all()
+    query = db.query(AiResult).filter(AiResult.video_id == video_id)
+    # Without a filter this returns every AI blob for the video — drafts, mask
+    # tracks, exports — and callers that want two fields pay for all of them.
+    wanted = [t.strip() for t in (result_type or "").split(",") if t.strip()]
+    if wanted:
+        query = query.filter(AiResult.result_type.in_(wanted))
+    rows = query.order_by(AiResult.created_at.desc()).all()
     return [
         {
             "video_id": r.video_id,

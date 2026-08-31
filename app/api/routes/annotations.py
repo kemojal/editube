@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.db.models import Annotation, Video, User
 from app.services.project_access import assert_write_project_content, can_access_project
 from app.db.database import get_db
@@ -114,6 +114,9 @@ def get_video_annotations(
 
     annotations = (
         db.query(Annotation)
+        # The serializer reads a.user for the author block, which was one
+        # SELECT per annotation on a route the player calls on every mount.
+        .options(joinedload(Annotation.user))
         .filter(Annotation.video_id == video_id)
         .order_by(Annotation.timecode.asc())
         .all()

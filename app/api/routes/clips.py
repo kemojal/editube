@@ -133,8 +133,15 @@ def _ensure_style(db: Session, clip: Clip) -> ClipStyle:
     return style
 
 
-def _serialize_clip(clip: Clip) -> dict:
-    return ClipOut.model_validate(clip).model_dump()
+def _serialize_clip(clip: Clip, *, include_history: bool = True) -> dict:
+    payload = ClipOut.model_validate(clip).model_dump()
+    if not include_history:
+        # Every edit_history entry embeds a full copy of the clip's transcript,
+        # cuts and highlights, and up to 40 are kept — so a list of well-edited
+        # clips carries ~40x its own transcript per row. Only the single-clip
+        # editor reads the history; the grid never does.
+        payload["edit_history"] = []
+    return payload
 
 
 def _clip_transcript_author(user: User) -> dict:
@@ -847,29 +854,42 @@ def create_clip(
 def list_clips(
     video_id: Optional[int] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
+    limit: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    q = (
-        db.query(Clip)
-        .options(joinedload(Clip.style))
-        .join(Video, Video.id == Clip.video_id)
-        .join(Project, Project.id == Video.project_id)
-    )
+    q = db.query(Clip).options(joinedload(Clip.style))
     if video_id is not None:
         _video_with_access(video_id, db, current_user)
         q = q.filter(Clip.video_id == video_id)
     if status_filter:
         q = q.filter(Clip.status == status_filter)
-    rows = q.order_by(Clip.created_at.desc()).all()
     if video_id is None:
-        rows = [
-            clip
-            for clip in rows
-            if clip.user_id == current_user.id
-            or can_access_project(db, current_user.id, clip.video.project)
-        ]
-    return [_serialize_clip(c) for c in rows]
+        # Access expressed in SQL rather than one project lookup per clip,
+        # the same shape list_repurpose_jobs already uses.
+        collaborating = select(ProjectCollaborator.project_id).where(
+            ProjectCollaborator.user_id == current_user.id
+        )
+        member_workspaces = select(WorkspaceMember.workspace_id).where(
+            WorkspaceMember.user_id == current_user.id,
+            WorkspaceMember.role != "client",
+        )
+        accessible_videos = (
+            select(Video.id)
+            .join(Project, Project.id == Video.project_id)
+            .where(
+                or_(
+                    Project.creator_id == current_user.id,
+                    Project.id.in_(collaborating),
+                    Project.workspace_id.in_(member_workspaces),
+                )
+            )
+        )
+        q = q.filter(
+            or_(Clip.user_id == current_user.id, Clip.video_id.in_(accessible_videos))
+        )
+    rows = q.order_by(Clip.created_at.desc()).limit(limit).all()
+    return [_serialize_clip(c, include_history=False) for c in rows]
 
 
 @router.get("/clips/{clip_id}", response_model=ClipOut)

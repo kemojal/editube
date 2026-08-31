@@ -511,7 +511,19 @@ def get_library_videos(
 @router.get("/{project_id}", response_model=ProjectResponse)
 def get_project(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     try:
-        db_project = db.query(Project).filter(Project.id == project_id).first()
+        db_project = (
+            db.query(Project)
+            # The list endpoint eager-loads these; the single-project path did
+            # not, so the response serializer lazy-loaded the creator and then
+            # one user per collaborator. Both the player and the clips route
+            # call this on mount.
+            .options(
+                joinedload(Project.creator),
+                selectinload(Project.collaborators).joinedload(ProjectCollaborator.user),
+            )
+            .filter(Project.id == project_id)
+            .first()
+        )
         if not db_project:
             raise HTTPException(status_code=404, detail="Project not found")
         if not can_access_project(db, current_user.id, db_project):
@@ -541,16 +553,17 @@ def _pipeline_status_for_video(db: Session, video: Video) -> dict:
         and prefs_row.result_data.get("enabled")
     )
 
-    draft_row = (
-        db.query(AiResult)
-        .filter(AiResult.video_id == video.id, AiResult.result_type == "rough_cut_draft")
-        .first()
-    )
-    ai_analysis = (
-        draft_row.result_data.get("aiAnalysis")
-        if draft_row and isinstance(draft_row.result_data, dict)
-        else None
-    )
+    # Pull the one string out in SQL. `result_data` on a rough_cut_draft is the
+    # entire editor timeline, and loading it whole to read a timestamp made
+    # this the most expensive part of an endpoint the studio shell polls every
+    # four seconds.
+    analyzed_at_raw = db.execute(
+        select(AiResult.result_data["aiAnalysis"]["analyzedAt"].astext).where(
+            AiResult.video_id == video.id,
+            AiResult.result_type == "rough_cut_draft",
+        )
+    ).scalar()
+    ai_analysis = {"analyzedAt": analyzed_at_raw} if analyzed_at_raw else None
     # Only the server-side auto-edit hook (`run_post_transcription_auto_edit`)
     # stamps `analyzedAt: "transcription:<id>"` on aiAnalysis; a client-format
     # draft save (rough-cut-draft-state.ts's `aiAnalysis: {showFillers,
