@@ -1,5 +1,6 @@
 import hashlib
 import os
+import time
 
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
@@ -99,7 +100,21 @@ def _session_timeout_minutes_for_user(db: Session, user_id: int) -> int:
         return 30
 
 
+# In-process cache of recently validated sessions. A hit skips the session +
+# settings round trips entirely — against a remote Postgres those two queries
+# cost ~500ms on every request. Revocation and inactivity are enforced with at
+# most TTL seconds of delay, negligible against minutes-scale session
+# timeouts; explicit revocation clears its entry immediately (this process).
+_SESSION_CACHE: dict[tuple[int, str], float] = {}
+_SESSION_CACHE_TTL_SECONDS = 60.0
+_SESSION_CACHE_MAX = 5000
+
+
 def _validate_and_touch_session(db: Session, user_id: int, session_id: str) -> None:
+    cache_key = (user_id, session_id)
+    cached_at = _SESSION_CACHE.get(cache_key)
+    if cached_at is not None and time.monotonic() - cached_at < _SESSION_CACHE_TTL_SECONDS:
+        return
     session = (
         db.query(UserSession)
         .filter(UserSession.user_id == user_id, UserSession.session_id == session_id)
@@ -125,8 +140,16 @@ def _validate_and_touch_session(db: Session, user_id: int, session_id: str) -> N
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    session.last_activity_at = now
-    db.commit()
+    # The timestamp only feeds a minutes-scale inactivity deadline, so a value
+    # up to 60s stale is indistinguishable — and skipping the write keeps
+    # frequent polling GETs from each paying a commit before their handler runs.
+    if (now - session.last_activity_at) >= timedelta(seconds=60):
+        session.last_activity_at = now
+        db.commit()
+
+    if len(_SESSION_CACHE) > _SESSION_CACHE_MAX:
+        _SESSION_CACHE.clear()
+    _SESSION_CACHE[cache_key] = time.monotonic()
 
 def authenticate_api_token(db: Session, token: str) -> User:
     """Resolve a personal access token (``edt_…``) to its owning user."""
@@ -271,6 +294,7 @@ def validate_refresh_session(db: Session, payload: dict) -> int:
 
 
 def revoke_user_session(db: Session, user_id: int, session_id: str) -> None:
+    _SESSION_CACHE.pop((user_id, session_id), None)
     session = (
         db.query(UserSession)
         .filter(UserSession.user_id == user_id, UserSession.session_id == session_id)

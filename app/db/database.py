@@ -50,8 +50,15 @@ def connect_args_for(url: str) -> dict:
 
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
-    pool_pre_ping=True,
-    pool_recycle=300,
+    # No pre_ping: against a remote Postgres the ping is a full network round
+    # trip paid on EVERY checkout (~250ms/request to Neon). Staleness is
+    # covered instead by recycling connections before Neon's ~5min idle
+    # cutoff and by the TCP keepalives in connect_args.
+    pool_pre_ping=False,
+    pool_recycle=240,
+    pool_size=10,
+    max_overflow=20,
+    pool_timeout=10,
     connect_args=connect_args_for(SQLALCHEMY_DATABASE_URL),
 )
 

@@ -33,6 +33,7 @@ from app.db.models import (
     User,
     Video,
     VideoApproval,
+    VideoProxy,
     VideoTranscription,
 )
 from app.utils.language import normalize_language
@@ -87,6 +88,9 @@ class _SqliteDbTestCase(unittest.TestCase):
         # Upload completion analytics is committed transactionally with the
         # video/transcription state, so this focused fixture needs the outbox.
         AnalyticsOutbox.__table__,
+        # video_detail_dict reports the editing-proxy rendition, so the
+        # payload reads this table too.
+        VideoProxy.__table__,
     ]
 
     def setUp(self) -> None:

@@ -578,6 +578,14 @@ def transcribe_video(video_id: int, language: str | None = None) -> None:
             db.commit()
             logger.info("Transcription completed for video %s (%s segments)", video_id, len(nonempty))
 
+            # Realtime hint so open editors refresh immediately instead of
+            # waiting out a poll interval. Best-effort by design.
+            from app.services.realtime import publish_video_update
+
+            publish_video_update(
+                uploader_id, video_id, kind="transcription", status="completed"
+            )
+
             # Server-side auto-edit: if the video has enabled auto-edit prefs,
             # analyze the transcript and seed/merge keepRanges + aiAnalysis into
             # the rough_cut_draft *before* the repurpose (clips) chain below, so
@@ -692,6 +700,16 @@ def _fail(db: Session, video_id: int, message: str) -> None:
             from app.services.repurpose_pipeline import mark_repurpose_jobs_failed
 
             mark_repurpose_jobs_failed(db, video_id, message)
+
+            from app.db.models import Video as _Video
+            from app.services.realtime import publish_video_update
+
+            uploader_id = (
+                db.query(_Video.uploader_id).filter(_Video.id == video_id).scalar()
+            )
+            publish_video_update(
+                uploader_id, video_id, kind="transcription", status="failed"
+            )
     except Exception:
         db.rollback()
         logger.exception("Could not persist transcription failure for video %s", video_id)

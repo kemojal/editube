@@ -138,6 +138,12 @@ class VideoDetailResponse(BaseModel):
     transcription: Optional[VideoTranscriptionNested] = None
     # True when the viewer may moderate others' comments (workflow status, assignee, etc.).
     can_moderate: bool = False
+    # Editing-proxy rendition (default profile). `proxy_url` is set only when
+    # generation completed; `proxy_status` is pending|processing|completed|
+    # failed, or null when no proxy row exists. Playback should prefer the
+    # proxy and fall back to `file_path`; export always uses `file_path`.
+    proxy_url: str | None = None
+    proxy_status: str | None = None
 
     model_config = {"from_attributes": True}
 

@@ -98,6 +98,13 @@ async def _app_lifespan(app: FastAPI):
     )
     tasks: list[asyncio.Task] = []
 
+    # Worker → WebSocket bridge: forwards job-status events published by RQ
+    # workers over Redis to live per-user notification sockets, so clients
+    # can react instead of polling. No-ops when REDIS_URL is unset.
+    from app.services.realtime import run_subscriber as _run_realtime_subscriber
+
+    tasks.append(asyncio.create_task(_run_realtime_subscriber()))
+
     from app.request_logging.config import RequestLogSettings
     from app.request_logging.writer import start_global_writer, stop_global_writer
 
@@ -422,6 +429,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["X-Request-ID"],
+    # Cache preflights (Chrome caps at 2h). Without this every authed GET
+    # pays an OPTIONS round trip, doubling request count on editor open.
+    max_age=7200,
 )
 
 
@@ -516,6 +526,33 @@ async def uploads_media_cors_fallback(request: Request, call_next):
 from app.request_logging.middleware import RequestLoggingMiddleware  # noqa: E402
 
 app.add_middleware(RequestLoggingMiddleware)
+
+
+from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
+
+
+class SelectiveGZipMiddleware(GZipMiddleware):
+    """GZip everything except media byte streams.
+
+    Compressing video/audio wastes CPU, and Content-Encoding on Range
+    responses (/uploads static files, the guest review media proxy) confuses
+    browser seek behavior because the range then addresses encoded bytes.
+    """
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if path.startswith("/uploads") or (
+                path.startswith("/review/") and path.endswith("/media")
+            ):
+                await self.app(scope, receive, send)
+                return
+        await super().__call__(scope, receive, send)
+
+
+# Registered after RequestLoggingMiddleware so compression is outermost:
+# the logging middleware still sees plaintext JSON bodies.
+app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
 
 
 # Include the WebSocket app

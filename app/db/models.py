@@ -673,7 +673,7 @@ class Project(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String)
     description = Column(Text)
-    creator_id = Column(Integer, ForeignKey("users.id"))
+    creator_id = Column(Integer, ForeignKey("users.id"), index=True)
     workspace_id = Column(
         Integer,
         ForeignKey("workspaces.id", ondelete="RESTRICT"),
@@ -722,8 +722,8 @@ class Project(Base):
 class ProjectCollaborator(Base):
     __tablename__ = "project_collaborators"
     id = Column(Integer, primary_key=True, index=True)
-    project_id = Column(Integer, ForeignKey("projects.id"))
-    user_id = Column(Integer, ForeignKey("users.id"))
+    project_id = Column(Integer, ForeignKey("projects.id"), index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
     role = Column(String)
     project = relationship("Project", back_populates="collaborators")
     user = relationship("User")
@@ -732,8 +732,8 @@ class ProjectCollaborator(Base):
 class Folder(Base):
     __tablename__ = "folders"
     id = Column(Integer, primary_key=True, index=True)
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
-    parent_id = Column(Integer, ForeignKey("folders.id"), nullable=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    parent_id = Column(Integer, ForeignKey("folders.id"), nullable=True, index=True)
     name = Column(String, nullable=False)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now())
@@ -751,9 +751,14 @@ class Folder(Base):
 
 class Video(Base):
     __tablename__ = "videos"
+    __table_args__ = (
+        # Prefix serves plain project_id filters; the full key serves the
+        # latest-source-video ranking (ORDER BY updated_at DESC, id DESC).
+        Index("ix_videos_project_updated", "project_id", "updated_at", "id"),
+    )
     id = Column(Integer, primary_key=True, index=True)
     project_id = Column(Integer, ForeignKey("projects.id"))
-    folder_id = Column(Integer, ForeignKey("folders.id"), nullable=True)
+    folder_id = Column(Integer, ForeignKey("folders.id"), nullable=True, index=True)
     name = Column(String)
     description = Column(Text)
     version = Column(Integer)
@@ -892,6 +897,9 @@ class VideoTranscription(Base):
 
 class AiResult(Base):
     __tablename__ = "ai_results"
+    __table_args__ = (
+        Index("ix_ai_results_video_type", "video_id", "result_type"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     video_id = Column(
@@ -916,10 +924,13 @@ class AiResult(Base):
 
 class Comment(Base):
     __tablename__ = "comments"
+    __table_args__ = (
+        Index("ix_comments_video_created", "video_id", "created_at"),
+    )
     id = Column(Integer, primary_key=True, index=True)
     video_id = Column(Integer, ForeignKey("videos.id"))
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    parent_id = Column(Integer, ForeignKey("comments.id"), nullable=True)
+    parent_id = Column(Integer, ForeignKey("comments.id"), nullable=True, index=True)
     text = Column(Text)
     timecode = Column(Integer)
     end_timecode = Column(Integer, nullable=True)  # null means point comment, set means range comment
@@ -1338,8 +1349,8 @@ class ReviewCommentDraft(Base):
 class Annotation(Base):
     __tablename__ = "annotations"
     id = Column(Integer, primary_key=True, index=True)
-    video_id = Column(Integer, ForeignKey("videos.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    video_id = Column(Integer, ForeignKey("videos.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     annotation_type = Column(String(50), nullable=False)
     annotation_data = Column(JSONB, nullable=False)
     timecode = Column(Float, nullable=False)
@@ -1415,6 +1426,9 @@ class SuggestionVote(Base):
 
 class Notification(Base):
     __tablename__ = "notifications"
+    __table_args__ = (
+        Index("ix_notifications_user_created", "user_id", "created_at"),
+    )
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     type = Column(String)
@@ -2408,7 +2422,7 @@ class RepurposeJob(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
     video_id = Column(Integer, ForeignKey("videos.id", ondelete="SET NULL"), nullable=True)
     source_mode = Column(String, nullable=False)  # youtube_url | upload | project_video
     source_url = Column(Text, nullable=True)

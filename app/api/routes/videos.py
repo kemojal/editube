@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, Query
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
 import logging
 
@@ -397,8 +397,6 @@ def upload_video(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == db_video.id)
         .first()
@@ -484,8 +482,6 @@ def create_video_from_youtube(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == db_video.id)
         .first()
@@ -608,8 +604,6 @@ def register_uploaded_video(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == db_video.id)
         .first()
@@ -631,8 +625,6 @@ def get_video(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == video_id, Video.project_id == project_id)
         .first()
@@ -679,8 +671,6 @@ def start_project_video_transcription(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == video_id, Video.project_id == project_id)
         .first()
@@ -699,8 +689,6 @@ def start_project_video_transcription(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == video_id, Video.project_id == project_id)
         .first()
@@ -758,8 +746,6 @@ def update_video_status(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == video_id, Video.project_id == project_id)
         .first()
@@ -795,8 +781,6 @@ def update_video_status(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == video_id, Video.project_id == project_id)
         .first()
@@ -825,8 +809,6 @@ async def send_video_for_review(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == video_id, Video.project_id == project_id)
         .first()

@@ -92,9 +92,10 @@ def delete_proxy(db: Session, video_id: int, profile: str) -> bool:
 def auto_proxy_on_upload(db: Session, video_id: int) -> Optional[VideoProxy]:
     """Called after a new video upload to auto-generate the default proxy.
 
-    Respects the PROXY_AUTO_GENERATE env var (default: off).
+    On by default so the editor gets a scrub-friendly rendition instead of
+    playing the full-resolution master; set PROXY_AUTO_GENERATE=0 to disable.
     """
-    if os.getenv("PROXY_AUTO_GENERATE", "0").strip() not in ("1", "true", "True"):
+    if os.getenv("PROXY_AUTO_GENERATE", "1").strip() in ("0", "false", "False"):
         logger.debug("Auto-proxy disabled; skipping for video %s", video_id)
         return None
 

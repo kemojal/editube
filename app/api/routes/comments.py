@@ -8,7 +8,7 @@ import json
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 from typing import List, Optional
 
 from app.db.database import get_db
@@ -170,13 +170,20 @@ def _comment_user_payload(comment: Comment) -> dict | None:
     ).model_dump()
 
 
-def _comment_response(comment: Comment, current_user_id: int, db: Session) -> dict:
+def _comment_response(
+    comment: Comment,
+    current_user_id: int,
+    db: Session,
+    segments_by_video: dict[int, list] | None = None,
+) -> dict:
     likes_count = len(comment.likes) if comment.likes else 0
     liked_by_me = any(like.user_id == current_user_id for like in (comment.likes or []))
     replies_count = len(comment.replies) if comment.replies else 0
     kind = getattr(comment, "kind", None) or COMMENT_KIND_COMMENT
     status = getattr(comment, "status", None) or "open"
-    anchor_ok, anchor_reason, anchor_remap_timecode = _anchor_state(db, comment)
+    anchor_ok, anchor_reason, anchor_remap_timecode = _anchor_state(
+        db, comment, segments_by_video
+    )
     return {
         "id": comment.id,
         "video_id": comment.video_id,
@@ -231,13 +238,23 @@ def _comment_response(comment: Comment, current_user_id: int, db: Session) -> di
     }
 
 
-def _anchor_state(db: Session, comment: Comment) -> tuple[bool, str | None, int | None]:
+def _anchor_state(
+    db: Session,
+    comment: Comment,
+    segments_by_video: dict[int, list] | None = None,
+) -> tuple[bool, str | None, int | None]:
     seg_idx = getattr(comment, "transcript_segment_index", None)
     anchor_text = (getattr(comment, "anchor_text", None) or "").strip().lower()
     if seg_idx is None:
         return True, None, None
-    tr = db.query(VideoTranscription).filter(VideoTranscription.video_id == comment.video_id).first()
-    segments = (tr.segments if tr and isinstance(tr.segments, list) else []) if tr else []
+    if segments_by_video is not None:
+        # Preloaded by the list endpoint: the transcript is the largest row in
+        # the schema, and fetching it once per comment turned a 100-comment
+        # thread into 100 full-transcript transfers.
+        segments = segments_by_video.get(comment.video_id) or []
+    else:
+        tr = db.query(VideoTranscription).filter(VideoTranscription.video_id == comment.video_id).first()
+        segments = (tr.segments if tr and isinstance(tr.segments, list) else []) if tr else []
     if seg_idx < 0 or seg_idx >= len(segments):
         if anchor_text:
             for seg in segments:
@@ -270,13 +287,25 @@ def _build_comment_tree(
     for c in rows:
         by_parent[c.parent_id].append(c)
 
+    # One transcript fetch per distinct video (segments only), one team-member
+    # check — both used to run per comment / per tree level.
+    comment_video_ids = {c.video_id for c in rows if c.video_id is not None}
+    segments_by_video: dict[int, list] = {}
+    if comment_video_ids:
+        for tr_video_id, tr_segments in db.query(
+            VideoTranscription.video_id, VideoTranscription.segments
+        ).filter(VideoTranscription.video_id.in_(comment_video_ids)):
+            segments_by_video[tr_video_id] = (
+                tr_segments if isinstance(tr_segments, list) else []
+            )
+    is_team = _is_team_member(db, db_project, current_user.id)
+
     def build(parent_id: int | None, parent_comment: Comment | None) -> List[dict]:
         children = sorted(
             by_parent.get(parent_id, []),
             key=lambda x: (x.timecode or 0, x.created_at),
         )
         out: List[dict] = []
-        is_team = _is_team_member(db, db_project, current_user.id)
         for c in children:
             if parent_id is None:
                 ok = _comment_visible_to_viewer(c, current_user.id, is_team)
@@ -285,7 +314,7 @@ def _build_comment_tree(
                 ok = _reply_visible_to_viewer(c, parent_comment, current_user.id, is_team)
             if not ok:
                 continue
-            item = _comment_response(c, current_user.id, db)
+            item = _comment_response(c, current_user.id, db, segments_by_video)
             # Comments from an earlier version in the chain are read-only history.
             if current_video_id is not None and c.video_id != current_video_id:
                 item["read_only"] = True
@@ -598,6 +627,9 @@ def get_comments(
             joinedload(Comment.likes),
             joinedload(Comment.user),
             joinedload(Comment.assignee),
+            # Batched instead of one lazy SELECT per comment while serializing.
+            selectinload(Comment.attachments),
+            selectinload(Comment.replies),
         )
         .order_by(Comment.created_at.asc())
         .all()

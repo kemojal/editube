@@ -18,6 +18,7 @@ from urllib.request import urlopen
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.database import get_db
@@ -28,9 +29,11 @@ from app.db.models import (
     RepurposeJob,
     RepurposeUserDefaults,
     Project,
+    ProjectCollaborator,
     User,
     Video,
     VideoTranscription,
+    WorkspaceMember,
 )
 from app.api.models.clips import (
     ClipCreate,
@@ -754,22 +757,35 @@ def list_repurpose_jobs(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Same visibility rule as can_access_project, expressed in SQL so this
+    # 4s-polled endpoint stays one query instead of scanning every user's jobs.
+    collaborating = select(ProjectCollaborator.project_id).where(
+        ProjectCollaborator.user_id == current_user.id
+    )
+    member_workspaces = select(WorkspaceMember.workspace_id).where(
+        WorkspaceMember.user_id == current_user.id,
+        WorkspaceMember.role != "client",
+    )
+    accessible_projects = select(Project.id).where(
+        or_(
+            Project.creator_id == current_user.id,
+            Project.id.in_(collaborating),
+            Project.workspace_id.in_(member_workspaces),
+        )
+    )
     rows = (
         db.query(RepurposeJob)
+        .filter(
+            or_(
+                RepurposeJob.user_id == current_user.id,
+                RepurposeJob.project_id.in_(accessible_projects),
+            )
+        )
         .order_by(RepurposeJob.created_at.desc())
+        .limit(200)
         .all()
     )
-    visible_rows: list[RepurposeJob] = []
-    for row in rows:
-        if row.user_id == current_user.id:
-            visible_rows.append(row)
-            continue
-        if row.project_id is None:
-            continue
-        project = db.query(Project).filter(Project.id == row.project_id).first()
-        if project and can_access_project(db, current_user.id, project):
-            visible_rows.append(row)
-    return [_serialize_job(r) for r in visible_rows]
+    return [_serialize_job(r) for r in rows]
 
 
 # --- Clip CRUD -----------------------------------------------------------

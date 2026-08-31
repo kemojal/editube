@@ -4,12 +4,54 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session, aliased, joinedload
 
 from app.db.models import Annotation, Comment, Project, Video, VideoTranscription
 from app.services.project_access import can_moderate_video_comments
 from app.services.video_status import decision_summary, normalize_status
+
+
+def _visible_counts_sql(
+    db: Session, video_id: int, viewer_user_id: int | None
+) -> tuple[int, int]:
+    """Comment/annotation counts for the detail payload, in one round trip.
+
+    Mirrors _comment_row_visible_to_viewer / _annotation_visible_to_viewer:
+    private top-level = author only; private reply = author or parent author;
+    private annotation = author only. Replaces loading every comment and
+    annotation row (FabricJS/JSONB blobs included) just to count them.
+    """
+    parent = aliased(Comment)
+    comments_q = (
+        select(func.count(Comment.id))
+        .outerjoin(parent, Comment.parent_id == parent.id)
+        .where(Comment.video_id == video_id)
+    )
+    annotations_q = select(func.count(Annotation.id)).where(
+        Annotation.video_id == video_id
+    )
+    if viewer_user_id is not None:
+        comments_q = comments_q.where(
+            or_(
+                Comment.is_private.is_(False),
+                Comment.user_id == viewer_user_id,
+                parent.user_id == viewer_user_id,
+            )
+        )
+        annotations_q = annotations_q.where(
+            or_(
+                Annotation.is_private.is_(False),
+                Annotation.user_id == viewer_user_id,
+            )
+        )
+    row = db.execute(
+        select(
+            comments_q.scalar_subquery().label("comments"),
+            annotations_q.scalar_subquery().label("annotations"),
+        )
+    ).one()
+    return int(row.comments or 0), int(row.annotations or 0)
 
 
 def _comment_row_visible_to_viewer(
@@ -126,19 +168,25 @@ def video_detail_dict(
     db: Session | None = None,
     db_project: Project | None = None,
 ) -> dict[str, Any]:
-    comments = video.comments or []
-    annotations = video.annotations or []
-    if viewer_user_id is not None:
-        by_id = {c.id: c for c in comments}
-        comments_count = sum(
-            1 for c in comments if _comment_row_visible_to_viewer(c, viewer_user_id, by_id)
-        )
-        annotations_count = sum(
-            1 for a in annotations if _annotation_visible_to_viewer(a, viewer_user_id)
+    if db is not None:
+        comments_count, annotations_count = _visible_counts_sql(
+            db, video.id, viewer_user_id
         )
     else:
-        comments_count = len(comments)
-        annotations_count = len(annotations)
+        # No session: fall back to counting whatever the caller loaded.
+        comments = video.comments or []
+        annotations = video.annotations or []
+        if viewer_user_id is not None:
+            by_id = {c.id: c for c in comments}
+            comments_count = sum(
+                1 for c in comments if _comment_row_visible_to_viewer(c, viewer_user_id, by_id)
+            )
+            annotations_count = sum(
+                1 for a in annotations if _annotation_visible_to_viewer(a, viewer_user_id)
+            )
+        else:
+            comments_count = len(comments)
+            annotations_count = len(annotations)
     can_moderate = False
     if (
         viewer_user_id is not None
@@ -146,6 +194,21 @@ def video_detail_dict(
         and db_project is not None
     ):
         can_moderate = can_moderate_video_comments(db, db_project, viewer_user_id)
+
+    # Editing-proxy rendition, so the editor can play a scrub-friendly file
+    # instead of the full-resolution master. Status lets the client keep
+    # polling/hot-swap once generation completes.
+    proxy_url = None
+    proxy_status = None
+    if db is not None:
+        from app.services.proxy_service import DEFAULT_PROFILE, get_proxy
+
+        proxy = get_proxy(db, video.id, DEFAULT_PROFILE)
+        if proxy is not None:
+            proxy_status = proxy.status
+            if proxy.status == "completed":
+                proxy_url = proxy.file_url
+
     return {
         "id": video.id,
         "project_id": video.project_id,
@@ -170,4 +233,6 @@ def video_detail_dict(
         "annotations_count": annotations_count,
         "transcription": transcription_to_dict(video.transcription),
         "can_moderate": can_moderate,
+        "proxy_url": proxy_url,
+        "proxy_status": proxy_status,
     }

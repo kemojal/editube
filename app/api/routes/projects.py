@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import List, NamedTuple
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.api.models.projects import (
     CollaboratorEmailList,
+    LibraryVideoResponse,
     ProjectCollaboratorUpdate,
     ProjectCreate,
     ProjectResponse,
@@ -46,7 +47,10 @@ from app.services.project_access import (
     get_workspace_member,
     list_users_for_mentions,
 )
-from app.services.rough_cut_workspace import latest_project_source_video
+from app.services.rough_cut_workspace import (
+    ROUGH_CUT_ASSET_DESCRIPTION,
+    latest_project_source_video,
+)
 from app.services.mentions import user_mention_handles
 from app.services.project_template_apply import apply_project_template
 from app.services.workspace_bootstrap import ensure_personal_workspace
@@ -69,59 +73,178 @@ def _latest_project_source_video(db: Session, project_id: int) -> Video | None:
     return latest_project_source_video(db, project_id)
 
 
-def convert_project_to_response(db_project: Project, db: Session | None = None) -> ProjectResponse:
-    def _user_resp(u: User) -> UserResponse:
-        return UserResponse(
-            id=u.id,
-            name=u.full_name or u.name or u.email,
-            email=u.email,
-            avatar_url=getattr(u, "avatar_url", None),
-            created_at=u.created_at.isoformat(),
-            updated_at=u.updated_at.isoformat(),
-        )
-
-    # Start with project-level collaborators
-    seen: set[int] = {db_project.creator.id}
-    members: list[UserResponse] = []
-    for pc in db_project.collaborators:
-        if pc.user.id not in seen:
-            seen.add(pc.user.id)
-            members.append(_user_resp(pc.user))
-
-    # Also include workspace members so the avatar stack shows everyone
-    if db and db_project.workspace_id:
-        ws_members = (
-            db.query(WorkspaceMember, User)
-            .join(User, User.id == WorkspaceMember.user_id)
-            .filter(WorkspaceMember.workspace_id == db_project.workspace_id)
-            .all()
-        )
-        for _, u in ws_members:
-            if u.id not in seen:
-                seen.add(u.id)
-                members.append(_user_resp(u))
-
-    thumbnail_url = None
-    latest_video_id = None
-    if db:
-        latest_video = _latest_project_source_video(db, db_project.id)
-        if latest_video:
-            thumbnail_url = latest_video.thumbnail_url
-            latest_video_id = latest_video.id
-
-    return ProjectResponse(
-        id=db_project.id,
-        name=db_project.name,
-        description=db_project.description,
-        workspace_id=db_project.workspace_id,
-        project_type=db_project.project_type,
-        created_at=db_project.created_at.isoformat(),
-        updated_at=db_project.updated_at.isoformat(),
-        creator=_user_resp(db_project.creator),
-        collaborators=members,
-        thumbnail_url=thumbnail_url,
-        latest_video_id=latest_video_id,
+def _user_resp(u: User) -> UserResponse:
+    return UserResponse(
+        id=u.id,
+        name=u.full_name or u.name or u.email,
+        email=u.email,
+        avatar_url=getattr(u, "avatar_url", None),
+        created_at=u.created_at.isoformat(),
+        updated_at=u.updated_at.isoformat(),
     )
+
+
+def _workspace_members_by_workspace(
+    db: Session, workspace_ids: list[int]
+) -> dict[int, list[User]]:
+    if not workspace_ids:
+        return {}
+    rows = (
+        db.query(WorkspaceMember.workspace_id, User)
+        .join(User, User.id == WorkspaceMember.user_id)
+        .filter(WorkspaceMember.workspace_id.in_(workspace_ids))
+        .all()
+    )
+    members: dict[int, list[User]] = {}
+    for workspace_id, user in rows:
+        members.setdefault(workspace_id, []).append(user)
+    return members
+
+
+class _ProjectRollup(NamedTuple):
+    thumbnail_url: str | None
+    latest_video_id: int
+    latest_version: int | None
+    latest_version_count: int
+    video_count: int
+
+
+def _video_rollups_by_project(
+    db: Session, project_ids: list[int]
+) -> dict[int, _ProjectRollup]:
+    """Batched latest_project_source_video plus per-project content counts.
+
+    One window query over non-asset videos yields, per project: the latest
+    source video (same ordering as latest_project_source_video), its version,
+    the size of its version chain, and the total video count.
+    """
+    if not project_ids:
+        return {}
+    normalized_description = func.lower(func.trim(func.coalesce(Video.description, "")))
+    # Ungrouped videos are each their own version chain.
+    chain_key = func.coalesce(
+        Video.version_group_id, func.concat("video-", cast(Video.id, String))
+    )
+    row_number = (
+        func.row_number()
+        .over(
+            partition_by=Video.project_id,
+            order_by=(Video.updated_at.desc(), Video.id.desc()),
+        )
+        .label("row_number")
+    )
+    chain_size = (
+        func.count()
+        .over(partition_by=(Video.project_id, chain_key))
+        .label("chain_size")
+    )
+    video_count = (
+        func.count().over(partition_by=Video.project_id).label("video_count")
+    )
+    ranked = (
+        select(
+            Video.id,
+            Video.project_id,
+            Video.thumbnail_url,
+            Video.version,
+            row_number,
+            chain_size,
+            video_count,
+        )
+        .where(Video.project_id.in_(project_ids))
+        .where(normalized_description != ROUGH_CUT_ASSET_DESCRIPTION)
+        .subquery()
+    )
+    rows = db.execute(
+        select(
+            ranked.c.id,
+            ranked.c.project_id,
+            ranked.c.thumbnail_url,
+            ranked.c.version,
+            ranked.c.chain_size,
+            ranked.c.video_count,
+        ).where(ranked.c.row_number == 1)
+    ).all()
+    return {
+        row.project_id: _ProjectRollup(
+            thumbnail_url=row.thumbnail_url,
+            latest_video_id=row.id,
+            latest_version=row.version,
+            latest_version_count=row.chain_size,
+            video_count=row.video_count,
+        )
+        for row in rows
+    }
+
+
+def _folder_counts_by_project(db: Session, project_ids: list[int]) -> dict[int, int]:
+    if not project_ids:
+        return {}
+    rows = (
+        db.query(Folder.project_id, func.count(Folder.id))
+        .filter(Folder.project_id.in_(project_ids))
+        .group_by(Folder.project_id)
+        .all()
+    )
+    return dict(rows)
+
+
+def convert_projects_to_responses(
+    db: Session | None, projects: list[Project]
+) -> list[ProjectResponse]:
+    ws_members_by_id: dict[int, list[User]] = {}
+    rollups_by_project: dict[int, _ProjectRollup] = {}
+    folder_counts: dict[int, int] = {}
+    if db and projects:
+        workspace_ids = sorted({p.workspace_id for p in projects if p.workspace_id})
+        project_ids = [p.id for p in projects]
+        ws_members_by_id = _workspace_members_by_workspace(db, workspace_ids)
+        rollups_by_project = _video_rollups_by_project(db, project_ids)
+        folder_counts = _folder_counts_by_project(db, project_ids)
+
+    responses: list[ProjectResponse] = []
+    for db_project in projects:
+        # Start with project-level collaborators
+        seen: set[int] = {db_project.creator.id}
+        members: list[UserResponse] = []
+        for pc in db_project.collaborators:
+            if pc.user.id not in seen:
+                seen.add(pc.user.id)
+                members.append(_user_resp(pc.user))
+
+        # Also include workspace members so the avatar stack shows everyone
+        if db and db_project.workspace_id:
+            for u in ws_members_by_id.get(db_project.workspace_id, []):
+                if u.id not in seen:
+                    seen.add(u.id)
+                    members.append(_user_resp(u))
+
+        rollup = rollups_by_project.get(db_project.id)
+
+        responses.append(
+            ProjectResponse(
+                id=db_project.id,
+                name=db_project.name,
+                description=db_project.description,
+                workspace_id=db_project.workspace_id,
+                project_type=db_project.project_type,
+                created_at=db_project.created_at.isoformat(),
+                updated_at=db_project.updated_at.isoformat(),
+                creator=_user_resp(db_project.creator),
+                collaborators=members,
+                thumbnail_url=rollup.thumbnail_url if rollup else None,
+                latest_video_id=rollup.latest_video_id if rollup else None,
+                video_count=(rollup.video_count if rollup else 0) if db else None,
+                folder_count=folder_counts.get(db_project.id, 0) if db else None,
+                latest_version=rollup.latest_version if rollup else None,
+                latest_version_count=rollup.latest_version_count if rollup else None,
+            )
+        )
+    return responses
+
+
+def convert_project_to_response(db_project: Project, db: Session | None = None) -> ProjectResponse:
+    return convert_projects_to_responses(db, [db_project])[0]
 
 
 def _ensure_workspace_collaborator(db: Session, project: Project, user_id: int) -> None:
@@ -297,31 +420,92 @@ def create_project(
 @router.get("/", response_model=List[ProjectResponse])
 def get_user_projects(
     project_type: str | None = None,
+    limit: int | None = Query(default=None, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    created_q = db.query(Project).filter(Project.creator_id == current_user.id)
-    collab_q = db.query(Project).join(ProjectCollaborator).filter(ProjectCollaborator.user_id == current_user.id)
-    ws_ids = [
-        r.workspace_id
-        for r in db.query(WorkspaceMember)
-        .filter(WorkspaceMember.user_id == current_user.id, WorkspaceMember.role != "client")
-        .all()
-    ]
-    if project_type:
-        created_q = created_q.filter(Project.project_type == project_type)
-        collab_q = collab_q.filter(Project.project_type == project_type)
-    ws_projects = (
-        db.query(Project)
-        .filter(Project.workspace_id.in_(ws_ids), *([] if not project_type else [Project.project_type == project_type]))
-        .all()
-        if ws_ids
-        else []
+    collaborating = select(ProjectCollaborator.project_id).where(
+        ProjectCollaborator.user_id == current_user.id
     )
-    merged: dict[int, Project] = {}
-    for p in created_q.all() + collab_q.all() + ws_projects:
-        merged[p.id] = p
-    return [convert_project_to_response(project, db) for project in merged.values()]
+    member_workspaces = select(WorkspaceMember.workspace_id).where(
+        WorkspaceMember.user_id == current_user.id,
+        WorkspaceMember.role != "client",
+    )
+    query = (
+        db.query(Project)
+        .filter(
+            or_(
+                Project.creator_id == current_user.id,
+                Project.id.in_(collaborating),
+                Project.workspace_id.in_(member_workspaces),
+            )
+        )
+        .options(
+            joinedload(Project.creator),
+            selectinload(Project.collaborators).joinedload(ProjectCollaborator.user),
+        )
+        .order_by(Project.updated_at.desc(), Project.id.desc())
+    )
+    if project_type:
+        query = query.filter(Project.project_type == project_type)
+    if offset:
+        query = query.offset(offset)
+    if limit is not None:
+        query = query.limit(limit)
+    return convert_projects_to_responses(db, query.all())
+
+
+@router.get("/library-videos", response_model=List[LibraryVideoResponse])
+def get_library_videos(
+    limit: int = Query(default=500, ge=1, le=1000),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Every video the user can reach, newest first, in one query.
+
+    Replaces the editor's recursive per-project, per-folder contents crawl
+    (one request per folder) with a single request for the media library.
+    """
+    collaborating = select(ProjectCollaborator.project_id).where(
+        ProjectCollaborator.user_id == current_user.id
+    )
+    member_workspaces = select(WorkspaceMember.workspace_id).where(
+        WorkspaceMember.user_id == current_user.id,
+        WorkspaceMember.role != "client",
+    )
+    rows = (
+        db.query(Video, Project.name)
+        .join(Project, Project.id == Video.project_id)
+        .filter(
+            or_(
+                Project.creator_id == current_user.id,
+                Project.id.in_(collaborating),
+                Project.workspace_id.in_(member_workspaces),
+            )
+        )
+        .order_by(Video.updated_at.desc(), Video.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        LibraryVideoResponse(
+            id=video.id,
+            name=video.name,
+            description=video.description,
+            version=video.version or 1,
+            version_group_id=video.version_group_id,
+            file_path=video.file_path,
+            thumbnail_url=video.thumbnail_url,
+            project_id=video.project_id,
+            project_name=project_name or "",
+            folder_id=video.folder_id,
+            uploader_id=video.uploader_id,
+            created_at=video.created_at,
+            updated_at=video.updated_at,
+        )
+        for video, project_name in rows
+    ]
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)

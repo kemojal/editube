@@ -34,6 +34,7 @@ _DEF_MIN_SILENCE_MS = 250       # split speech on pauses this long (AUDIO_VAD_MI
 _DEF_SPEECH_PAD_MS = 100        # pre/post-roll protecting word edges (AUDIO_VAD_SPEECH_PAD_MS)
 _MIN_REPORTED_SILENCE_S = 0.25  # complement gaps shorter than this are just word spacing
 _MAX_RANGES = 5000              # JSONB size guard for multi-hour sources
+_PEAK_BARS = 3200               # waveform buckets (AUDIO_PEAK_BARS); matches the editor's client extractor
 
 
 def _env_float(name: str, default: float) -> float:
@@ -112,7 +113,7 @@ def analyze_wav_speech(
                 for s, e in ranges[:_MAX_RANGES]
             ]
 
-        return {
+        result: dict[str, Any] = {
             "version": 1,
             "engine": "silero-vad",
             "sample_rate": _SAMPLE_RATE,
@@ -126,6 +127,40 @@ def analyze_wav_speech(
                 "speech_pad_ms": speech_pad_ms,
             },
         }
+
+        # Waveform peaks, so the editor never has to download and decode the
+        # whole master file client-side just to paint the timeline waveform.
+        # Only for full-source extractions: a range-trimmed WAV (offset > 0)
+        # would misalign against the player's timeline.
+        if offset_seconds == 0:
+            peaks = _waveform_peaks(audio)
+            if peaks:
+                result["peaks"] = peaks
+
+        return result
     except Exception:
         logger.exception("Audio speech analysis failed for %s", wav_path)
+        return None
+
+
+def _waveform_peaks(audio: Any) -> list[float] | None:
+    """Per-bucket max-abs amplitude, normalized to this file's own ceiling.
+
+    Linear 0..1 values; the editor applies its perceptual display curve. Never
+    raises — peaks are an enhancement on top of the VAD result.
+    """
+    try:
+        import numpy as np
+
+        bars = _env_int("AUDIO_PEAK_BARS", _PEAK_BARS)
+        samples = np.asarray(audio)
+        if bars <= 0 or samples.size < bars:
+            return None
+        block = samples.size // bars
+        trimmed = np.abs(samples[: block * bars]).reshape(bars, block)
+        raw = trimmed.max(axis=1)
+        ceiling = max(float(raw.max()), 0.01)
+        return [round(float(value) / ceiling, 3) for value in raw]
+    except Exception:
+        logger.exception("Waveform peak extraction failed")
         return None

@@ -2,7 +2,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, joinedload
 
 from app.db.database import get_db
 from app.db.models import Project, Video, User
@@ -92,8 +92,6 @@ def start_video_transcription(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == video_id)
         .first()
@@ -113,8 +111,6 @@ def start_video_transcription(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == video_id)
         .first()
@@ -209,8 +205,6 @@ def update_transcription_segments(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == video_id)
         .first()
@@ -229,8 +223,6 @@ def get_video_by_id(
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == video_id)
         .first()
@@ -307,8 +299,6 @@ def _load_video_for_write(video_id: int, db: Session, current_user: User):
         .options(
             joinedload(Video.uploader),
             joinedload(Video.transcription),
-            selectinload(Video.comments),
-            selectinload(Video.annotations),
         )
         .filter(Video.id == video_id)
         .first()

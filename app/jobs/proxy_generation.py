@@ -91,6 +91,12 @@ def _transcode(input_path: str, output_path: str, profile: dict) -> None:
         "-maxrate", profile["bitrate"],
         "-bufsize", str(int(profile["bitrate"].replace("M", "")) * 2) + "M",
         "-vf", scale_filter,
+        # A keyframe every 2 seconds, fps-independent, no scene-cut extras:
+        # x264's default GOP (~250 frames ≈ 10s) makes editor seeks land up to
+        # ten seconds off; a dense, regular cadence is what makes the proxy
+        # scrub well. `-sc_threshold 0` keeps the cadence exact.
+        "-force_key_frames", "expr:gte(t,n_forced*2)",
+        "-sc_threshold", "0",
         "-c:a", "aac",
         "-b:a", profile["audio_bitrate"],
         "-movflags", "+faststart",
@@ -207,6 +213,18 @@ def proxy_generation_job(proxy_id: int) -> None:
             db.commit()
 
             logger.info("Proxy %s completed: %s", proxy_id, proxy.file_url[:80] if proxy.file_url else "")
+
+            # Realtime hint: an open editor can hot-swap onto the proxy
+            # without waiting for its next detail poll. Best-effort.
+            from app.services.realtime import publish_video_update
+
+            publish_video_update(
+                video.uploader_id,
+                video.id,
+                kind="proxy",
+                status="completed",
+                proxy_url=proxy.file_url,
+            )
 
         except Exception as e:
             proxy.status = "failed"
