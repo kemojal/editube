@@ -9,6 +9,7 @@ from app.db.models import Project, Video, User
 from app.api.models.videos import (
     ReviewDecisionRequest,
     VideoDetailResponse,
+    VideoEditorBootstrapResponse,
     VideoStatusUpdate,
     VideoWithProjectResponse,
 )
@@ -240,6 +241,65 @@ def get_video_by_id(
         workspace_id=db_project.workspace_id if db_project else None,
     )
     return _video_with_project_payload(db, db_video, current_user.id)
+
+
+@router.get("/{video_id}/editor-bootstrap", response_model=VideoEditorBootstrapResponse)
+def get_editor_bootstrap(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Everything the rough-cut editor needs to open, in one round trip.
+
+    The editor used to fetch the detail payload and then — only after it
+    resolved — the rough-cut draft. Against a high-latency database/API each
+    sequential request costs seconds; this collapses the critical path to one.
+    The standalone GET /videos/{id} and /ai/rough-cut-draft endpoints remain
+    for callers that need just one half.
+    """
+    db_video = (
+        db.query(Video)
+        .options(
+            joinedload(Video.uploader),
+            joinedload(Video.transcription),
+        )
+        .filter(Video.id == video_id)
+        .first()
+    )
+    if not db_video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    db_project = db.query(Project).filter(Project.id == db_video.project_id).first()
+    if not can_access_project(db, current_user.id, db_project):
+        raise HTTPException(status_code=403, detail="Not authorized to access this video")
+
+    payload = _video_with_project_payload(db, db_video, current_user.id)
+
+    from app.services import draft_store
+
+    view = draft_store.get_draft_for_video(db, db_video)
+    if view.row is None and not view.payload:
+        payload["draft"] = {
+            "video_id": view.video_id or db_video.id,
+            "result_type": "rough_cut_draft",
+            "status": "pending",
+            "result_data": None,
+            "updated_at": None,
+            "revision": 0,
+            "checksum": None,
+        }
+    else:
+        payload["draft"] = {
+            "video_id": view.video_id or db_video.id,
+            "result_type": "rough_cut_draft",
+            "status": "completed",
+            "result_data": view.payload,
+            "error_message": None,
+            "updated_at": view.row.updated_at if view.row is not None else None,
+            "revision": view.revision,
+            "checksum": view.checksum,
+        }
+    return payload
 
 
 @router.post("/{video_id}/stream/refresh")

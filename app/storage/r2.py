@@ -74,6 +74,12 @@ class R2Backend:
             multipart_chunksize=_MULTIPART_CHUNK,
         )
 
+    # Objects are written once under content-derived keys and never rewritten
+    # in place (a new version is a new key), so browsers may cache them
+    # forever. Without this, every reload revalidates or re-downloads media —
+    # video first frame, filmstrip source, and each dashboard thumbnail.
+    _IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
+
     # -- writes -----------------------------------------------------------
     def upload_stream(self, fileobj: BinaryIO, *, key: str, content_type: str) -> UploadResult:
         if hasattr(fileobj, "seek"):
@@ -86,7 +92,7 @@ class R2Backend:
             fileobj,
             self._bucket,
             key,
-            ExtraArgs={"ContentType": content_type},
+            ExtraArgs={"ContentType": content_type, "CacheControl": self._IMMUTABLE_CACHE},
             Config=self._transfer_config(),
         )
         return self._result(key, content_type)
@@ -100,7 +106,7 @@ class R2Backend:
             str(p),
             self._bucket,
             key,
-            ExtraArgs={"ContentType": content_type},
+            ExtraArgs={"ContentType": content_type, "CacheControl": self._IMMUTABLE_CACHE},
             Config=self._transfer_config(),
         )
         return self._result(key, content_type, known_bytes=p.stat().st_size)
@@ -138,8 +144,13 @@ class R2Backend:
     # instead of starting over, and the single-PUT 5 GB ceiling disappears.
 
     def create_multipart_upload(self, *, key: str, content_type: str) -> str:
+        # CacheControl set here lands on the completed object without the
+        # browser needing to send any header with its part PUTs.
         response = self._s3().create_multipart_upload(
-            Bucket=self._bucket, Key=key, ContentType=content_type
+            Bucket=self._bucket,
+            Key=key,
+            ContentType=content_type,
+            CacheControl=self._IMMUTABLE_CACHE,
         )
         return str(response["UploadId"])
 

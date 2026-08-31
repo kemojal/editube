@@ -161,6 +161,17 @@ class VideoWithProjectResponse(VideoDetailResponse):
     versions: List["VideoVersionSummary"] = []
 
 
+class VideoEditorBootstrapResponse(VideoWithProjectResponse):
+    """One-round-trip editor open.
+
+    The rough-cut draft rides along with the detail payload instead of
+    costing a second sequential request — against a high-latency link the
+    detail → draft waterfall alone was multiple seconds.
+    """
+
+    draft: dict | None = None
+
+
 class VideoVersionSummary(BaseModel):
     id: int
     version: int
