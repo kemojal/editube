@@ -28,10 +28,26 @@ DB_NAME="${LOCAL_DB_NAME:-editube_dev}"
 LOCAL_URL="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${DB_NAME}"
 export PGHOST PGPORT PGUSER
 
-# Postgres.app and Homebrew keep their client tools off the default PATH.
-for candidate in /opt/homebrew/opt/postgresql@*/bin /Applications/Postgres.app/Contents/Versions/*/bin; do
-  [ -x "$candidate/psql" ] && PATH="$candidate:$PATH"
+# Postgres.app and Homebrew keep their client tools off the default PATH, and
+# several versions are often installed side by side. Always pick the newest:
+# pg_dump refuses to dump a server newer than itself, so an older set of tools
+# earlier in PATH would break `sync` with a confusing error.
+newest_bin=""
+newest_major=0
+for candidate in \
+  /opt/homebrew/opt/postgresql@*/bin \
+  /usr/local/opt/postgresql@*/bin \
+  /Applications/Postgres.app/Contents/Versions/*/bin
+do
+  [ -x "$candidate/pg_dump" ] || continue
+  major="$("$candidate/pg_dump" --version 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+  [ -n "$major" ] || continue
+  if [ "$major" -gt "$newest_major" ]; then
+    newest_major="$major"
+    newest_bin="$candidate"
+  fi
 done
+[ -n "$newest_bin" ] && PATH="$newest_bin:$PATH"
 export PATH
 
 python_bin() {
@@ -92,8 +108,20 @@ PY
   echo "alembic stamped at head"
 }
 
+# The database to copy from. Once .env has been pointed at the local copy its
+# active DATABASE_URL is local, so every postgres URL in the file is
+# considered — including commented-out ones, which is where the remote line
+# normally ends up — and local targets are filtered out.
+# One awk pass rather than a grep pipeline: under `set -o pipefail` a `head -1`
+# that closes the pipe early makes the whole pipeline non-zero, and `set -e`
+# then kills the script with no output at all.
 remote_url() {
-  grep -E '^DATABASE_URL=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"
+  awk '
+    match($0, /postgresql:\/\/[^"'"'"' ]+/) {
+      url = substr($0, RSTART, RLENGTH)
+      if (url !~ /@(localhost|127\.0\.0\.1)/) { print url; exit }
+    }
+  ' .env .env.local 2>/dev/null || true
 }
 
 case "${1:-up}" in
@@ -121,16 +149,30 @@ case "${1:-up}" in
   sync)
     require_server
     db_exists || { echo "Database ${DB_NAME} does not exist — run 'up' first." >&2; exit 1; }
-    REMOTE_URL="$(remote_url)"
-    case "$REMOTE_URL" in
-      "") echo "No DATABASE_URL in .env to copy from." >&2; exit 1 ;;
-      *"${PGHOST}:${PGPORT}"*|*localhost:*)
-        echo ".env already points at a local database — nothing remote to copy." >&2
-        exit 1 ;;
-    esac
+    # An explicit source wins; otherwise the remote is found in .env.
+    REMOTE_URL="${2:-$(remote_url)}"
+    if [ -z "$REMOTE_URL" ]; then
+      cat >&2 <<MSG
+No remote postgres URL found in .env to copy from.
 
+Pass one explicitly:
+  ./scripts/local_db.sh sync 'postgresql://user:pass@host/dbname?sslmode=require'
+MSG
+      exit 1
+    fi
+
+    # libpq fills anything a connection string omits from PGHOST/PGPORT/PGUSER,
+    # and remote URLs rarely carry a port — so without clearing those the
+    # "remote" connection dials the remote host on the *local* port.
+    remote() { env -u PGHOST -u PGPORT -u PGUSER -u PGDATABASE "$@"; }
+
+    server_major="$(remote psql "$REMOTE_URL" -tAc 'show server_version' 2>/dev/null | cut -d. -f1 || true)"
+    if [ -z "$server_major" ]; then
+      echo "Could not connect to the remote database to read its version." >&2
+      echo "Check the URL in .env (or pass one: $0 sync '<url>')." >&2
+      exit 1
+    fi
     # pg_dump refuses to dump a server newer than itself.
-    server_major="$(psql "$REMOTE_URL" -tAc 'show server_version' 2>/dev/null | cut -d. -f1)"
     dump_major="$(pg_dump --version | grep -oE '[0-9]+' | head -1)"
     if [ -n "$server_major" ] && [ "$dump_major" -lt "$server_major" ]; then
       cat >&2 <<MSG
@@ -145,8 +187,14 @@ MSG
       exit 1
     fi
 
+    # The dump carries the whole schema, so restore into a freshly created
+    # database: layering it over an existing schema produces a wall of
+    # "already exists" noise that hides real failures. Alembic's version row
+    # rides along in the dump, so no stamping is needed afterwards.
     echo "Copying data from the remote database (read-only on the remote)..."
-    pg_dump "$REMOTE_URL" --no-owner --no-privileges --clean --if-exists \
+    dropdb --if-exists "$DB_NAME"
+    createdb "$DB_NAME"
+    remote pg_dump "$REMOTE_URL" --no-owner --no-privileges \
       | psql -d "$DB_NAME" -v ON_ERROR_STOP=0 -q
     echo "Sync complete."
     ;;
